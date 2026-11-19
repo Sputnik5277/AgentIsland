@@ -73,7 +73,8 @@ class AgentMonitor: ObservableObject {
     @Published var pingPending: Int = 0
     
     @Published var funnelOnline: Bool = true
-    @Published var syncthingOnline: Bool = false
+    @Published var nutstoreOnline: Bool = true
+    @Published var tailscaleOnline: Bool = true
     
     @Published var currentMode: IslandMode = .compact
     @Published var pulse: Bool = false
@@ -134,7 +135,14 @@ class AgentMonitor: ObservableObject {
             let ping = self.runInboxCount(box: "ping")
             
             let fOnline = self.checkPort(host: "127.0.0.1", port: 8081)
-            let sOnline = self.checkPort(host: "127.0.0.1", port: 8384)
+            let nOnline = NSWorkspace.shared.runningApplications.contains {
+                $0.bundleIdentifier?.lowercased().contains("nutstore") == true ||
+                $0.localizedName?.contains("坚果云") == true ||
+                $0.localizedName?.lowercased().contains("nutstore") == true
+            }
+            let tOnline = NSWorkspace.shared.runningApplications.contains {
+                $0.bundleIdentifier?.contains("tailscale") == true || $0.localizedName?.lowercased().contains("tailscale") == true
+            }
             
             DispatchQueue.main.async {
                 let prevTotal = self.lastKnownTotalPending
@@ -142,7 +150,8 @@ class AgentMonitor: ObservableObject {
                 self.almaPending = alma
                 self.pingPending = ping
                 self.funnelOnline = fOnline
-                self.syncthingOnline = sOnline
+                self.nutstoreOnline = nOnline
+                self.tailscaleOnline = tOnline
                 
                 let currentTotal = agy + alma + ping
                 if prevTotal >= 0 && currentTotal > prevTotal {
@@ -163,7 +172,7 @@ class AgentMonitor: ObservableObject {
             p.arguments = ["-c", """
 import json, os, glob
 root = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
-for box in ["ping", "agy", "alma"]:
+for box in ["ping", "agy", "alma", "codex", "claude-desktop"]:
     ack_file = os.path.join(root, ".ack", f"{box}.json")
     os.makedirs(os.path.dirname(ack_file), exist_ok=True)
     acked = {}
@@ -536,17 +545,17 @@ struct DynamicIslandView: View {
                 actionSquircle(icon: "folder.fill", label: "Spaces 库") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
                 }
-                actionSquircle(icon: "arrow.triangle.2.circlepath", label: "Syncthing") {
-                    if let u = URL(string: "http://127.0.0.1:8384") { NSWorkspace.shared.open(u) }
+                actionSquircle(icon: "bubble.left.and.bubble.right.fill", label: "交流台账") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
                 }
             }
             .padding(.horizontal, 12)
             
             // Section 3: Sliders & Channels Row (Like Display / Sound bars in Control Center)
             HStack(spacing: 12) {
-                channelItem(name: "Funnel", isOk: monitor.funnelOnline)
-                channelItem(name: "Syncthing", isOk: monitor.syncthingOnline)
-                channelItem(name: "Tailscale", isOk: true)
+                channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline)
+                channelItem(name: "坚果云", isOk: monitor.nutstoreOnline)
+                channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline)
                 Spacer()
                 
                 Button(action: {
@@ -826,7 +835,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "🏝️ 打开/收起中控台", action: #selector(toggleIsland), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "⚡ 一键全网收口", action: #selector(sweepAll), keyEquivalent: "k"))
         menu.addItem(NSMenuItem(title: "📁 打开 Spaces 产物库", action: #selector(openSpaces), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem(title: "🔄 打开 Syncthing Web", action: #selector(openSyncthing), keyEquivalent: "y"))
+        menu.addItem(NSMenuItem(title: "📝 打开《交流.md》", action: #selector(openCommLog), keyEquivalent: "c"))
+        menu.addItem(NSMenuItem(title: "🌐 检查 Funnel 健康状态", action: #selector(openFunnelHealth), keyEquivalent: "f"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "🚪 退出 AgentIsland", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -905,8 +915,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
     }
     
-    @objc func openSyncthing() {
-        if let u = URL(string: "http://127.0.0.1:8384") {
+    @objc func openCommLog() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
+    }
+    
+    @objc func openFunnelHealth() {
+        if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
             NSWorkspace.shared.open(u)
         }
     }
