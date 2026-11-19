@@ -5,6 +5,21 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.5.0] - 2026-11-19
+
+### 🕒 Done Feed & Real-Time Accountability / 已办结流与成果透明化
+
+- **🕒 最新结案回信 · 已办结流（Done Feed & Reply Transparency）**
+  - 彻底攻克“回信销账后在界面上消失蒸发、看不到最终完成情况”的认知断层；
+  - 展开任意 Agent 抽屉时，在待办下方（或无待办时）新增【最新结案回信 · 已办结流 (Done Feed)】模块；
+  - 实时提取呈现该 Agent 最近 3 笔已结案回信的标题、完成时间戳与发回件流向；
+  - 每笔回信提供「查看回信」按钮，一键调出 Obsidian 回信原件核查，露露随时掌握最终交付成果。
+- **🚀 60 秒极速跨机闭环实测通过（Sub-2-Minute Cross-Machine Roundtrip）**
+  - 全网定时任务与巡检全面调至 60 秒（1分钟），实测 Alma 本地唤醒 51 秒、Ping 远端唤醒 52 秒；
+  - 跨端端到端往返从过去的 15 分钟暴缩至 2 分钟以内，实测往返总耗时仅 129 秒，彻底告别时滞黑洞。
+
+---
+
 ## [v1.4.0] - 2026-11-19
 
 ### 🎨 Theme Customization & Light Mode Parity / 状态栏调色盘与浅色模式原厂重构

@@ -111,6 +111,10 @@ class AgentMonitor: ObservableObject {
     @Published var almaTasks: [TaskItem] = []
     @Published var pingTasks: [TaskItem] = []
     
+    @Published var agyDoneTasks: [TaskItem] = []
+    @Published var almaDoneTasks: [TaskItem] = []
+    @Published var pingDoneTasks: [TaskItem] = []
+    
     @Published var funnelOnline: Bool = true
     @Published var nutstoreOnline: Bool = true
     @Published var tailscaleOnline: Bool = true
@@ -256,6 +260,10 @@ class AgentMonitor: ObservableObject {
                 self.pingTasks = pingArr
                 self.agyTasks = agyArr
                 self.almaTasks = almaArr
+                
+                self.pingDoneTasks = data["ping_done"] ?? []
+                self.agyDoneTasks = data["agy_done"] ?? []
+                self.almaDoneTasks = data["alma_done"] ?? []
                 
                 self.pingPending = pingArr.count
                 self.agyPending = agyArr.count
@@ -462,6 +470,27 @@ for box in boxes:
             pass
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
+
+    # Phase 2.5: Extract recent completed replies (Done Feed)
+    done_items = []
+    for p in all_md:
+        if handoff.REPLY_RE.search(p.name):
+            try:
+                txt = p.read_text(encoding='utf-8', errors='replace')
+                meta, body = handoff.parse_frontmatter(txt)
+                title = handoff.first_heading(body) or p.stem
+                done_items.append({
+                    'file': p.name,
+                    'from': str(meta.get('from', '未知')),
+                    'to': str(meta.get('to', box)),
+                    'date': str(meta.get('date', '-')),
+                    'title': title,
+                    'mtime': p.stat().st_mtime
+                })
+            except Exception:
+                pass
+    done_items.sort(key=lambda x: x['mtime'], reverse=True)
+    res[box + '_done'] = done_items[:3]
 
 # Deep Telemetry from token_usage_archive_v2 (Context & Quota Ledger)
 telem_total = '--'
@@ -1017,6 +1046,15 @@ struct DynamicIslandView: View {
         }
     }
     
+    func agentDoneTasks(_ agent: String) -> [TaskItem] {
+        switch agent {
+        case "agy": return monitor.agyDoneTasks
+        case "alma": return monitor.almaDoneTasks
+        case "ping": return monitor.pingDoneTasks
+        default: return []
+        }
+    }
+    
     func agentTaskDrawerView(agent: String) -> some View {
         let tasks = agentTasks(agent)
         return VStack(spacing: 8) {
@@ -1064,78 +1102,146 @@ struct DynamicIslandView: View {
             .padding(.top, 10)
             .padding(.horizontal, 14)
             
-            // Task List or Empty State
-            if tasks.isEmpty {
+            // Task List + Done Feed Section
+            ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 8) {
-                    Spacer()
-                    Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 26))
-                        .foregroundColor(Color(hex: "10B981"))
-                    Text("无待办事项 · 处于就绪状态")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundColor(primaryTextColor)
-                    Text("所有历史单均已合规回信结案")
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundColor(secondaryTextColor)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(spacing: 5) {
-                        ForEach(tasks) { task in
-                            HStack(spacing: 7) {
-                                ZStack {
-                                    Circle()
-                                        .fill(Color(hex: "FF9500").opacity(0.18))
-                                        .frame(width: 22, height: 22)
-                                    Image(systemName: "doc.text.fill")
-                                        .font(.system(size: 9.5, weight: .bold))
-                                        .foregroundColor(Color(hex: "D97706"))
-                                }
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(task.title)
-                                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                                        .foregroundColor(primaryTextColor)
-                                        .lineLimit(1)
-                                    HStack(spacing: 4) {
-                                        Text("\(task.from) → \(task.to)")
-                                            .font(.system(size: 8.5, weight: .medium))
-                                            .foregroundColor(secondaryTextColor)
-                                        Text("•")
-                                            .font(.system(size: 7))
-                                            .foregroundColor(secondaryTextColor.opacity(0.6))
-                                        Text(task.date)
-                                            .font(.system(size: 8.5, weight: .medium))
-                                            .foregroundColor(secondaryTextColor)
+                    // 1. Pending Tasks Section (if any)
+                    if !tasks.isEmpty {
+                        LazyVStack(spacing: 5) {
+                            ForEach(tasks) { task in
+                                HStack(spacing: 7) {
+                                    ZStack {
+                                        Circle()
+                                            .fill(Color(hex: "FF9500").opacity(0.18))
+                                            .frame(width: 20, height: 20)
+                                        Image(systemName: "doc.text.fill")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundColor(Color(hex: "D97706"))
                                     }
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(task.title)
+                                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                            .foregroundColor(primaryTextColor)
+                                            .lineLimit(1)
+                                        HStack(spacing: 4) {
+                                            Text("\(task.from) → \(task.to)")
+                                                .font(.system(size: 8, weight: .medium))
+                                                .foregroundColor(secondaryTextColor)
+                                            Text("•")
+                                                .font(.system(size: 7))
+                                                .foregroundColor(secondaryTextColor.opacity(0.6))
+                                            Text(task.date)
+                                                .font(.system(size: 8, weight: .medium))
+                                                .foregroundColor(secondaryTextColor)
+                                        }
+                                    }
+                                    Spacer()
+                                    Button(action: {
+                                        let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
+                                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                    }) {
+                                        Text("查看单据")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundColor(accentColor)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+                                            .background(
+                                                Capsule()
+                                                    .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                            )
+                                    }
+                                    .buttonStyle(PressableScaleButtonStyle())
                                 }
-                                Spacer()
-                                Button(action: {
-                                    let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
-                                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                                }) {
-                                    Text("查看单据")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundColor(accentColor)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 3.5)
-                                        .background(
-                                            Capsule()
-                                                .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
-                                        )
-                                }
-                                .buttonStyle(PressableScaleButtonStyle())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4.5)
+                                .background(squircleCardBackground)
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(squircleCardBackground)
+                        }
+                        .padding(.horizontal, 10)
+                    } else {
+                        HStack(spacing: 5) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .foregroundColor(Color(hex: "059669"))
+                            Text("当前无积压待办 · 全员就绪")
+                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                .foregroundColor(Color(hex: "059669"))
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    
+                    // 2. Done Feed Section (Recent Completed Replies)
+                    let dones = agentDoneTasks(agent)
+                    if !dones.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "clock.arrow.circlepath")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(secondaryTextColor)
+                                Text("最新结案回信 · 已办结流")
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundColor(secondaryTextColor)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.top, 2)
+                            
+                            LazyVStack(spacing: 5) {
+                                ForEach(dones) { done in
+                                    HStack(spacing: 7) {
+                                        ZStack {
+                                            Circle()
+                                                .fill(Color(hex: "059669").opacity(0.16))
+                                                .frame(width: 20, height: 20)
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 8.5, weight: .bold))
+                                                .foregroundColor(Color(hex: "059669"))
+                                        }
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(done.title)
+                                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                                .foregroundColor(primaryTextColor)
+                                                .lineLimit(1)
+                                            HStack(spacing: 4) {
+                                                Text("回件: \(done.from) → \(done.to)")
+                                                    .font(.system(size: 8))
+                                                    .foregroundColor(secondaryTextColor)
+                                                Text("•")
+                                                    .font(.system(size: 7))
+                                                    .foregroundColor(secondaryTextColor.opacity(0.5))
+                                                Text(done.date)
+                                                    .font(.system(size: 8))
+                                                    .foregroundColor(secondaryTextColor)
+                                            }
+                                        }
+                                        Spacer()
+                                        Button(action: {
+                                            let path = "\(monitor.rootPath)/\(agent)/\(done.file)"
+                                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                        }) {
+                                            Text("查看回信")
+                                                .font(.system(size: 8.5, weight: .semibold))
+                                                .foregroundColor(accentColor)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 3)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                )
+                                        }
+                                        .buttonStyle(PressableScaleButtonStyle())
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4.5)
+                                    .background(squircleCardBackground)
+                                }
+                            }
+                            .padding(.horizontal, 10)
                         }
                     }
-                    .padding(.horizontal, 10)
                 }
-                .frame(maxHeight: 200)
             }
+            .frame(maxHeight: 215)
             
             // Bottom Guidance Line
             HStack {
