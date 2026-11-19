@@ -86,6 +86,16 @@ class AgentMonitor: ObservableObject {
     private var lastKnownTotalPending: Int = -1
     private var timer: Timer?
     private var breathTimer: Timer?
+    private var lastToggleTime: Date = Date.distantPast
+    
+    func canToggle() -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(lastToggleTime) < 0.35 {
+            return false
+        }
+        lastToggleTime = now
+        return true
+    }
     
     let rootPath = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
     let handoffScript = "/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts/handoff.py"
@@ -184,10 +194,15 @@ for box in ["ping", "agy", "alma", "codex", "claude-desktop"]:
         for f in os.listdir(box_dir):
             if f.endswith(".md") and not f.startswith(".") and not "-reply" in f:
                 if f not in acked:
-                    acked[f] = "一键全网收口: " + str(os.path.getmtime(os.path.join(box_dir, f)))
+                    base = f[:-3]
+                    has_reply = any(f"{base}-reply" in r for r in all_files)
+                    c = open(os.path.join(box_dir, f), errors="replace").read()
+                    is_done = any(k in c for k in ["status: 已完成", "status: 作废", "status: 已关闭"])
+                    if (has_reply or is_done):
+                        acked[f] = "智能核销(已回信结案): " + str(os.path.getmtime(os.path.join(box_dir, f)))
     with open(ack_file, "w") as out:
         json.dump(acked, out, ensure_ascii=False, indent=2)
-print("SWEEP_OK")
+print("RECONCILE_OK")
 """]
             let pipe = Pipe()
             p.standardOutput = pipe
@@ -198,7 +213,7 @@ print("SWEEP_OK")
             
             DispatchQueue.main.async {
                 withAnimation(.spring()) {
-                    self.sweepFeedback = "⚡ 全网收口完成！待办归零"
+                    self.sweepFeedback = "✓ 智能核销完成！未办结坚决保留"
                 }
                 self.refreshAll()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
@@ -332,9 +347,8 @@ struct DynamicIslandView: View {
             )
             .contentShape(Rectangle())
             .onTapGesture {
-                if monitor.currentMode == .expanded {
-                    monitor.setMode(.compact)
-                } else {
+                if monitor.currentMode == .compact {
+                    guard monitor.canToggle() else { return }
                     monitor.setMode(.expanded)
                 }
             }
@@ -462,20 +476,29 @@ struct DynamicIslandView: View {
                         icon: "apple.terminal.fill",
                         iconBg: Color(hex: "007AFF"),
                         title: "白 / AGY",
-                        subtitle: monitor.agyPending == 0 ? "空闲就绪" : "\(monitor.agyPending) 待办"
-                    )
+                        subtitle: monitor.agyPending == 0 ? "空闲就绪" : "\(monitor.agyPending) 待办",
+                        hasPending: monitor.agyPending > 0
+                    ) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/agy"))
+                    }
                     controlCenterPill(
                         icon: "bolt.fill",
                         iconBg: Color(hex: "FF9500"),
                         title: "Alma",
-                        subtitle: monitor.almaPending == 0 ? "空闲巡检" : "\(monitor.almaPending) 待办"
-                    )
+                        subtitle: monitor.almaPending == 0 ? "空闲巡检" : "\(monitor.almaPending) 待办",
+                        hasPending: monitor.almaPending > 0
+                    ) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/alma"))
+                    }
                     controlCenterPill(
                         icon: "cloud.fill",
                         iconBg: Color(hex: "5856D6"),
                         title: "Ping (VM)",
-                        subtitle: monitor.pingPending == 0 ? "空闲就绪" : "\(monitor.pingPending) 待办"
-                    )
+                        subtitle: monitor.pingPending == 0 ? "空闲就绪" : "\(monitor.pingPending) 待办",
+                        hasPending: monitor.pingPending > 0
+                    ) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/ping"))
+                    }
                 }
                 .frame(width: 175)
                 
@@ -510,7 +533,7 @@ struct DynamicIslandView: View {
                         HStack(spacing: 5) {
                             Image(systemName: "bolt.fill")
                                 .font(.system(size: 10, weight: .bold))
-                            Text("一键全网收口")
+                            Text("智能核销已办")
                                 .font(.system(size: 10.5, weight: .bold, design: .rounded))
                         }
                         .foregroundColor(.white)
@@ -553,9 +576,34 @@ struct DynamicIslandView: View {
             
             // Section 3: Sliders & Channels Row (Like Display / Sound bars in Control Center)
             HStack(spacing: 12) {
-                channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline)
-                channelItem(name: "坚果云", isOk: monitor.nutstoreOnline)
-                channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline)
+                channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline) {
+                    if monitor.funnelOnline {
+                        if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
+                            NSWorkspace.shared.open(u)
+                        }
+                    } else {
+                        let p = Process()
+                        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                        p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.lin.funnel-server"]
+                        try? p.run()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            monitor.refreshAll()
+                        }
+                    }
+                }
+                channelItem(name: "坚果云", isOk: monitor.nutstoreOnline) {
+                    if monitor.nutstoreOnline {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files"))
+                    } else {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Nutstore.app"))
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            monitor.refreshAll()
+                        }
+                    }
+                }
+                channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline) {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
+                }
                 Spacer()
                 
                 Button(action: {
@@ -583,29 +631,37 @@ struct DynamicIslandView: View {
     }
     
     // Squircle Capsule (Wi-Fi/Bluetooth style)
-    func controlCenterPill(icon: String, iconBg: Color, title: String, subtitle: String) -> some View {
-        HStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(iconBg)
-                    .frame(width: 22, height: 22)
-                Image(systemName: icon)
-                    .font(.system(size: 9.5, weight: .bold))
-                    .foregroundColor(.white)
+    func controlCenterPill(icon: String, iconBg: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                ZStack {
+                    Circle()
+                        .fill(iconBg)
+                        .frame(width: 22, height: 22)
+                    Image(systemName: icon)
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(primaryTextColor)
+                    Text(subtitle)
+                        .font(.system(size: 8.5, weight: .medium))
+                        .foregroundColor(hasPending ? Color(hex: "D97706") : secondaryTextColor)
+                }
+                Spacer()
+                if hasPending {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundColor(Color(hex: "D97706"))
+                }
             }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(primaryTextColor)
-                Text(subtitle)
-                    .font(.system(size: 8.5, weight: .medium))
-                    .foregroundColor(secondaryTextColor)
-            }
-            Spacer()
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(squircleCardBackground)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(squircleCardBackground)
+        .buttonStyle(PressableScaleButtonStyle())
     }
     
     // Action Squircle
@@ -626,15 +682,19 @@ struct DynamicIslandView: View {
         .buttonStyle(PressableScaleButtonStyle())
     }
     
-    func channelItem(name: String, isOk: Bool) -> some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(isOk ? Color(hex: "10B981") : Color(hex: "EF4444"))
-                .frame(width: 6, height: 6)
-            Text(name)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundColor(secondaryTextColor)
+    func channelItem(name: String, isOk: Bool, action: (() -> Void)? = nil) -> some View {
+        Button(action: { action?() }) {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(isOk ? Color(hex: "10B981") : Color(hex: "EF4444"))
+                    .frame(width: 6, height: 6)
+                    .shadow(color: (isOk ? Color(hex: "10B981") : Color(hex: "EF4444")).opacity(0.5), radius: 1.5)
+                Text(name)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundColor(isOk ? secondaryTextColor : Color(hex: "EF4444"))
+            }
         }
+        .buttonStyle(PlainButtonStyle())
     }
     
     var squircleCardBackground: some View {
@@ -749,6 +809,13 @@ class DynamicIslandPanel: NSPanel {
     }
 }
 
+// MARK: - Custom Hosting View with First Mouse Acceptance
+class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var islandPanel: DynamicIslandPanel!
@@ -833,7 +900,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "🏝️ 打开/收起中控台", action: #selector(toggleIsland), keyEquivalent: "i"))
-        menu.addItem(NSMenuItem(title: "⚡ 一键全网收口", action: #selector(sweepAll), keyEquivalent: "k"))
+        menu.addItem(NSMenuItem(title: "⚡ 智能核销已办", action: #selector(sweepAll), keyEquivalent: "k"))
         menu.addItem(NSMenuItem(title: "📁 打开 Spaces 产物库", action: #selector(openSpaces), keyEquivalent: "s"))
         menu.addItem(NSMenuItem(title: "📝 打开《交流.md》", action: #selector(openCommLog), keyEquivalent: "c"))
         menu.addItem(NSMenuItem(title: "🌐 检查 Funnel 健康状态", action: #selector(openFunnelHealth), keyEquivalent: "f"))
@@ -846,7 +913,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let initialRect = NSRect(x: 0, y: 0, width: 200, height: 48)
         islandPanel = DynamicIslandPanel(contentRect: initialRect)
         
-        let hostingView = NSHostingView(rootView: DynamicIslandView(monitor: monitor))
+        let hostingView = FirstMouseHostingView(rootView: DynamicIslandView(monitor: monitor))
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         islandPanel.contentView = hostingView
@@ -888,7 +955,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let y = screenFrame.origin.y + screenFrame.height - windowHeight
         
         let targetRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-        islandPanel.setFrame(targetRect, display: true, animate: true)
+        islandPanel.setFrame(targetRect, display: true, animate: false)
         
         if mode == .expanded {
             islandPanel.makeKey()

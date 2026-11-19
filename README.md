@@ -37,10 +37,12 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 
 - 💎 **Apple Liquid Glass Design**: Authentic system frosted glass using native `NSVisualEffectView`, providing real-time backdrop blur and razor-sharp specular highlights.
 - 🎛️ **1:1 Control Center Layout**: Squircle modules patterned directly after the macOS Control Center grid.
-- ⚡ **1-Click Sweep Action**: Instantly marks completed tasks and syncs the shared ledger with a single click—no CLI needed.
+- 🩺 **Interactive Channel Self-Healing**: Click red channel dots to auto-launch or restart background sync daemons (Nutstore, Funnel 64M, Tailscale).
+- 📂 **Direct Agent Inbox Drilldown**: Click any agent pill to instantly open its handoffs inbox folder in Finder.
+- ⚡ **1-Click Sweep Action**: Instantly marks completed tasks and syncs the shared ledger across 5 agent boxes with a single click—no CLI needed.
+- 🖱️ **First-Mouse Single-Click Responsiveness**: Custom `FirstMouseHostingView` ensuring immediate 1-click activation without macOS first-mouse swallow.
 - 🖥️ **Active Display Tracking**: Automatically follows active mouse cursor focus across multi-monitor setups (e.g. 4K/2K external displays).
 - 🌓 **Instant Theme Adaptation**: Automatically and seamlessly transitions between macOS Light and Dark modes.
-- 🖱️ **Auto-Dismiss on Blur**: Smoothly expands when clicked, and auto-dismisses when clicking outside or pressing `Esc`.
 - 🛡️ **Zero Token & 100% Offline**: Pure local file and port polling. Uses zero LLM tokens and ~15MB RAM.
 
 ### Quick Start
@@ -74,10 +76,12 @@ open /Applications/AgentIsland.app
 
 - 💎 **苹果原厂液态玻璃**：底层调用硬件加速 `NSVisualEffectView` 实时折射背景，搭配 1.0px 水晶切面内高光，通透纯净。
 - 🎛️ **1:1 苹果控制中心网格**：完全复刻 macOS 经典 Squircle 圆角胶囊模块，信息层次分明。
-- ⚡ **一键全网收口 (Sweep All)**：点击金刚键，后台自动批量核销结案已完成待办，待办数字瞬间归零。
+- 🩺 **通道红灯点击自愈**：通道异常红灯时点击直接唤起启动或热启服务（坚果云自动唤醒 / Funnel 一键热启 / Tailscale 跳转）。
+- 📂 **智能体收件箱一秒下钻**：点击白 / Alma / Ping 药丸卡片，一键在 Finder 中打开对应待办收件箱目录，待办单单一清二楚。
+- ⚡ **一键全网收口 (Sweep All)**：点击金刚键，后台自动批量核销全网 5 大收件箱已完成待办，待办数字瞬间归零。
+- 🖱️ **首击直达（First-Mouse）**：攻克 macOS 原生悬浮窗首击吞咽问题，单击即开、防抖不抽搐，失焦或按 `Esc` 丝滑收拢。
 - 🖥️ **活跃屏幕智能跟随**：精准检测鼠标当前所在的外接显示器（如 4K 宽屏），胶囊自动平滑就位，绝不跑飞。
 - 🌓 **深浅色实时自动变色**：监听系统底层主题切换事件，浅色透亮白霜玻璃与深色黑晶玻璃零延迟无缝自适应。
-- 🖱️ **全域失焦自动收拢**：点击展开，点击屏幕任意外部空白处（或按 `Esc` 键）瞬间丝滑收起，操作无阻力。
 - 🛡️ **零 Token 纯本地运行**：纯 Python / Swift 底层读取本地台账与端口，0 API 消耗，极低 CPU 占用（内存约 15MB）。
 
 ### 快速开始
