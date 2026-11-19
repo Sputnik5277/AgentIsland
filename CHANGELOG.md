@@ -5,6 +5,25 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.3.0] - 2026-11-19
+
+### 🚀 Architecture Evolution / 架构升级与双核中控
+
+- **⚡ 3 天滑动冷热归档体系（Hot-to-Cold Eviction Engine）**
+  - 建立标准 `handoffs/archive/<YYYY-MM>/<box>/` 自动化退火体系；
+  - 凡修改时间超过 72 小时（3 天保鲜期）且已在 `.ack/` 结案的历史老单，由系统自动原子迁移至归档冷区；
+  - 彻底终结单据无限堆积痛点，确保收件箱极速保鲜，磁盘扫描 I/O 永远控制在 10ms 以内。
+- **🌐 跨箱全网反向索引（Cross-Box Reply Penetration）**
+  - 彻底打破单箱孤岛假设，实现全网三箱的 `reply_to` 全局反向穿透映射；
+  - 远端节点（Ping）跨箱投递到发起人（AGY/Alma）收件箱的回信，中控台自动识别并对齐消单，杜绝假待办。
+- **🪙 Antigravity 双核遥测底座（Deep Telemetry & Ledger Integration）**
+  - 吸纳 `antigravity-context-viewer` 的两级账本机制，无锁非侵入式读取本地 `token_usage_archive_v2.json`；
+  - 在控制中心 Hero Card 实时呈现 **本月 Token 消耗（3.46B 🪙）· Cache 命中率（94%）· 主力模型分布**，实现“任务待办流 ＋ AI 运行态”双核管控。
+- **🔍 一键核验与归档（Verify & Archive）一体化**
+  - 核心操作升级为【🔍 全网核验与归档】，跨箱关联消单与历史老单自动退火合二为一，具备真实物理闭环。
+
+---
+
 ## [v1.2.0] - 2026-11-19
 
 ### 🛡️ Core Correction & Reconcile / 核心交互纠偏与合规核验

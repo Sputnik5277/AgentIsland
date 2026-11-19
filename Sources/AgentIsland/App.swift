@@ -95,6 +95,10 @@ class AgentMonitor: ObservableObject {
     @Published var isDarkMode: Bool = false
     @Published var reconcileFeedback: String? = nil
     
+    @Published var tokenTotal: String = "3.46B"
+    @Published var tokenCacheRate: String = "94%"
+    @Published var tokenTopModel: String = "Flash"
+    
     var onModeChange: ((IslandMode) -> Void)?
     var onDrawerChange: (() -> Void)?
     
@@ -192,6 +196,12 @@ class AgentMonitor: ObservableObject {
                 self.nutstoreOnline = nOnline
                 self.tailscaleOnline = tOnline
                 
+                if let telem = data["__telemetry__"]?.first {
+                    self.tokenTotal = telem.file
+                    self.tokenCacheRate = telem.title
+                    self.tokenTopModel = telem.from
+                }
+                
                 let currentTotal = pingArr.count + agyArr.count + almaArr.count
                 let prevTotal = self.lastKnownTotalPending
                 if prevTotal >= 0 && currentTotal > prevTotal {
@@ -215,49 +225,79 @@ from pathlib import Path
 ROOT = Path("/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs")
 ACK_DIR = ROOT / ".ack"
 REPLY_RE = re.compile(r"-reply\\d*\\.md$", re.IGNORECASE)
+boxes = ["ping", "agy", "alma"]
+
+reply_map = {}
+for b in boxes:
+    b_dir = ROOT / b
+    if not b_dir.is_dir(): continue
+    for p in b_dir.iterdir():
+        if p.is_file() and REPLY_RE.search(p.name):
+            base = re.sub(r"-reply\\d*\\.md$", ".md", p.name, flags=re.IGNORECASE)
+            reply_map[base] = f"{b}/{p.name}"
+            try:
+                txt = p.read_text(encoding="utf-8", errors="replace")
+                for line in txt.splitlines():
+                    if line.strip().startswith("reply_to:"):
+                        rt = line.split(":", 1)[1].strip()
+                        if rt and rt != "none":
+                            reply_map[Path(rt).name] = f"{b}/{p.name}"
+            except Exception:
+                pass
 
 reconciled = 0
-for box in ["ping", "agy", "alma"]:
+for box in boxes:
     box_dir = ROOT / box
     if not box_dir.is_dir(): continue
     ack_file = ACK_DIR / f"{box}.json"
     acked = {}
     if ack_file.exists():
         try: acked = json.loads(ack_file.read_text(encoding="utf-8"))
-        except: pass
+        except Exception: pass
     all_files = [p for p in box_dir.iterdir() if p.is_file() and p.name.endswith(".md")]
-    replies_map = {}
-    for p in all_files:
-        if REPLY_RE.search(p.name):
-            base = re.sub(r"-reply\\d*\\.md$", "", p.name, flags=re.IGNORECASE) + ".md"
-            replies_map[base] = p
-            try:
-                txt = p.read_text(encoding="utf-8", errors="replace")
-                for line in txt.splitlines():
-                    if line.strip().startswith("reply_to:"):
-                        rt = line.split(":", 1)[1].strip()
-                        if rt and rt != "none": replies_map[Path(rt).name] = p
-            except: pass
     for p in all_files:
         if REPLY_RE.search(p.name): continue
         if p.name in acked: continue
-        if p.name in replies_map:
-            acked[p.name] = f"reconciled: 已见回信 {replies_map[p.name].name}"
+        if p.name in reply_map:
+            acked[p.name] = f"reconciled: 已见回信 {reply_map[p.name]}"
             reconciled += 1
     ack_file.write_text(json.dumps(acked, ensure_ascii=False, indent=2), encoding="utf-8")
-print(f"RECONCILE_DONE:{reconciled}")
+
+# 3 天冷热归档触发（自动归档超 72h 且已结案的老单）
+archived = 0
+try:
+    sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
+    import handoff
+    arch_res = handoff.archive_stale_files(keep_days=3)
+    archived = sum(arch_res.values())
+except Exception:
+    pass
+
+print(f"RECONCILE_DONE:{reconciled}:{archived}")
 """]
             let pipe = Pipe()
             p.standardOutput = pipe
             try? p.run()
             p.waitUntilExit()
             
+            let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let outStr = String(data: outputData, encoding: .utf8) ?? ""
+            var arcCount = 0
+            if let m = outStr.components(separatedBy: "RECONCILE_DONE:").last?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                let parts = m.components(separatedBy: ":")
+                if parts.count >= 2 {
+                    arcCount = Int(parts[1]) ?? 0
+                }
+            }
+            
             self.refreshAll()
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 let total = self.pingPending + self.agyPending + self.almaPending
                 withAnimation(.spring()) {
-                    if total == 0 {
+                    if arcCount > 0 {
+                        self.reconcileFeedback = "✅ 核验完成：自动归档 \(arcCount) 笔老单"
+                    } else if total == 0 {
                         self.reconcileFeedback = "✅ 全网已闭环（0 待办）"
                     } else {
                         self.reconcileFeedback = "🔍 全网核验完成：仍有 \(total) 项真待办推进中"
@@ -289,55 +329,97 @@ from pathlib import Path
 sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
 import handoff
 
+boxes = ['ping', 'agy', 'alma']
+ROOT = handoff.HANDOFFS_ROOT
+
+# Phase 1: Global reply index across all boxes (prevents cross-box blindspots)
+global_replied = set()
+for b in boxes:
+    b_dir = ROOT / b
+    if not b_dir.is_dir(): continue
+    for p in b_dir.iterdir():
+        if not p.is_file() or handoff.is_ignored_file(p): continue
+        if handoff.REPLY_RE.search(p.name):
+            base = handoff.re.sub(r'-reply\\d*\\.md$', '.md', p.name, flags=handoff.re.IGNORECASE)
+            global_replied.add(base)
+            global_replied.add(p.stem)
+            try:
+                meta, _ = handoff.parse_frontmatter(p.read_text(encoding='utf-8', errors='replace'))
+                rt = str(meta.get('reply_to', '')).strip()
+                if rt and rt != 'none':
+                    global_replied.add(Path(rt).name)
+                rel = meta.get('related', [])
+                if isinstance(rel, list):
+                    for item in rel:
+                        global_replied.add(Path(str(item)).name)
+            except Exception:
+                pass
+
+# Phase 2: Per-box pending extraction
 res = {}
-for box in ['ping', 'agy', 'alma']:
-    inbox_dir = handoff.HANDOFFS_ROOT / box
+for box in boxes:
+    inbox_dir = ROOT / box
     if not inbox_dir.is_dir():
         res[box] = []
         continue
     acked_names = handoff.load_ack(box)
     all_md = [p for p in inbox_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
-    replied_targets = set()
-    reply_stems = set()
-    for p in all_md:
-        if handoff.REPLY_RE.search(p.name):
-            base = handoff.re.sub(r'-reply\\d*\\.md$', '', p.name, flags=handoff.re.IGNORECASE)
-            reply_stems.add(base)
-            meta, _ = handoff.parse_frontmatter(p.read_text(encoding='utf-8', errors='replace'))
-            rt = str(meta.get('reply_to', '')).strip()
-            if rt and rt != 'none':
-                replied_targets.add(Path(rt).name)
-            rel = meta.get('related', [])
-            if isinstance(rel, list):
-                for item in rel:
-                    replied_targets.add(Path(str(item)).name)
-
     items = []
     for p in all_md:
         if handoff.REPLY_RE.search(p.name):
             continue
-        text = p.read_text(encoding='utf-8', errors='replace')
-        meta, body = handoff.parse_frontmatter(text)
-        status = str(meta.get('status', '')).strip()
-        if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考')):
-            continue
-        frm = str(meta.get('from', '')).strip().lower()
-        if frm == box:
-            continue
-        if p.stem in reply_stems or p.name in replied_targets:
-            continue
         if p.name in acked_names:
             continue
-        items.append({
-            'file': p.name,
-            'from': str(meta.get('from', '未知')),
-            'to': str(meta.get('to', box)),
-            'date': str(meta.get('date', '-')),
-            'title': handoff.first_heading(body) or p.stem,
-            'mtime': p.stat().st_mtime
-        })
+        if p.name in global_replied or p.stem in global_replied:
+            continue
+        try:
+            text = p.read_text(encoding='utf-8', errors='replace')
+            meta, body = handoff.parse_frontmatter(text)
+            status = str(meta.get('status', '')).strip()
+            if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考')):
+                continue
+            frm = str(meta.get('from', '')).strip().lower()
+            if frm == box:
+                continue
+            items.append({
+                'file': p.name,
+                'from': str(meta.get('from', '未知')),
+                'to': str(meta.get('to', box)),
+                'date': str(meta.get('date', '-')),
+                'title': handoff.first_heading(body) or p.stem,
+                'mtime': p.stat().st_mtime
+            })
+        except Exception:
+            pass
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
+
+# Deep Telemetry from token_usage_archive_v2 (Context & Quota Ledger)
+telem_total = '--'
+telem_cache = '--'
+telem_model = 'Flash'
+try:
+    tp = Path('/Users/l/.gemini/antigravity/token_usage_archive_v2.json')
+    if tp.exists():
+        td = json.loads(tp.read_text(encoding='utf-8'))
+        m = td.get('costEstimateCurrentMonth', {})
+        cats = m.get('byCategory', {})
+        tot = cats.get('inputTokens', 0) + cats.get('cacheTokens', 0) + cats.get('outputTokens', 0)
+        c_rate = (cats.get('cacheTokens', 0) / tot * 100) if tot > 0 else 0
+        def _fmt(n):
+            if n >= 1000000000: return f"{n/1000000000:.2f}B"
+            if n >= 1000000: return f"{n/1000000:.1f}M"
+            if n >= 1000: return f"{n/1000:.1f}K"
+            return str(n)
+        top_m = sorted(m.get('byModel', {}).items(), key=lambda x: x[1].get('tokens', 0), reverse=True)
+        t_name = top_m[0][0].replace('gemini-', '').replace('claude-', '') if top_m else 'Flash'
+        telem_total = _fmt(tot)
+        telem_cache = f"{c_rate:.0f}%"
+        telem_model = t_name
+except Exception:
+    pass
+
+res['__telemetry__'] = [{'file': telem_total, 'title': telem_cache, 'from': telem_model, 'to': 'self', 'date': '-', 'mtime': 0}]
 
 print(json.dumps(res, ensure_ascii=False))
 """]
@@ -635,16 +717,46 @@ struct DynamicIslandView: View {
                         Spacer()
                     }
                     
+                    // Deep Telemetry Badge (Antigravity Context & Ledger)
+                    HStack(spacing: 5) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "circle.hexagongrid.fill")
+                                .font(.system(size: 8))
+                                .foregroundColor(Color(hex: "007AFF"))
+                            Text(monitor.tokenTotal)
+                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                .foregroundColor(primaryTextColor)
+                        }
+                        Text("·")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(secondaryTextColor.opacity(0.4))
+                        HStack(spacing: 2) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 7.5))
+                                .foregroundColor(Color(hex: "34C759"))
+                            Text("Cache \(monitor.tokenCacheRate)")
+                                .font(.system(size: 8.5, weight: .medium, design: .rounded))
+                                .foregroundColor(secondaryTextColor)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
+                    )
+                    
                     Spacer()
                     
-                    // Big Action Button: Verify & Reconcile
+                    // Big Action Button: Verify & Reconcile & Archive
                     Button(action: {
                         monitor.triggerVerifyAndReconcile()
                     }) {
                         HStack(spacing: 5) {
                             Image(systemName: "sparkle.magnifyingglass")
                                 .font(.system(size: 10, weight: .bold))
-                            Text("🔍 全网核验与对齐")
+                            Text("🔍 全网核验与归档")
                                 .font(.system(size: 10.5, weight: .bold, design: .rounded))
                         }
                         .foregroundColor(.white)
