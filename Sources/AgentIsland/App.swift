@@ -115,6 +115,7 @@ class AgentMonitor: ObservableObject {
     @Published var totalDispatched: Int = 0
     @Published var totalAccepted: Int = 0
     @Published var totalSubmitted: Int = 0
+    @Published var activeConfirmIndex: Int = 0
     
     @Published var agyTasks: [TaskItem] = []
     @Published var almaTasks: [TaskItem] = []
@@ -873,9 +874,9 @@ struct DynamicIslandView: View {
             .padding(.top, 10)
             .padding(.horizontal, 14)
 
-            // Section 0: Meituan Delivery Shelf (High-Priority Actionable Confirmation Banner)
+            // Section 0: Meituan Focused Live Order Card (谁发单谁验收谁结束 · 中间过程透明化)
             if !monitor.pendingConfirms.isEmpty {
-                pendingConfirmationShelfView
+                meituanLiveTrackingCardView
                     .padding(.horizontal, 12)
             }
             
@@ -1197,89 +1198,176 @@ struct DynamicIslandView: View {
             )
     }
 
-    var pendingConfirmationShelfView: some View {
-        VStack(spacing: 5) {
-            HStack(spacing: 4) {
-                ZStack {
-                    Circle()
-                        .fill(Color(hex: "8B5CF6"))
-                        .frame(width: 15, height: 15)
-                    Image(systemName: "bell.fill")
-                        .font(.system(size: 7.5, weight: .bold))
-                        .foregroundColor(.white)
-                }
-                Text("美团履约 · 产物已送达待验收 (\(monitor.pendingConfirms.count))")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundColor(Color(hex: "8B5CF6"))
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 2)
+    // 美团外卖实时履约焦点卡 (完全按照美团与骑手系统设计 · 谁发出任务谁验收谁结束 · 中间过程透明化)
+    @ViewBuilder
+    var meituanLiveTrackingCardView: some View {
+        let count = monitor.pendingConfirms.count
+        if count > 0 {
+            let safeIdx = min(max(0, monitor.activeConfirmIndex), count - 1)
+            let item = monitor.pendingConfirms[safeIdx]
+            // 谁发出任务谁验收谁结束：仅派单方或露露有权确认收货结案
+            let isDispatcher = (item.to == "agy" || item.to == "lulu")
             
-            ForEach(monitor.pendingConfirms) { confirm in
-                HStack(spacing: 6) {
-                    VStack(alignment: .leading, spacing: 1.5) {
-                        Text(confirm.title)
-                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                            .foregroundColor(primaryTextColor)
-                            .lineLimit(1)
-                        HStack(spacing: 3) {
-                            Text("\(confirm.from) ➔ \(confirm.to)")
-                                .font(.system(size: 8, weight: .semibold))
-                                .foregroundColor(Color(hex: "8B5CF6"))
-                            if !confirm.artifacts.isEmpty {
-                                Text("•")
-                                    .font(.system(size: 6.5))
-                                    .foregroundColor(secondaryTextColor)
-                                Text("产物: \(confirm.artifacts)")
-                                    .font(.system(size: 7.5, weight: .medium))
-                                    .foregroundColor(secondaryTextColor)
-                                    .lineLimit(1)
-                            }
-                        }
+            VStack(spacing: 5) {
+                // Header: 骑手状态 + 轮播器
+                HStack(spacing: 5) {
+                    ZStack {
+                        Circle()
+                            .fill(Color(hex: "8B5CF6"))
+                            .frame(width: 15, height: 15)
+                        Image(systemName: "bell.fill")
+                            .font(.system(size: 7.5, weight: .bold))
+                            .foregroundColor(.white)
                     }
+                    Text(isDispatcher ? "美团履约 · 产物送达待您验货" : "全网履约流 · 待派单方验收")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(Color(hex: "8B5CF6"))
+                    
                     Spacer()
                     
-                    Button(action: {
-                        let path = "\(monitor.rootPath)/\(confirm.file)"
-                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                    }) {
-                        Text("查看")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundColor(primaryTextColor)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2.5)
-                            .background(squircleCardBackground)
-                    }
-                    .buttonStyle(PressableScaleButtonStyle())
-                    
-                    Button(action: {
-                        monitor.confirmTask(file: confirm.file, dispatcher: confirm.to)
-                    }) {
-                        HStack(spacing: 2) {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 7, weight: .bold))
-                            Text("结案")
-                                .font(.system(size: 8, weight: .bold))
+                    if count > 1 {
+                        HStack(spacing: 4) {
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    monitor.activeConfirmIndex = (safeIdx - 1 + count) % count
+                                }
+                            }) {
+                                Image(systemName: "chevron.left")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(secondaryTextColor)
+                                    .frame(width: 14, height: 14)
+                                    .background(squircleCardBackground)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            
+                            Text("\(safeIdx + 1)/\(count)")
+                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                                .foregroundColor(secondaryTextColor)
+                            
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    monitor.activeConfirmIndex = (safeIdx + 1) % count
+                                }
+                            }) {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(secondaryTextColor)
+                                    .frame(width: 14, height: 14)
+                                    .background(squircleCardBackground)
+                            }
+                            .buttonStyle(PlainButtonStyle())
                         }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2.5)
-                        .background(
-                            Capsule().fill(Color(hex: "8B5CF6"))
-                        )
                     }
-                    .buttonStyle(PressableScaleButtonStyle())
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                
+                // Card Body
+                VStack(alignment: .leading, spacing: 4) {
+                    // Order Title + Stepper
+                    HStack {
+                        Text(item.title)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundColor(primaryTextColor)
+                            .lineLimit(1)
+                        Spacer()
+                        meituanStepperView(stage: item.stage)
+                    }
+                    
+                    // Route & Artifact Link
+                    HStack(spacing: 4) {
+                        HStack(spacing: 2) {
+                            Text("骑手:\(item.from)")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundColor(Color(hex: "3B82F6"))
+                            Text("➔")
+                                .font(.system(size: 7))
+                                .foregroundColor(secondaryTextColor)
+                            Text("派单客户:\(item.to)")
+                                .font(.system(size: 8.5, weight: .bold))
+                                .foregroundColor(isDispatcher ? Color(hex: "8B5CF6") : secondaryTextColor)
+                        }
+                        
+                        if !item.artifacts.isEmpty {
+                            Text("•")
+                                .font(.system(size: 6.5))
+                                .foregroundColor(secondaryTextColor)
+                            Button(action: {
+                                let ap = item.artifacts.hasPrefix("/") ? item.artifacts : "\(monitor.rootPath)/../\(item.artifacts)"
+                                NSWorkspace.shared.open(URL(fileURLWithPath: ap))
+                            }) {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.system(size: 7))
+                                    Text("产物: \(item.artifacts)")
+                                        .font(.system(size: 8, weight: .medium))
+                                        .lineLimit(1)
+                                }
+                                .foregroundColor(accentColor)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                        
+                        Spacer()
+                        
+                        // Actions: 严格遵循「谁发出任务谁验收谁结束」
+                        Button(action: {
+                            let path = "\(monitor.rootPath)/\(item.file)"
+                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        }) {
+                            Text("查看单据")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundColor(primaryTextColor)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2.5)
+                                .background(squircleCardBackground)
+                        }
+                        .buttonStyle(PressableScaleButtonStyle())
+                        
+                        if isDispatcher {
+                            // 仅派单客户有权结案！
+                            Button(action: {
+                                monitor.confirmTask(file: item.file, dispatcher: item.to)
+                            }) {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 7.5, weight: .bold))
+                                    Text("确认收货结案")
+                                        .font(.system(size: 8, weight: .bold))
+                                }
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2.5)
+                                .background(
+                                    Capsule().fill(Color(hex: "8B5CF6"))
+                                )
+                            }
+                            .buttonStyle(PressableScaleButtonStyle())
+                        } else {
+                            // 非派单客户只能监督查看，无权越俎代庖！
+                            HStack(spacing: 2) {
+                                Image(systemName: "hourglass")
+                                    .font(.system(size: 7))
+                                Text("等待客户 \(item.to) 验货")
+                                    .font(.system(size: 7.5, weight: .semibold))
+                            }
+                            .foregroundColor(secondaryTextColor)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule().fill(Color.black.opacity(monitor.isDarkMode ? 0.3 : 0.05))
+                            )
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
                 .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
                 )
             }
+            .padding(.horizontal, 2)
         }
-        .padding(.horizontal, 4)
     }
     
     func agentTaskDrawerView(agent: String) -> some View {
@@ -1332,9 +1420,9 @@ struct DynamicIslandView: View {
             // Task List + Done Feed Section
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 8) {
-                    // 0. Meituan Pending Confirmation Shelf (if any)
+                    // 0. Meituan Focused Live Order Card (谁发单谁验收谁结束 · 中间过程透明化)
                     if !monitor.pendingConfirms.isEmpty {
-                        pendingConfirmationShelfView
+                        meituanLiveTrackingCardView
                     }
 
                     // 1. Pending Tasks Section (if any)
@@ -1577,7 +1665,11 @@ struct DynamicIslandView: View {
         case .compact: return 28
         case .notification: return 34
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 340 : 258
+            if monitor.selectedDrawerAgent != nil {
+                return 340
+            } else {
+                return monitor.pendingConfirms.isEmpty ? 238 : 300
+            }
         }
     }
     
