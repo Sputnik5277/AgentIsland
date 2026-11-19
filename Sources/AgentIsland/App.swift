@@ -873,12 +873,6 @@ struct DynamicIslandView: View {
             }
             .padding(.top, 10)
             .padding(.horizontal, 14)
-
-            // Section 0: Meituan Focused Live Order Card (谁发单谁验收谁结束 · 中间过程透明化)
-            if !monitor.pendingConfirms.isEmpty {
-                meituanLiveTrackingCardView
-                    .padding(.horizontal, 12)
-            }
             
             // Section 1: Top 2-Column Grid (Like Wi-Fi / Bluetooth + Now Playing Card in Control Center)
             HStack(spacing: 9) {
@@ -912,7 +906,7 @@ struct DynamicIslandView: View {
                         monitor.setDrawerAgent("ping")
                     }
                 }
-                .frame(width: 175)
+                .frame(width: 220)
                 
                 // Right Column: Hero Squircle Card (Meituan Order Live Tracking)
                 VStack(spacing: 8) {
@@ -1420,11 +1414,6 @@ struct DynamicIslandView: View {
             // Task List + Done Feed Section
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 8) {
-                    // 0. Meituan Focused Live Order Card (谁发单谁验收谁结束 · 中间过程透明化)
-                    if !monitor.pendingConfirms.isEmpty {
-                        meituanLiveTrackingCardView
-                    }
-
                     // 1. Pending Tasks Section (if any)
                     if !tasks.isEmpty {
                         LazyVStack(spacing: 5) {
@@ -1432,15 +1421,15 @@ struct DynamicIslandView: View {
                                 HStack(spacing: 7) {
                                     ZStack {
                                         Circle()
-                                            .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18))
+                                            .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
                                             .frame(width: 20, height: 20)
-                                        Image(systemName: task.stage == "accepted" ? "bolt.fill" : "doc.text.fill")
+                                        Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.fill" : "doc.text.fill"))
                                             .font(.system(size: 9, weight: .bold))
-                                            .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : Color(hex: "D97706"))
+                                            .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
                                     }
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(task.title)
-                                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                            .font(.system(size: 10, weight: .bold, design: .rounded))
                                             .foregroundColor(primaryTextColor)
                                             .lineLimit(1)
                                         HStack(spacing: 4) {
@@ -1459,21 +1448,48 @@ struct DynamicIslandView: View {
                                         }
                                     }
                                     Spacer()
-                                    Button(action: {
-                                        let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
-                                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                                    }) {
-                                        Text("查看单据")
-                                            .font(.system(size: 8.5, weight: .semibold))
-                                            .foregroundColor(accentColor)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 3)
-                                            .background(
-                                                Capsule()
-                                                    .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
-                                            )
+                                    
+                                    // Actions: 严格遵循「谁发出任务谁验收谁结束」
+                                    HStack(spacing: 5) {
+                                        if task.stage == "submitted" {
+                                            if task.to == "agy" || task.to == "lulu" {
+                                                Button(action: {
+                                                    monitor.confirmTask(file: "\(agent)/\(task.file)", dispatcher: task.to)
+                                                }) {
+                                                    Text("收货结案")
+                                                        .font(.system(size: 8.5, weight: .bold))
+                                                        .foregroundColor(.white)
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 3)
+                                                        .background(Capsule().fill(Color(hex: "8B5CF6")))
+                                                }
+                                                .buttonStyle(PressableScaleButtonStyle())
+                                            } else {
+                                                Text("待\(task.to)验货")
+                                                    .font(.system(size: 8, weight: .semibold))
+                                                    .foregroundColor(secondaryTextColor)
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 2.5)
+                                                    .background(Capsule().fill(Color.black.opacity(0.12)))
+                                            }
+                                        }
+                                        
+                                        Button(action: {
+                                            let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
+                                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                        }) {
+                                            Text("查看单据")
+                                                .font(.system(size: 8.5, weight: .semibold))
+                                                .foregroundColor(accentColor)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 3)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                )
+                                        }
+                                        .buttonStyle(PressableScaleButtonStyle())
                                     }
-                                    .buttonStyle(PressableScaleButtonStyle())
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4.5)
@@ -1656,7 +1672,7 @@ struct DynamicIslandView: View {
         case .compact: return monitor.totalSubmitted > 0 || monitor.totalAccepted > 0 ? 186 : 170
         case .notification: return 320
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 396 : 366
+            return monitor.selectedDrawerAgent != nil ? 520 : 496 // 宽大通透大面板！
         }
     }
     
@@ -1665,11 +1681,7 @@ struct DynamicIslandView: View {
         case .compact: return 28
         case .notification: return 34
         case .expanded:
-            if monitor.selectedDrawerAgent != nil {
-                return 340
-            } else {
-                return monitor.pendingConfirms.isEmpty ? 238 : 300
-            }
+            return monitor.selectedDrawerAgent != nil ? 390 : 286 // 宽大多端大面板！
         }
     }
     
