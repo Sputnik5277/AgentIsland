@@ -52,6 +52,15 @@ struct AppleGlassBackground: NSViewRepresentable {
 }
 
 // MARK: - Models & State
+struct TaskItem: Identifiable, Hashable {
+    var id: String { file }
+    let file: String
+    let from: String
+    let to: String
+    let date: String
+    let title: String
+}
+
 enum IslandMode: Equatable {
     case compact
     case notification(String, String)
@@ -72,16 +81,22 @@ class AgentMonitor: ObservableObject {
     @Published var almaPending: Int = 0
     @Published var pingPending: Int = 0
     
+    @Published var agyTasks: [TaskItem] = []
+    @Published var almaTasks: [TaskItem] = []
+    @Published var pingTasks: [TaskItem] = []
+    
     @Published var funnelOnline: Bool = true
     @Published var nutstoreOnline: Bool = true
     @Published var tailscaleOnline: Bool = true
     
     @Published var currentMode: IslandMode = .compact
+    @Published var selectedDrawerAgent: String? = nil
     @Published var pulse: Bool = false
     @Published var isDarkMode: Bool = false
-    @Published var sweepFeedback: String? = nil
+    @Published var reconcileFeedback: String? = nil
     
     var onModeChange: ((IslandMode) -> Void)?
+    var onDrawerChange: (() -> Void)?
     
     private var lastKnownTotalPending: Int = -1
     private var timer: Timer?
@@ -95,6 +110,15 @@ class AgentMonitor: ObservableObject {
         }
         lastToggleTime = now
         return true
+    }
+    
+    func setDrawerAgent(_ agent: String?) {
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+                self.selectedDrawerAgent = agent
+            }
+            self.onDrawerChange?()
+        }
     }
     
     let rootPath = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
@@ -140,10 +164,7 @@ class AgentMonitor: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            let agy = self.runInboxCount(box: "agy")
-            let alma = self.runInboxCount(box: "alma")
-            let ping = self.runInboxCount(box: "ping")
-            
+            let data = self.fetchInboxesJSON()
             let fOnline = self.checkPort(host: "127.0.0.1", port: 8081)
             let nOnline = NSWorkspace.shared.runningApplications.contains {
                 $0.bundleIdentifier?.lowercased().contains("nutstore") == true ||
@@ -155,66 +176,95 @@ class AgentMonitor: ObservableObject {
             }
             
             DispatchQueue.main.async {
-                let prevTotal = self.lastKnownTotalPending
-                self.agyPending = agy
-                self.almaPending = alma
-                self.pingPending = ping
+                let pingArr = data["ping"] ?? []
+                let agyArr = data["agy"] ?? []
+                let almaArr = data["alma"] ?? []
+                
+                self.pingTasks = pingArr
+                self.agyTasks = agyArr
+                self.almaTasks = almaArr
+                
+                self.pingPending = pingArr.count
+                self.agyPending = agyArr.count
+                self.almaPending = almaArr.count
+                
                 self.funnelOnline = fOnline
                 self.nutstoreOnline = nOnline
                 self.tailscaleOnline = tOnline
                 
-                let currentTotal = agy + alma + ping
+                let currentTotal = pingArr.count + agyArr.count + almaArr.count
+                let prevTotal = self.lastKnownTotalPending
                 if prevTotal >= 0 && currentTotal > prevTotal {
-                    self.triggerNotification(title: "📩 多 Agent 新待办到达", subtitle: "Ping: \(ping) | AGY: \(agy) | Alma: \(alma)")
+                    self.triggerNotification(title: "📩 多 Agent 新待办到达", subtitle: "Ping: \(pingArr.count) | AGY: \(agyArr.count) | Alma: \(almaArr.count)")
                 }
                 self.lastKnownTotalPending = currentTotal
             }
         }
     }
     
-    func triggerSweepAll() {
+    func triggerVerifyAndReconcile() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            // Sweep ack for ping, agy, alma
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
             p.arguments = ["-c", """
-import json, os, glob
-root = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
-for box in ["ping", "agy", "alma", "codex", "claude-desktop"]:
-    ack_file = os.path.join(root, ".ack", f"{box}.json")
-    os.makedirs(os.path.dirname(ack_file), exist_ok=True)
+import os, sys, json, re
+from pathlib import Path
+
+ROOT = Path("/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs")
+ACK_DIR = ROOT / ".ack"
+REPLY_RE = re.compile(r"-reply\\d*\\.md$", re.IGNORECASE)
+
+reconciled = 0
+for box in ["ping", "agy", "alma"]:
+    box_dir = ROOT / box
+    if not box_dir.is_dir(): continue
+    ack_file = ACK_DIR / f"{box}.json"
     acked = {}
-    if os.path.exists(ack_file):
-        try: acked = json.load(open(ack_file))
+    if ack_file.exists():
+        try: acked = json.loads(ack_file.read_text(encoding="utf-8"))
         except: pass
-    box_dir = os.path.join(root, box)
-    if os.path.exists(box_dir):
-        for f in os.listdir(box_dir):
-            if f.endswith(".md") and not f.startswith(".") and not "-reply" in f:
-                if f not in acked:
-                    acked[f] = "一键全网收口: " + str(os.path.getmtime(os.path.join(box_dir, f)))
-    with open(ack_file, "w") as out:
-        json.dump(acked, out, ensure_ascii=False, indent=2)
-print("SWEEP_OK")
+    all_files = [p for p in box_dir.iterdir() if p.is_file() and p.name.endswith(".md")]
+    replies_map = {}
+    for p in all_files:
+        if REPLY_RE.search(p.name):
+            base = re.sub(r"-reply\\d*\\.md$", "", p.name, flags=re.IGNORECASE) + ".md"
+            replies_map[base] = p
+            try:
+                txt = p.read_text(encoding="utf-8", errors="replace")
+                for line in txt.splitlines():
+                    if line.strip().startswith("reply_to:"):
+                        rt = line.split(":", 1)[1].strip()
+                        if rt and rt != "none": replies_map[Path(rt).name] = p
+            except: pass
+    for p in all_files:
+        if REPLY_RE.search(p.name): continue
+        if p.name in acked: continue
+        if p.name in replies_map:
+            acked[p.name] = f"reconciled: 已见回信 {replies_map[p.name].name}"
+            reconciled += 1
+    ack_file.write_text(json.dumps(acked, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"RECONCILE_DONE:{reconciled}")
 """]
             let pipe = Pipe()
             p.standardOutput = pipe
-            do {
-                try p.run()
-                p.waitUntilExit()
-            } catch {}
+            try? p.run()
+            p.waitUntilExit()
             
-            DispatchQueue.main.async {
+            self.refreshAll()
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                let total = self.pingPending + self.agyPending + self.almaPending
                 withAnimation(.spring()) {
-                    self.sweepFeedback = "⚡ 全网收口完成！待办归零"
-                }
-                self.refreshAll()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                    withAnimation {
-                        self.sweepFeedback = nil
+                    if total == 0 {
+                        self.reconcileFeedback = "✅ 全网已闭环（0 待办）"
+                    } else {
+                        self.reconcileFeedback = "🔍 全网核验完成：仍有 \(total) 项真待办推进中"
                     }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                    withAnimation { self.reconcileFeedback = nil }
                 }
             }
         }
@@ -230,10 +280,67 @@ print("SWEEP_OK")
         }
     }
     
-    private func runInboxCount(box: String) -> Int {
+    private func fetchInboxesJSON() -> [String: [TaskItem]] {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        p.arguments = [handoffScript, "inbox", box]
+        p.arguments = ["-c", """
+import sys, json, os, re
+from pathlib import Path
+sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
+import handoff
+
+res = {}
+for box in ['ping', 'agy', 'alma']:
+    inbox_dir = handoff.HANDOFFS_ROOT / box
+    if not inbox_dir.is_dir():
+        res[box] = []
+        continue
+    acked_names = handoff.load_ack(box)
+    all_md = [p for p in inbox_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
+    replied_targets = set()
+    reply_stems = set()
+    for p in all_md:
+        if handoff.REPLY_RE.search(p.name):
+            base = handoff.re.sub(r'-reply\\d*\\.md$', '', p.name, flags=handoff.re.IGNORECASE)
+            reply_stems.add(base)
+            meta, _ = handoff.parse_frontmatter(p.read_text(encoding='utf-8', errors='replace'))
+            rt = str(meta.get('reply_to', '')).strip()
+            if rt and rt != 'none':
+                replied_targets.add(Path(rt).name)
+            rel = meta.get('related', [])
+            if isinstance(rel, list):
+                for item in rel:
+                    replied_targets.add(Path(str(item)).name)
+
+    items = []
+    for p in all_md:
+        if handoff.REPLY_RE.search(p.name):
+            continue
+        text = p.read_text(encoding='utf-8', errors='replace')
+        meta, body = handoff.parse_frontmatter(text)
+        status = str(meta.get('status', '')).strip()
+        if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考')):
+            continue
+        frm = str(meta.get('from', '')).strip().lower()
+        if frm == box:
+            continue
+        if p.stem in reply_stems or p.name in replied_targets:
+            continue
+        if p.name in acked_names:
+            continue
+        items.append({
+            'file': p.name,
+            'from': str(meta.get('from', '未知')),
+            'to': str(meta.get('to', box)),
+            'date': str(meta.get('date', '-')),
+            'title': handoff.first_heading(body) or p.stem,
+            'mtime': p.stat().st_mtime
+        })
+    items.sort(key=lambda x: x['mtime'], reverse=True)
+    res[box] = items
+
+print(json.dumps(res, ensure_ascii=False))
+"""]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = Pipe()
@@ -241,17 +348,22 @@ print("SWEEP_OK")
             try p.run()
             p.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let out = String(data: data, encoding: .utf8) {
-                if let match = out.range(of: #"共 (\d+) 条"#, options: .regularExpression) {
-                    let sub = out[match]
-                    let digits = sub.filter { "0123456789".contains($0) }
-                    return Int(digits) ?? 0
+            if let root = try? JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]] {
+                var output: [String: [TaskItem]] = [:]
+                for (box, arr) in root {
+                    output[box] = arr.compactMap { d in
+                        guard let file = d["file"] as? String,
+                              let from = d["from"] as? String,
+                              let to = d["to"] as? String,
+                              let date = d["date"] as? String,
+                              let title = d["title"] as? String else { return nil }
+                        return TaskItem(file: file, from: from, to: to, date: date, title: title)
+                    }
                 }
+                return output
             }
-        } catch {
-            return 0
-        }
-        return 0
+        } catch {}
+        return [:]
     }
     
     private func checkPort(host: String, port: Int32) -> Bool {
@@ -359,7 +471,11 @@ struct DynamicIslandView: View {
         case .notification(let title, let subtitle):
             notificationView(title: title, subtitle: subtitle)
         case .expanded:
-            controlCenterExpandedView
+            if let agent = monitor.selectedDrawerAgent {
+                agentTaskDrawerView(agent: agent)
+            } else {
+                controlCenterExpandedView
+            }
         }
     }
     
@@ -440,10 +556,10 @@ struct DynamicIslandView: View {
                 Spacer()
                 
                 // Status hint
-                if let fb = monitor.sweepFeedback {
+                if let fb = monitor.reconcileFeedback {
                     Text(fb)
                         .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                        .foregroundColor(Color(hex: "059669"))
+                        .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
                         .transition(.scale)
                 } else {
                     Text("点外部或 Esc 收起")
@@ -474,7 +590,7 @@ struct DynamicIslandView: View {
                         subtitle: monitor.agyPending == 0 ? "空闲就绪" : "\(monitor.agyPending) 待办",
                         hasPending: monitor.agyPending > 0
                     ) {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/agy"))
+                        monitor.setDrawerAgent("agy")
                     }
                     controlCenterPill(
                         icon: "bolt.fill",
@@ -483,7 +599,7 @@ struct DynamicIslandView: View {
                         subtitle: monitor.almaPending == 0 ? "空闲巡检" : "\(monitor.almaPending) 待办",
                         hasPending: monitor.almaPending > 0
                     ) {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/alma"))
+                        monitor.setDrawerAgent("alma")
                     }
                     controlCenterPill(
                         icon: "cloud.fill",
@@ -492,7 +608,7 @@ struct DynamicIslandView: View {
                         subtitle: monitor.pingPending == 0 ? "空闲就绪" : "\(monitor.pingPending) 待办",
                         hasPending: monitor.pingPending > 0
                     ) {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/ping"))
+                        monitor.setDrawerAgent("ping")
                     }
                 }
                 .frame(width: 175)
@@ -502,9 +618,9 @@ struct DynamicIslandView: View {
                     HStack {
                         ZStack {
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(Color(hex: "FF9500"))
+                                .fill(totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669"))
                                 .frame(width: 22, height: 22)
-                            Image(systemName: "bolt.badge.clock.fill")
+                            Image(systemName: totalPending > 0 ? "hourglass" : "checkmark.shield.fill")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(.white)
                         }
@@ -521,14 +637,14 @@ struct DynamicIslandView: View {
                     
                     Spacer()
                     
-                    // Big One-Click Sweep Action Button
+                    // Big Action Button: Verify & Reconcile
                     Button(action: {
-                        monitor.triggerSweepAll()
+                        monitor.triggerVerifyAndReconcile()
                     }) {
                         HStack(spacing: 5) {
-                            Image(systemName: "bolt.fill")
+                            Image(systemName: "sparkle.magnifyingglass")
                                 .font(.system(size: 10, weight: .bold))
-                            Text("一键全网收口")
+                            Text("🔍 全网核验与对齐")
                                 .font(.system(size: 10.5, weight: .bold, design: .rounded))
                         }
                         .foregroundColor(.white)
@@ -538,12 +654,14 @@ struct DynamicIslandView: View {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .fill(
                                     LinearGradient(
-                                        colors: [Color(hex: "007AFF"), Color(hex: "0051C7")],
+                                        colors: totalPending > 0
+                                            ? [Color(hex: "D97706"), Color(hex: "B45309")]
+                                            : [Color(hex: "059669"), Color(hex: "047857")],
                                         startPoint: .top,
                                         endPoint: .bottom
                                     )
                                 )
-                                .shadow(color: Color(hex: "007AFF").opacity(0.35), radius: 3, y: 1.5)
+                                .shadow(color: (totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669")).opacity(0.35), radius: 3, y: 1.5)
                         )
                     }
                     .buttonStyle(PressableScaleButtonStyle())
@@ -692,6 +810,157 @@ struct DynamicIslandView: View {
         .buttonStyle(PlainButtonStyle())
     }
     
+    func agentDisplayName(_ agent: String) -> String {
+        switch agent {
+        case "agy": return "白 / AGY"
+        case "alma": return "Alma"
+        case "ping": return "Ping (VM)"
+        default: return agent
+        }
+    }
+    
+    func agentTasks(_ agent: String) -> [TaskItem] {
+        switch agent {
+        case "agy": return monitor.agyTasks
+        case "alma": return monitor.almaTasks
+        case "ping": return monitor.pingTasks
+        default: return []
+        }
+    }
+    
+    func agentTaskDrawerView(agent: String) -> some View {
+        let tasks = agentTasks(agent)
+        return VStack(spacing: 8) {
+            // Header Row
+            HStack {
+                Button(action: {
+                    monitor.setDrawerAgent(nil)
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 9.5, weight: .bold))
+                        Text("返回")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                    }
+                    .foregroundColor(Color(hex: "007AFF"))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        Capsule().fill(Color(hex: "007AFF").opacity(monitor.isDarkMode ? 0.20 : 0.12))
+                    )
+                }
+                .buttonStyle(PressableScaleButtonStyle())
+                
+                Spacer()
+                
+                Text("\(agentDisplayName(agent)) · \(tasks.count) 项真待办")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryTextColor)
+                
+                Spacer()
+                
+                Button(action: {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "\(monitor.rootPath)/\(agent)"))
+                }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: 8.5))
+                        Text("访达")
+                            .font(.system(size: 9.5, weight: .semibold))
+                    }
+                    .foregroundColor(secondaryTextColor)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(.top, 10)
+            .padding(.horizontal, 14)
+            
+            // Task List or Empty State
+            if tasks.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 26))
+                        .foregroundColor(Color(hex: "10B981"))
+                    Text("无待办事项 · 处于就绪状态")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundColor(primaryTextColor)
+                    Text("所有历史单均已合规回信结案")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(secondaryTextColor)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(spacing: 5) {
+                        ForEach(tasks) { task in
+                            HStack(spacing: 7) {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color(hex: "FF9500").opacity(0.18))
+                                        .frame(width: 22, height: 22)
+                                    Image(systemName: "doc.text.fill")
+                                        .font(.system(size: 9.5, weight: .bold))
+                                        .foregroundColor(Color(hex: "D97706"))
+                                }
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(task.title)
+                                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                                        .foregroundColor(primaryTextColor)
+                                        .lineLimit(1)
+                                    HStack(spacing: 4) {
+                                        Text("\(task.from) → \(task.to)")
+                                            .font(.system(size: 8.5, weight: .medium))
+                                            .foregroundColor(secondaryTextColor)
+                                        Text("•")
+                                            .font(.system(size: 7))
+                                            .foregroundColor(secondaryTextColor.opacity(0.6))
+                                        Text(task.date)
+                                            .font(.system(size: 8.5, weight: .medium))
+                                            .foregroundColor(secondaryTextColor)
+                                    }
+                                }
+                                Spacer()
+                                Button(action: {
+                                    let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                }) {
+                                    Text("查看单据")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundColor(Color(hex: "007AFF"))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 3.5)
+                                        .background(
+                                            Capsule()
+                                                .fill(Color(hex: "007AFF").opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                        )
+                                }
+                                .buttonStyle(PressableScaleButtonStyle())
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(squircleCardBackground)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .frame(maxHeight: 200)
+            }
+            
+            // Bottom Guidance Line
+            HStack {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 7.5))
+                    .foregroundColor(Color(hex: "D97706"))
+                Text("露露掌握最高裁决权 · 见真实回信与产物方可收口")
+                    .font(.system(size: 8.5, weight: .medium, design: .rounded))
+                    .foregroundColor(secondaryTextColor.opacity(0.85))
+            }
+            .padding(.bottom, 6)
+        }
+    }
+    
     var squircleCardBackground: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
@@ -741,7 +1010,8 @@ struct DynamicIslandView: View {
         switch monitor.currentMode {
         case .compact: return 165
         case .notification: return 320
-        case .expanded: return 356
+        case .expanded:
+            return monitor.selectedDrawerAgent != nil ? 386 : 356
         }
     }
     
@@ -749,7 +1019,8 @@ struct DynamicIslandView: View {
         switch monitor.currentMode {
         case .compact: return 28
         case .notification: return 34
-        case .expanded: return 238
+        case .expanded:
+            return monitor.selectedDrawerAgent != nil ? 310 : 238
         }
     }
     
@@ -762,7 +1033,7 @@ struct DynamicIslandView: View {
     }
     
     var allHealthy: Bool {
-        return monitor.funnelOnline && (monitor.agyPending == 0)
+        return monitor.funnelOnline && monitor.nutstoreOnline && monitor.tailscaleOnline && totalPending == 0
     }
     
     var statusSummary: String {
@@ -830,6 +1101,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updatePanelFrame(for: mode)
         }
         
+        monitor.onDrawerChange = { [weak self] in
+            guard let self = self else { return }
+            self.updatePanelFrame(for: self.monitor.currentMode)
+        }
+        
         // Listen to macOS System Appearance Theme Change (Light <-> Dark mode instantaneous switch)
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
@@ -895,7 +1171,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "🏝️ 打开/收起中控台", action: #selector(toggleIsland), keyEquivalent: "i"))
-        menu.addItem(NSMenuItem(title: "⚡ 一键全网收口", action: #selector(sweepAll), keyEquivalent: "k"))
+        menu.addItem(NSMenuItem(title: "🔍 全网核验与对齐", action: #selector(reconcileAll), keyEquivalent: "k"))
         menu.addItem(NSMenuItem(title: "📁 打开 Spaces 产物库", action: #selector(openSpaces), keyEquivalent: "s"))
         menu.addItem(NSMenuItem(title: "📝 打开《交流.md》", action: #selector(openCommLog), keyEquivalent: "c"))
         menu.addItem(NSMenuItem(title: "🌐 检查 Funnel 健康状态", action: #selector(openFunnelHealth), keyEquivalent: "f"))
@@ -942,8 +1218,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             windowWidth = 360
             windowHeight = 54
         case .expanded:
-            windowWidth = 390
-            windowHeight = 265
+            if monitor.selectedDrawerAgent != nil {
+                windowWidth = 416
+                windowHeight = 340
+            } else {
+                windowWidth = 390
+                windowHeight = 265
+            }
         }
         
         let x = screenFrame.origin.x + (screenFrame.width - windowWidth) / 2.0
@@ -969,8 +1250,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    @objc func sweepAll() {
-        monitor.triggerSweepAll()
+    @objc func reconcileAll() {
+        monitor.triggerVerifyAndReconcile()
     }
     
     @objc func openSpaces() {
