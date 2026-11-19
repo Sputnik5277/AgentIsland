@@ -63,6 +63,7 @@ struct TaskItem: Identifiable, Hashable {
     var statusText: String = "待接单"
     var artifacts: String = ""
     var eta: String = ""
+    var highlights: String = ""
 }
 
 enum IslandMode: Equatable {
@@ -130,7 +131,26 @@ class AgentMonitor: ObservableObject {
     @Published var tailscaleOnline: Bool = true
     
     @Published var currentMode: IslandMode = .compact
-    @Published var selectedDrawerAgent: String? = nil
+    @Published var selectedDrawerAgent: String? = nil {
+        didSet { self.onDrawerChange?() }
+    }
+    @Published var showTopology: Bool = false {
+        didSet { self.onDrawerChange?() }
+    }
+    @Published var expandedTaskId: String? = nil
+    
+    func toggleTaskExpanded(_ id: String) {
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.20)) {
+                if self.expandedTaskId == id {
+                    self.expandedTaskId = nil
+                } else {
+                    self.expandedTaskId = id
+                }
+            }
+            self.onDrawerChange?()
+        }
+    }
     @Published var pulse: Bool = false
     @Published var isDarkMode: Bool = false
     @Published var reconcileFeedback: String? = nil
@@ -444,6 +464,14 @@ import handoff
 boxes = ['ping', 'agy', 'alma']
 ROOT = handoff.HANDOFFS_ROOT
 
+
+
+all_acked_bases = set()
+for b in boxes + ['lulu']:
+    for k in handoff.load_ack(b).keys():
+        b_stem = k.replace('.md', '').split('-reply')[0].split('-audit')[0].split('-submit')[0]
+        all_acked_bases.add(b_stem)
+
 # Phase 1: Global reply index across all boxes (prevents cross-box blindspots)
 global_replied = set()
 for b in boxes:
@@ -523,15 +551,16 @@ for box in boxes:
                 'stage': stage,
                 'statusText': status_text,
                 'artifacts': '',
-                'eta': eta
+                'eta': eta,
+                'highlights': handoff.extract_highlights(text)
             })
         except Exception:
             pass
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
 
-# Phase 3: Pending Confirmations (Meituan Step 3: Submitted waiting for Confirm)
-pending_confirms = []
+# Phase 3: Pending Confirmations (发起方闭环核验中)
+raw_confirms = []
 for b in boxes:
     b_dir = ROOT / b
     if not b_dir.is_dir(): continue
@@ -544,24 +573,33 @@ for b in boxes:
             status = str(meta.get('status', '')).strip()
             if status != '待确认': continue
             to_agent = str(meta.get('to', '')).strip().lower()
+            b_stem = p.name.replace('.md', '').split('-reply')[0].split('-audit')[0].split('-submit')[0]
+            if b_stem in all_acked_bases: continue
             acked = handoff.load_ack(to_agent)
-            if p.name in acked: continue
-            artifacts = str(meta.get('artifacts', ''))
-            pending_confirms.append({
+            if p.name in acked or b_stem in acked: continue
+            raw_confirms.append({
                 'file': f'{b}/{p.name}',
+                'base': b_stem,
                 'from': str(meta.get('from', '未知')),
                 'to': to_agent,
                 'date': str(meta.get('date', '-')),
                 'title': handoff.first_heading(body) or p.stem,
                 'mtime': p.stat().st_mtime,
                 'stage': 'submitted',
-                'statusText': '待验收',
-                'artifacts': artifacts,
-                'eta': '等待验货'
+                'statusText': '发起方核验中',
+                'artifacts': str(meta.get('artifacts', '')),
+                'eta': '发起方验收中',
+                'highlights': handoff.extract_highlights(txt)
             })
         except Exception: pass
-pending_confirms.sort(key=lambda x: x['mtime'], reverse=True)
-res['pending_confirms'] = pending_confirms
+
+latest_by_base = {}
+for item in raw_confirms:
+    b_key = item['base']
+    if b_key not in latest_by_base or item['mtime'] > latest_by_base[b_key]['mtime']:
+        latest_by_base[b_key] = item
+
+res['pending_confirms'] = sorted(latest_by_base.values(), key=lambda x: x['mtime'], reverse=True)
 
 # Phase 4: Extract recent completed replies (Done Feed, only confirmed)
 for box in boxes:
@@ -588,7 +626,8 @@ for box in boxes:
                     'stage': 'confirmed',
                     'statusText': '已结案',
                     'artifacts': str(meta.get('artifacts', '')),
-                    'eta': ''
+                    'eta': '',
+                    'highlights': handoff.extract_highlights(txt)
                 })
             except Exception:
                 pass
@@ -644,7 +683,8 @@ print(json.dumps(res, ensure_ascii=False))
                         let statusText = (d["statusText"] as? String) ?? "待接单"
                         let artifacts = (d["artifacts"] as? String) ?? ""
                         let eta = (d["eta"] as? String) ?? ""
-                        return TaskItem(file: file, from: from, to: to, date: date, title: title, stage: stage, statusText: statusText, artifacts: artifacts, eta: eta)
+                        let highlights = (d["highlights"] as? String) ?? ""
+                        return TaskItem(file: file, from: from, to: to, date: date, title: title, stage: stage, statusText: statusText, artifacts: artifacts, eta: eta, highlights: highlights)
                     }
                 }
                 return output
@@ -701,16 +741,16 @@ struct DynamicIslandView: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 
-                // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，对标 context-viewer)
+                // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .fill(
                         monitor.currentMode == .compact
                             ? (monitor.isDarkMode
-                                ? Color.black.opacity(0.90)
-                                : Color(hex: "FFFFFF").opacity(0.92))
+                                ? Color.black.opacity(0.94)
+                                : Color(hex: "FFFFFF").opacity(0.95))
                             : (monitor.isDarkMode
-                                ? Color(hex: "080B12").opacity(0.88)
-                                : Color.white.opacity(0.92))
+                                ? Color(hex: "080B12").opacity(0.95)
+                                : Color.white.opacity(0.94))
                     )
                 
                 // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
@@ -830,35 +870,73 @@ struct DynamicIslandView: View {
         .padding(.horizontal, 12)
     }
     
-    // MARK: - Apple Control Center 1:1 Layout (参考用户发来的控制中心截图)
+    // MARK: - AgentIsland & Multi-Agent 架构控制中心 (苹果原厂大字阶与四层空间调度)
     var controlCenterExpandedView: some View {
-        VStack(spacing: 10) {
-            // Header Row
-            HStack {
-                HStack(spacing: 6) {
-                    ZStack {
-                        Circle()
-                            .fill(accentColor)
-                            .frame(width: 17, height: 17)
-                        Image(systemName: "slider.horizontal.3")
-                            .foregroundColor(.white)
-                            .font(.system(size: 8.5, weight: .bold))
-                    }
-                    Text("Agent 控制中心")
-                        .font(.system(size: 12.5, weight: .bold, design: .rounded))
-                        .foregroundColor(primaryTextColor)
+        VStack(spacing: 8) {
+            // Layer 1: Header Row (14pt 大标题 + 链路图切换 + 关闭/Esc)
+            HStack(spacing: 8) {
+                ZStack {
+                    Circle()
+                        .fill(accentColor)
+                        .frame(width: 22, height: 22)
+                    Image(systemName: "slider.horizontal.3")
+                        .foregroundColor(.white)
+                        .font(.system(size: 11, weight: .bold))
                 }
+                Text("AgentIsland 控制中心")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryTextColor)
+                
+                // 顶部视图模式切换：工单流 vs 架构链路图
+                HStack(spacing: 2) {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            monitor.showTopology = false
+                        }
+                    }) {
+                        Text("📋 调度工单")
+                            .font(.system(size: 10.5, weight: !monitor.showTopology ? .bold : .medium, design: .rounded))
+                            .foregroundColor(!monitor.showTopology ? Color.white : secondaryTextColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule().fill(!monitor.showTopology ? accentColor : Color.clear)
+                            )
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            monitor.showTopology = true
+                        }
+                    }) {
+                        Text("🌐 全网链路图")
+                            .font(.system(size: 10.5, weight: monitor.showTopology ? .bold : .medium, design: .rounded))
+                            .foregroundColor(monitor.showTopology ? Color.white : secondaryTextColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule().fill(monitor.showTopology ? accentColor : Color.clear)
+                            )
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding(2)
+                .background(
+                    Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
+                )
+                
                 Spacer()
                 
-                // Status hint
+                // Status hint / reconcile feedback
                 if let fb = monitor.reconcileFeedback {
                     Text(fb)
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
                         .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
                         .transition(.scale)
                 } else {
-                    Text("点外部或 Esc 收起")
-                        .font(.system(size: 9.5, weight: .medium))
+                    Text("Esc 收起")
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundColor(secondaryTextColor.opacity(0.8))
                 }
                 
@@ -867,264 +945,562 @@ struct DynamicIslandView: View {
                 }) {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundColor(secondaryTextColor.opacity(0.6))
-                        .font(.system(size: 13))
+                        .font(.system(size: 16))
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-            .padding(.top, 10)
-            .padding(.horizontal, 14)
+            .padding(.top, 8)
+            .padding(.horizontal, 16)
             
-            // Section 1: Top 2-Column Grid (Like Wi-Fi / Bluetooth + Now Playing Card in Control Center)
-            HStack(spacing: 9) {
-                // Left Column: 3 Stacked Agent Squircle Capsules
-                VStack(spacing: 6) {
-                    controlCenterPill(
+            // Layer 2: 黄金展示区 (工单流 vs 架构链路图)
+            if monitor.showTopology {
+                // 真正的全网四层立体架构全透明链路图
+                architectureTopologyView
+            } else {
+                if !monitor.pendingConfirms.isEmpty {
+                    liveDispatchHeroCardView
+                        .padding(.horizontal, 14)
+                } else {
+                    autoloopReadyHeroCardView
+                        .padding(.horizontal, 14)
+                }
+                
+                // Layer 3: 三 Agent 实名横向并列卡 (3 Balanced Columns)
+                HStack(spacing: 10) {
+                    agentBalanceCard(
                         icon: "apple.terminal.fill",
                         iconBg: accentColor,
                         title: "白 / AGY",
-                        subtitle: monitor.agyPending == 0 ? "空闲就绪" : "\(monitor.agyPending) 待办",
+                        subtitle: monitor.agyPending == 0 ? "前台就绪" : "\(monitor.agyPending) 项待办",
                         hasPending: monitor.agyPending > 0
                     ) {
                         monitor.setDrawerAgent("agy")
                     }
-                    controlCenterPill(
+                    
+                    agentBalanceCard(
                         icon: "bolt.fill",
                         iconBg: Color(hex: "FF9500"),
                         title: "Alma",
-                        subtitle: monitor.almaPending == 0 ? "空闲巡检" : "\(monitor.almaPending) 待办",
+                        subtitle: monitor.almaPending == 0 ? "中台巡检" : "\(monitor.almaPending) 项待办",
                         hasPending: monitor.almaPending > 0
                     ) {
                         monitor.setDrawerAgent("alma")
                     }
-                    controlCenterPill(
+                    
+                    agentBalanceCard(
                         icon: "cloud.fill",
                         iconBg: Color(hex: "5856D6"),
                         title: "Ping (VM)",
-                        subtitle: monitor.pingPending == 0 ? "空闲就绪" : "\(monitor.pingPending) 待办",
+                        subtitle: monitor.pingPending == 0 ? "云端总控" : "\(monitor.pingPending) 项待办",
                         hasPending: monitor.pingPending > 0
                     ) {
                         monitor.setDrawerAgent("ping")
                     }
                 }
-                .frame(width: 220)
-                
-                // Right Column: Hero Squircle Card (Meituan Order Live Tracking)
-                VStack(spacing: 8) {
-                    HStack {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(monitor.totalSubmitted > 0 ? Color(hex: "8B5CF6") : (totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669")))
-                                .frame(width: 22, height: 22)
-                            Image(systemName: monitor.totalSubmitted > 0 ? "bell.badge.fill" : (totalPending > 0 ? "hourglass" : "checkmark.shield.fill"))
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(.white)
-                        }
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(monitor.totalSubmitted > 0 ? "美团履约 · 待验收" : "美团实时履约")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(secondaryTextColor)
-                            HStack(spacing: 4) {
-                                if monitor.totalSubmitted > 0 {
-                                    Text("\(monitor.totalSubmitted) 待验")
-                                        .font(.system(size: 13, weight: .bold, design: .rounded))
-                                        .foregroundColor(Color(hex: "8B5CF6"))
-                                }
-                                Text("\(totalPending) 待办")
-                                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                                    .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
+                .padding(.horizontal, 14)
+            }
+            
+            // Layer 4: 底部收拢通道与资产入口 (Slim Footer)
+            HStack(spacing: 10) {
+                // 通道指示灯
+                HStack(spacing: 8) {
+                    channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline) {
+                        if monitor.funnelOnline {
+                            if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
+                                NSWorkspace.shared.open(u)
                             }
                         }
-                        Spacer()
                     }
-                    
-                    // Deep Telemetry Badge (Antigravity Context & Ledger)
-                    HStack(spacing: 5) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "circle.hexagongrid.fill")
-                                .font(.system(size: 8))
-                                .foregroundColor(accentColor)
-                            Text(monitor.tokenTotal)
-                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                                .foregroundColor(primaryTextColor)
-                        }
-                        Text("·")
-                            .font(.system(size: 8.5))
-                            .foregroundColor(secondaryTextColor.opacity(0.4))
-                        HStack(spacing: 2) {
-                            Image(systemName: "bolt.fill")
-                                .font(.system(size: 7.5))
-                                .foregroundColor(Color(hex: "34C759"))
-                            Text("Cache \(monitor.tokenCacheRate)")
-                                .font(.system(size: 8.5, weight: .medium, design: .rounded))
-                                .foregroundColor(secondaryTextColor)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
-                    )
-                    
-                    Spacer()
-                    
-                    // Big Action Button: Verify & Reconcile & Archive
-                    Button(action: {
-                        monitor.triggerVerifyAndReconcile()
-                    }) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "sparkle.magnifyingglass")
-                                .font(.system(size: 10, weight: .bold))
-                            Text("🔍 全网核验与归档")
-                                .font(.system(size: 10.5, weight: .bold, design: .rounded))
-                        }
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 7)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(
-                                    LinearGradient(
-                                        colors: totalPending > 0
-                                            ? [Color(hex: "D97706"), Color(hex: "B45309")]
-                                            : [Color(hex: "059669"), Color(hex: "047857")],
-                                        startPoint: .top,
-                                        endPoint: .bottom
-                                    )
-                                )
-                                .shadow(color: (totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669")).opacity(0.35), radius: 3, y: 1.5)
-                        )
-                    }
-                    .buttonStyle(PressableScaleButtonStyle())
-                }
-                .padding(10)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(squircleCardBackground)
-            }
-            .frame(height: 122)
-            .padding(.horizontal, 12)
-            
-            // Section 2: Quick Action Squircles (Like Focus Mode / AirDrop row in Control Center)
-            HStack(spacing: 8) {
-                actionSquircle(icon: "photo.on.rectangle", label: "全景图 v28") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
-                }
-                actionSquircle(icon: "folder.fill", label: "Spaces 库") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
-                }
-                actionSquircle(icon: "bubble.left.and.bubble.right.fill", label: "交流台账") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
-                }
-            }
-            .padding(.horizontal, 12)
-            
-            // Section 3: Sliders & Channels Row (Like Display / Sound bars in Control Center)
-            HStack(spacing: 12) {
-                channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline) {
-                    if monitor.funnelOnline {
-                        if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
-                            NSWorkspace.shared.open(u)
-                        }
-                    } else {
-                        let p = Process()
-                        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                        p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.lin.funnel-server"]
-                        try? p.run()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                            monitor.refreshAll()
-                        }
-                    }
-                }
-                channelItem(name: "坚果云", isOk: monitor.nutstoreOnline) {
-                    if monitor.nutstoreOnline {
+                    channelItem(name: "坚果云", isOk: monitor.nutstoreOnline) {
                         NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files"))
-                    } else {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Nutstore.app"))
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                            monitor.refreshAll()
-                        }
+                    }
+                    channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
                     }
                 }
-                channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline) {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
-                }
+                
                 Spacer()
                 
-                Button(action: {
-                    monitor.refreshAll()
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 9))
-                        Text("刷新")
-                            .font(.system(size: 9.5, weight: .semibold))
+                // 快捷资产入口
+                HStack(spacing: 8) {
+                    Button(action: {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "photo.on.rectangle")
+                                .font(.system(size: 10.5))
+                            Text("全景图")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(secondaryTextColor)
                     }
-                    .foregroundColor(secondaryTextColor)
+                    .buttonStyle(PlainButtonStyle())
+                    
+                    Button(action: {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "folder.fill")
+                                .font(.system(size: 10.5))
+                            Text("Spaces")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(secondaryTextColor)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    
+                    Button(action: {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bubble.left.and.bubble.right.fill")
+                                .font(.system(size: 10.5))
+                            Text("交流.md")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(secondaryTextColor)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    
+                    Button(action: {
+                        monitor.refreshAll()
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundColor(secondaryTextColor)
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
-                .buttonStyle(PlainButtonStyle())
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 6)
+            .padding(.vertical, 5)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
             )
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 14)
             .padding(.bottom, 8)
         }
     }
     
-    // Squircle Capsule (Wi-Fi/Bluetooth style)
-    func controlCenterPill(icon: String, iconBg: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    // 全网四层立体架构全透明链路图 (真实架构拓扑 · 过程100%全透明)
+    var architectureTopologyView: some View {
+        VStack(spacing: 7) {
+            // Layer 1: 指挥层
             HStack(spacing: 8) {
                 ZStack {
-                    Circle()
-                        .fill(iconBg)
-                        .frame(width: 22, height: 22)
-                    Image(systemName: icon)
-                        .font(.system(size: 9.5, weight: .bold))
-                        .foregroundColor(.white)
+                    Circle().fill(Color(hex: "D97706").opacity(0.18)).frame(width: 24, height: 24)
+                    Image(systemName: "person.crop.circle.fill").font(.system(size: 13, weight: .bold)).foregroundColor(Color(hex: "D97706"))
                 }
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(primaryTextColor)
-                    Text(subtitle)
-                        .font(.system(size: 8.5, weight: .medium))
-                        .foregroundColor(hasPending ? Color(hex: "D97706") : secondaryTextColor)
+                    Text("【01 指挥层】露露 (Commander)").font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    Text("iPhone 手机端 / Muse / 微信 — 意图发起与最高裁决").font(.system(size: 9.5, weight: .medium)).foregroundColor(secondaryTextColor)
                 }
                 Spacer()
-                if hasPending {
-                    Image(systemName: "folder.badge.gearshape")
-                        .font(.system(size: 8.5, weight: .semibold))
-                        .foregroundColor(Color(hex: "D97706"))
+                Text("意图源头").font(.system(size: 9, weight: .semibold)).foregroundColor(Color(hex: "D97706")).padding(.horizontal, 5).padding(.vertical, 2).background(Capsule().fill(Color(hex: "D97706").opacity(0.12)))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(squircleCardBackground)
+            
+            // Arrow 1
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.down").font(.system(size: 8.5, weight: .bold)).foregroundColor(secondaryTextColor.opacity(0.5))
+                Text("自然语言意图 / 手机点选决策卡").font(.system(size: 8.5, weight: .medium, design: .monospaced)).foregroundColor(secondaryTextColor.opacity(0.7))
+            }
+            
+            // Layer 2: 总控层
+            HStack(spacing: 8) {
+                ZStack {
+                    Circle().fill(Color(hex: "5856D6").opacity(0.18)).frame(width: 24, height: 24)
+                    Image(systemName: "cloud.fill").font(.system(size: 12, weight: .bold)).foregroundColor(Color(hex: "5856D6"))
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("【02 总控层】Ping (Dispatcher · 云端 VM)").font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    Text("意图编译、全网派单 (Step 1)、指标核验、发起方结案 (Step 4)").font(.system(size: 9.5, weight: .medium)).foregroundColor(secondaryTextColor)
+                }
+                Spacer()
+                HStack(spacing: 3) {
+                    Circle().fill(Color(hex: "10B981")).frame(width: 5, height: 5)
+                    Text("云端常驻").font(.system(size: 9, weight: .bold)).foregroundColor(Color(hex: "10B981"))
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(squircleCardBackground)
+            
+            // Arrow 2: Dual Dedicated Channels
+            HStack(spacing: 16) {
+                HStack(spacing: 3) {
+                    Image(systemName: "bolt.fill").font(.system(size: 8))
+                    Text("Funnel 443 HTTPS 专线 (100ms)").font(.system(size: 9, weight: .bold, design: .rounded))
+                }
+                .foregroundColor(Color(hex: "059669"))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color(hex: "059669").opacity(0.14)))
+                
+                HStack(spacing: 3) {
+                    Image(systemName: "lock.shield.fill").font(.system(size: 8))
+                    Text("Tailscale SSH 专线").font(.system(size: 9, weight: .bold, design: .rounded))
+                }
+                .foregroundColor(Color(hex: "3B82F6"))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color(hex: "3B82F6").opacity(0.14)))
+            }
+            
+            // Layer 3: 执行端双机协同
+            HStack(spacing: 8) {
+                // Mac Mini
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "apple.terminal.fill").font(.system(size: 10, weight: .bold)).foregroundColor(accentColor)
+                        Text("【03 执行中台】Mac Mini").font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    }
+                    Text("白/AGY (前台交互/代码走查) · Alma (中台)").font(.system(size: 8.5, weight: .medium)).foregroundColor(secondaryTextColor)
+                    Text("Funnel 接收即广播: events.log ➔ autoloop").font(.system(size: 8, weight: .medium, design: .monospaced)).foregroundColor(Color(hex: "059669"))
+                }
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(squircleCardBackground)
+                
+                // Simulation PC
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "desktopcomputer").font(.system(size: 10, weight: .bold)).foregroundColor(Color(hex: "3B82F6"))
+                        Text("【04 算力实机】模拟电脑").font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    }
+                    Text("PFC3D 9012 / FLAC3D 9011 原生求解").font(.system(size: 8.5, weight: .medium)).foregroundColor(secondaryTextColor)
+                    Text("IP 192.168.50.239 · 2400×1600 图件落盘").font(.system(size: 8, weight: .medium, design: .monospaced)).foregroundColor(Color(hex: "3B82F6"))
+                }
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(squircleCardBackground)
+            }
+        }
+        .padding(.horizontal, 14)
+    }
+
+    // AgentIsland 架构调度·全透明履约焦点卡 (点开卡片可查看核心提炼重点)
+    @ViewBuilder
+    var liveDispatchHeroCardView: some View {
+        let count = monitor.pendingConfirms.count
+        if count > 0 {
+            let safeIdx = min(max(0, monitor.activeConfirmIndex), count - 1)
+            let item = monitor.pendingConfirms[safeIdx]
+            
+            VStack(spacing: 8) {
+                // Header: 调度状态 + 轮播器
+                HStack(spacing: 6) {
+                    ZStack {
+                        Circle()
+                            .fill(Color(hex: "8B5CF6"))
+                            .frame(width: 18, height: 18)
+                        Image(systemName: "bell.badge.fill")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    Text("架构调度 · 发起方亲自视觉验收闭环")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundColor(Color(hex: "8B5CF6"))
+                    
+                    Spacer()
+                    
+                    if count > 1 {
+                        HStack(spacing: 6) {
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    monitor.activeConfirmIndex = (safeIdx - 1 + count) % count
+                                }
+                            }) {
+                                Image(systemName: "chevron.left")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                    .frame(width: 18, height: 18)
+                                    .background(squircleCardBackground)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            
+                            Text("\(safeIdx + 1)/\(count)")
+                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                .foregroundColor(secondaryTextColor)
+                            
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    monitor.activeConfirmIndex = (safeIdx + 1) % count
+                                }
+                            }) {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                    .frame(width: 18, height: 18)
+                                    .background(squircleCardBackground)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                    }
+                }
+                .padding(.horizontal, 4)
+                
+                // Card Body (点击卡片展开提炼重点)
+                VStack(alignment: .leading, spacing: 6) {
+                    // Task Title + 4-Step Stepper
+                    HStack(alignment: .center) {
+                        Text(item.title)
+                            .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                            .foregroundColor(primaryTextColor)
+                            .lineLimit(1)
+                        Spacer()
+                        lifecycleStepperView(stage: item.stage)
+                    }
+                    
+                    // Route & Artifact Link
+                    HStack(spacing: 8) {
+                        HStack(spacing: 4) {
+                            Text("履约方: \(item.from)")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundColor(Color(hex: "3B82F6"))
+                            Text("➔")
+                                .font(.system(size: 9))
+                                .foregroundColor(secondaryTextColor)
+                            Text("派单方: \(item.to)")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundColor(Color(hex: "8B5CF6"))
+                        }
+                        
+                        if !item.artifacts.isEmpty {
+                            Text("•")
+                                .font(.system(size: 8))
+                                .foregroundColor(secondaryTextColor)
+                            Button(action: {
+                                let ap = item.artifacts.hasPrefix("/") ? item.artifacts : "\(monitor.rootPath)/../\(item.artifacts)"
+                                NSWorkspace.shared.open(URL(fileURLWithPath: ap))
+                            }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "arrow.up.right.square.fill")
+                                        .font(.system(size: 9.5))
+                                    Text("产物: \(item.artifacts)")
+                                        .font(.system(size: 10.5, weight: .medium))
+                                        .lineLimit(1)
+                                }
+                                .foregroundColor(accentColor)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                        
+                        Spacer()
+                        
+                        Button(action: {
+                            monitor.toggleTaskExpanded(item.id)
+                        }) {
+                            HStack(spacing: 2) {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 8.5))
+                                Text(monitor.expandedTaskId == item.id ? "收起" : "重点")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundColor(monitor.expandedTaskId == item.id ? Color.white : accentColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                Capsule().fill(monitor.expandedTaskId == item.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                            )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        
+                        Button(action: {
+                            let path = "\(monitor.rootPath)/\(item.file)"
+                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        }) {
+                            Text("原文")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(secondaryTextColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3.5)
+                                .background(
+                                    Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    
+                    // 点开卡片展开核心提炼重点
+                    if monitor.expandedTaskId == item.id {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "text.quote")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(accentColor)
+                                Text("核心提炼重点")
+                                    .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                                    .foregroundColor(accentColor)
+                            }
+                            Text(item.highlights.isEmpty ? "（本单据暂无正文摘要）" : item.highlights)
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundColor(primaryTextColor)
+                                .lineSpacing(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                        )
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    monitor.toggleTaskExpanded(item.id)
+                }
+            }
+            .padding(10)
+            .background(squircleCardBackground)
+        }
+    }
+    
+    // 全员就绪态 Hero 卡片 (AgentIsland & Autoloop 中台运行就绪)
+    @ViewBuilder
+    var autoloopReadyHeroCardView: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color(hex: "059669").opacity(monitor.isDarkMode ? 0.20 : 0.12))
+                    .frame(width: 34, height: 34)
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(Color(hex: "059669"))
+            }
+            
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text("全网架构就绪 · 0 积压待办")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(primaryTextColor)
+                    Text("•")
+                        .foregroundColor(secondaryTextColor)
+                    Text("Funnel 443 专线直达")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(Color(hex: "059669"))
+                }
+                
+                HStack(spacing: 6) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "circle.hexagongrid.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(accentColor)
+                        Text(monitor.tokenTotal)
+                            .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                            .foregroundColor(primaryTextColor)
+                    }
+                    Text("·")
+                        .font(.system(size: 9))
+                        .foregroundColor(secondaryTextColor.opacity(0.4))
+                    HStack(spacing: 3) {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(Color(hex: "34C759"))
+                        Text("缓存率 \(monitor.tokenCacheRate)")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundColor(secondaryTextColor)
+                    }
+                }
+            }
+            
+            Spacer()
+            
+            Button(action: {
+                monitor.triggerVerifyAndReconcile()
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "sparkle.magnifyingglass")
+                        .font(.system(size: 10.5, weight: .bold))
+                    Text("全网核验")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color(hex: "059669"))
+                )
+            }
+            .buttonStyle(PressableScaleButtonStyle())
+        }
+        .padding(12)
+        .background(squircleCardBackground)
+    }
+    
+    // 横向三等分 Agent 平衡卡片 (3 Balanced Cards)
+    func agentBalanceCard(icon: String, iconBg: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    ZStack {
+                        Circle()
+                            .fill(iconBg)
+                            .frame(width: 22, height: 22)
+                        Image(systemName: icon)
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    Text(title)
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundColor(primaryTextColor)
+                    Spacer()
+                    if hasPending {
+                        Circle()
+                            .fill(Color(hex: "8B5CF6"))
+                            .frame(width: 7, height: 7)
+                    }
+                }
+                Text(subtitle)
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    .foregroundColor(hasPending ? Color(hex: "8B5CF6") : secondaryTextColor)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(squircleCardBackground)
         }
         .buttonStyle(PressableScaleButtonStyle())
     }
     
-    // Action Squircle
-    func actionSquircle(icon: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(accentColor)
-                Text(label)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundColor(primaryTextColor)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 7)
-            .background(squircleCardBackground)
+    // 四段架构履约轴 (派单 ➔ 接单 ➔ 待验 ➔ 结案)
+    func lifecycleStepperView(stage: String) -> some View {
+        HStack(spacing: 3) {
+            stepperNode(name: "派单", active: true, done: stage != "dispatched")
+            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            stepperNode(name: "接单", active: stage == "accepted" || stage == "submitted" || stage == "confirmed", done: stage == "submitted" || stage == "confirmed")
+            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            stepperNode(name: "待验", active: stage == "submitted" || stage == "confirmed", done: stage == "confirmed", highlight: stage == "submitted")
+            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            stepperNode(name: "结案", active: stage == "confirmed", done: stage == "confirmed")
         }
-        .buttonStyle(PressableScaleButtonStyle())
+    }
+
+    func stepperNode(name: String, active: Bool, done: Bool, highlight: Bool = false) -> some View {
+        HStack(spacing: 2.5) {
+            Circle()
+                .fill(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.35)))
+                .frame(width: 5, height: 5)
+            Text(name)
+                .font(.system(size: 9.5, weight: highlight || done || active ? .bold : .medium, design: .rounded))
+                .foregroundColor(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : primaryTextColor) : secondaryTextColor))
+        }
+        .padding(.horizontal, 4.5)
+        .padding(.vertical, 2)
+        .background(
+            Capsule().fill(highlight ? Color(hex: "8B5CF6").opacity(0.18) : (active ? (done ? Color(hex: "10B981").opacity(0.12) : accentColor.opacity(0.10)) : Color.clear))
+        )
     }
     
     func channelItem(name: String, isOk: Bool, action: (() -> Void)? = nil) -> some View {
@@ -1135,7 +1511,7 @@ struct DynamicIslandView: View {
                     .frame(width: 6, height: 6)
                     .shadow(color: (isOk ? Color(hex: "10B981") : Color(hex: "EF4444")).opacity(0.5), radius: 1.5)
                 Text(name)
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundColor(isOk ? secondaryTextColor : Color(hex: "EF4444"))
             }
         }
@@ -1150,7 +1526,7 @@ struct DynamicIslandView: View {
         default: return agent
         }
     }
-    
+
     func agentTasks(_ agent: String) -> [TaskItem] {
         switch agent {
         case "agy": return monitor.agyTasks
@@ -1159,7 +1535,7 @@ struct DynamicIslandView: View {
         default: return []
         }
     }
-    
+
     func agentDoneTasks(_ agent: String) -> [TaskItem] {
         switch agent {
         case "agy": return monitor.agyDoneTasks
@@ -1169,220 +1545,26 @@ struct DynamicIslandView: View {
         }
     }
 
-    func meituanStepperView(stage: String) -> some View {
-        HStack(spacing: 2) {
-            stepperNode(name: "①派单", active: true, done: stage != "dispatched")
-            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
-            stepperNode(name: "②接单", active: stage != "dispatched", done: stage == "submitted" || stage == "confirmed")
-            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
-            stepperNode(name: "③待验", active: stage == "submitted", done: stage == "confirmed", highlight: stage == "submitted")
-            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
-            stepperNode(name: "④结案", active: stage == "confirmed", done: stage == "confirmed")
-        }
-    }
-
-    func stepperNode(name: String, active: Bool, done: Bool, highlight: Bool = false) -> some View {
-        Text(name)
-            .font(.system(size: 7, weight: active ? .bold : .medium, design: .rounded))
-            .foregroundColor(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.4)))
-            .padding(.horizontal, 3.5)
-            .padding(.vertical, 1)
-            .background(
-                Capsule().fill(highlight ? Color(hex: "8B5CF6").opacity(0.18) : (active ? (done ? Color(hex: "10B981").opacity(0.12) : accentColor.opacity(0.10)) : Color.clear))
-            )
-    }
-
-    // 美团外卖实时履约焦点卡 (完全按照美团与骑手系统设计 · 谁发出任务谁验收谁结束 · 中间过程透明化)
-    @ViewBuilder
-    var meituanLiveTrackingCardView: some View {
-        let count = monitor.pendingConfirms.count
-        if count > 0 {
-            let safeIdx = min(max(0, monitor.activeConfirmIndex), count - 1)
-            let item = monitor.pendingConfirms[safeIdx]
-            // 谁发出任务谁验收谁结束：仅派单方或露露有权确认收货结案
-            let isDispatcher = (item.to == "agy" || item.to == "lulu")
-            
-            VStack(spacing: 5) {
-                // Header: 骑手状态 + 轮播器
-                HStack(spacing: 5) {
-                    ZStack {
-                        Circle()
-                            .fill(Color(hex: "8B5CF6"))
-                            .frame(width: 15, height: 15)
-                        Image(systemName: "bell.fill")
-                            .font(.system(size: 7.5, weight: .bold))
-                            .foregroundColor(.white)
-                    }
-                    Text(isDispatcher ? "美团履约 · 产物送达待您验货" : "全网履约流 · 待派单方验收")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundColor(Color(hex: "8B5CF6"))
-                    
-                    Spacer()
-                    
-                    if count > 1 {
-                        HStack(spacing: 4) {
-                            Button(action: {
-                                withAnimation(.easeInOut(duration: 0.18)) {
-                                    monitor.activeConfirmIndex = (safeIdx - 1 + count) % count
-                                }
-                            }) {
-                                Image(systemName: "chevron.left")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundColor(secondaryTextColor)
-                                    .frame(width: 14, height: 14)
-                                    .background(squircleCardBackground)
-                            }
-                            .buttonStyle(PlainButtonStyle())
-                            
-                            Text("\(safeIdx + 1)/\(count)")
-                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                            
-                            Button(action: {
-                                withAnimation(.easeInOut(duration: 0.18)) {
-                                    monitor.activeConfirmIndex = (safeIdx + 1) % count
-                                }
-                            }) {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundColor(secondaryTextColor)
-                                    .frame(width: 14, height: 14)
-                                    .background(squircleCardBackground)
-                            }
-                            .buttonStyle(PlainButtonStyle())
-                        }
-                    }
-                }
-                .padding(.horizontal, 6)
-                
-                // Card Body
-                VStack(alignment: .leading, spacing: 4) {
-                    // Order Title + Stepper
-                    HStack {
-                        Text(item.title)
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundColor(primaryTextColor)
-                            .lineLimit(1)
-                        Spacer()
-                        meituanStepperView(stage: item.stage)
-                    }
-                    
-                    // Route & Artifact Link
-                    HStack(spacing: 4) {
-                        HStack(spacing: 2) {
-                            Text("骑手:\(item.from)")
-                                .font(.system(size: 8.5, weight: .semibold))
-                                .foregroundColor(Color(hex: "3B82F6"))
-                            Text("➔")
-                                .font(.system(size: 7))
-                                .foregroundColor(secondaryTextColor)
-                            Text("派单客户:\(item.to)")
-                                .font(.system(size: 8.5, weight: .bold))
-                                .foregroundColor(isDispatcher ? Color(hex: "8B5CF6") : secondaryTextColor)
-                        }
-                        
-                        if !item.artifacts.isEmpty {
-                            Text("•")
-                                .font(.system(size: 6.5))
-                                .foregroundColor(secondaryTextColor)
-                            Button(action: {
-                                let ap = item.artifacts.hasPrefix("/") ? item.artifacts : "\(monitor.rootPath)/../\(item.artifacts)"
-                                NSWorkspace.shared.open(URL(fileURLWithPath: ap))
-                            }) {
-                                HStack(spacing: 2) {
-                                    Image(systemName: "arrow.up.right.square")
-                                        .font(.system(size: 7))
-                                    Text("产物: \(item.artifacts)")
-                                        .font(.system(size: 8, weight: .medium))
-                                        .lineLimit(1)
-                                }
-                                .foregroundColor(accentColor)
-                            }
-                            .buttonStyle(PlainButtonStyle())
-                        }
-                        
-                        Spacer()
-                        
-                        // Actions: 严格遵循「谁发出任务谁验收谁结束」
-                        Button(action: {
-                            let path = "\(monitor.rootPath)/\(item.file)"
-                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                        }) {
-                            Text("查看单据")
-                                .font(.system(size: 8, weight: .semibold))
-                                .foregroundColor(primaryTextColor)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2.5)
-                                .background(squircleCardBackground)
-                        }
-                        .buttonStyle(PressableScaleButtonStyle())
-                        
-                        if isDispatcher {
-                            // 仅派单客户有权结案！
-                            Button(action: {
-                                monitor.confirmTask(file: item.file, dispatcher: item.to)
-                            }) {
-                                HStack(spacing: 2) {
-                                    Image(systemName: "checkmark")
-                                        .font(.system(size: 7.5, weight: .bold))
-                                    Text("确认收货结案")
-                                        .font(.system(size: 8, weight: .bold))
-                                }
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2.5)
-                                .background(
-                                    Capsule().fill(Color(hex: "8B5CF6"))
-                                )
-                            }
-                            .buttonStyle(PressableScaleButtonStyle())
-                        } else {
-                            // 非派单客户只能监督查看，无权越俎代庖！
-                            HStack(spacing: 2) {
-                                Image(systemName: "hourglass")
-                                    .font(.system(size: 7))
-                                Text("等待客户 \(item.to) 验货")
-                                    .font(.system(size: 7.5, weight: .semibold))
-                            }
-                            .foregroundColor(secondaryTextColor)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(
-                                Capsule().fill(Color.black.opacity(monitor.isDarkMode ? 0.3 : 0.05))
-                            )
-                        }
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
-                )
-            }
-            .padding(.horizontal, 2)
-        }
-    }
-    
     func agentTaskDrawerView(agent: String) -> some View {
         let tasks = agentTasks(agent)
-        return VStack(spacing: 8) {
-            // Header Row
+        let dones = agentDoneTasks(agent)
+        return VStack(spacing: 10) {
+            // Header Row (14pt 大标题 + 粗体返回)
             HStack {
                 Button(action: {
                     monitor.setDrawerAgent(nil)
                 }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "chevron.left")
-                            .font(.system(size: 9.5, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                         Text("返回")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .font(.system(size: 11.5, weight: .bold, design: .rounded))
                     }
                     .foregroundColor(accentColor)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3.5)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
                     .background(
-                        Capsule().fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.12))
+                        Capsule().fill(accentColor.opacity(monitor.isDarkMode ? 0.22 : 0.12))
                     )
                 }
                 .buttonStyle(PressableScaleButtonStyle())
@@ -1390,7 +1572,7 @@ struct DynamicIslandView: View {
                 Spacer()
                 
                 Text("\(agentDisplayName(agent)) · \(tasks.count) 项真待办")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
                     .foregroundColor(primaryTextColor)
                 
                 Spacer()
@@ -1398,203 +1580,280 @@ struct DynamicIslandView: View {
                 Button(action: {
                     NSWorkspace.shared.open(URL(fileURLWithPath: "\(monitor.rootPath)/\(agent)"))
                 }) {
-                    HStack(spacing: 3) {
+                    HStack(spacing: 4) {
                         Image(systemName: "folder.fill")
-                            .font(.system(size: 8.5))
+                            .font(.system(size: 10.5))
                         Text("访达")
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                     }
                     .foregroundColor(secondaryTextColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                    )
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-            .padding(.top, 10)
-            .padding(.horizontal, 14)
+            .padding(.top, 8)
+            .padding(.horizontal, 16)
             
-            // Task List + Done Feed Section
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(spacing: 8) {
+            // Task List + Done Feed Section (自适应展开 · 杜绝巨幅空白)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 10) {
                     // 1. Pending Tasks Section (if any)
                     if !tasks.isEmpty {
-                        LazyVStack(spacing: 5) {
+                        VStack(spacing: 8) {
                             ForEach(tasks) { task in
-                                HStack(spacing: 7) {
-                                    ZStack {
-                                        Circle()
-                                            .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
-                                            .frame(width: 20, height: 20)
-                                        Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.fill" : "doc.text.fill"))
-                                            .font(.system(size: 9, weight: .bold))
-                                            .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
-                                    }
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(task.title)
-                                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                                            .foregroundColor(primaryTextColor)
-                                            .lineLimit(1)
-                                        HStack(spacing: 4) {
-                                            meituanStepperView(stage: task.stage)
-                                            Text("•")
-                                                .font(.system(size: 7))
-                                                .foregroundColor(secondaryTextColor.opacity(0.6))
-                                            Text("\(task.from) → \(task.to)")
-                                                .font(.system(size: 8, weight: .medium))
-                                                .foregroundColor(secondaryTextColor)
-                                            if !task.eta.isEmpty {
-                                                Text("• \(task.eta)")
-                                                    .font(.system(size: 7.5, weight: .medium))
-                                                    .foregroundColor(Color(hex: "3B82F6"))
-                                            }
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 8) {
+                                        ZStack {
+                                            Circle()
+                                                .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
+                                                .frame(width: 24, height: 24)
+                                            Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.badge.fill" : "doc.text.fill"))
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
                                         }
-                                    }
-                                    Spacer()
-                                    
-                                    // Actions: 严格遵循「谁发出任务谁验收谁结束」
-                                    HStack(spacing: 5) {
-                                        if task.stage == "submitted" {
-                                            if task.to == "agy" || task.to == "lulu" {
-                                                Button(action: {
-                                                    monitor.confirmTask(file: "\(agent)/\(task.file)", dispatcher: task.to)
-                                                }) {
-                                                    Text("收货结案")
-                                                        .font(.system(size: 8.5, weight: .bold))
-                                                        .foregroundColor(.white)
-                                                        .padding(.horizontal, 6)
-                                                        .padding(.vertical, 3)
-                                                        .background(Capsule().fill(Color(hex: "8B5CF6")))
-                                                }
-                                                .buttonStyle(PressableScaleButtonStyle())
-                                            } else {
-                                                Text("待\(task.to)验货")
-                                                    .font(.system(size: 8, weight: .semibold))
+                                        
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(task.title)
+                                                .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                                                .foregroundColor(primaryTextColor)
+                                                .lineLimit(1)
+                                            
+                                            HStack(spacing: 6) {
+                                                lifecycleStepperView(stage: task.stage)
+                                                Text("•").font(.system(size: 8)).foregroundColor(secondaryTextColor.opacity(0.6))
+                                                Text("\(task.from) ➔ \(task.to)")
+                                                    .font(.system(size: 10, weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
-                                                    .padding(.horizontal, 5)
-                                                    .padding(.vertical, 2.5)
-                                                    .background(Capsule().fill(Color.black.opacity(0.12)))
+                                                if !task.eta.isEmpty {
+                                                    Text("• \(task.eta)")
+                                                        .font(.system(size: 10, weight: .semibold))
+                                                        .foregroundColor(Color(hex: "3B82F6"))
+                                                }
                                             }
                                         }
                                         
-                                        Button(action: {
-                                            let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
-                                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                                        }) {
-                                            Text("查看单据")
-                                                .font(.system(size: 8.5, weight: .semibold))
-                                                .foregroundColor(accentColor)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 3)
+                                        Spacer()
+                                        
+                                        // Action buttons (点开卡片查看重点)
+                                        HStack(spacing: 6) {
+                                            Button(action: {
+                                                monitor.toggleTaskExpanded(task.id)
+                                            }) {
+                                                HStack(spacing: 2) {
+                                                    Image(systemName: "sparkles")
+                                                        .font(.system(size: 8.5))
+                                                    Text(monitor.expandedTaskId == task.id ? "收起" : "重点")
+                                                        .font(.system(size: 10, weight: .bold))
+                                                }
+                                                .foregroundColor(monitor.expandedTaskId == task.id ? Color.white : accentColor)
+                                                .padding(.horizontal, 7)
+                                                .padding(.vertical, 3.5)
                                                 .background(
-                                                    Capsule()
-                                                        .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                    Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
                                                 )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
+                                            
+                                            Button(action: {
+                                                let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
+                                                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                            }) {
+                                                Text("原文")
+                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .foregroundColor(secondaryTextColor)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 3.5)
+                                                    .background(
+                                                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                                    )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
                                         }
-                                        .buttonStyle(PressableScaleButtonStyle())
+                                    }
+                                    
+                                    // 点开卡片展开核心提炼重点！
+                                    if monitor.expandedTaskId == task.id {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "text.quote")
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .foregroundColor(accentColor)
+                                                Text("核心提炼重点")
+                                                    .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                                                    .foregroundColor(accentColor)
+                                            }
+                                            Text(task.highlights.isEmpty ? "（本单据暂无正文摘要）" : task.highlights)
+                                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                                .foregroundColor(primaryTextColor)
+                                                .lineSpacing(3)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                        .padding(8)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                                .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                                        )
                                     }
                                 }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4.5)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
                                 .background(squircleCardBackground)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    monitor.toggleTaskExpanded(task.id)
+                                }
                             }
                         }
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 14)
                     } else {
-                        HStack(spacing: 5) {
+                        HStack(spacing: 6) {
                             Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 9.5, weight: .bold))
+                                .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(Color(hex: "059669"))
                             Text("当前无积压待办 · 全员就绪")
-                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
                                 .foregroundColor(Color(hex: "059669"))
                         }
-                        .padding(.vertical, 3)
+                        .padding(.vertical, 8)
                     }
                     
                     // 2. Done Feed Section (Recent Completed Replies)
-                    let dones = agentDoneTasks(agent)
                     if !dones.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 4) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 5) {
                                 Image(systemName: "clock.arrow.circlepath")
-                                    .font(.system(size: 8))
+                                    .font(.system(size: 10))
                                     .foregroundColor(secondaryTextColor)
                                 Text("最新结案回信 · 已办结流")
-                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
                                     .foregroundColor(secondaryTextColor)
                                 Spacer()
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.top, 2)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 4)
                             
-                            LazyVStack(spacing: 5) {
+                            VStack(spacing: 6) {
                                 ForEach(dones) { done in
-                                    HStack(spacing: 7) {
-                                        ZStack {
-                                            Circle()
-                                                .fill(Color(hex: "059669").opacity(0.16))
-                                                .frame(width: 20, height: 20)
-                                            Image(systemName: "checkmark")
-                                                .font(.system(size: 8.5, weight: .bold))
-                                                .foregroundColor(Color(hex: "059669"))
-                                        }
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            Text(done.title)
-                                                .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                                                .foregroundColor(primaryTextColor)
-                                                .lineLimit(1)
-                                            HStack(spacing: 4) {
-                                                Text("回件: \(done.from) → \(done.to)")
-                                                    .font(.system(size: 8))
-                                                    .foregroundColor(secondaryTextColor)
-                                                Text("•")
-                                                    .font(.system(size: 7))
-                                                    .foregroundColor(secondaryTextColor.opacity(0.5))
-                                                Text(done.date)
-                                                    .font(.system(size: 8))
-                                                    .foregroundColor(secondaryTextColor)
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack(spacing: 8) {
+                                            ZStack {
+                                                Circle()
+                                                    .fill(Color(hex: "059669").opacity(0.16))
+                                                    .frame(width: 22, height: 22)
+                                                Image(systemName: "checkmark")
+                                                    .font(.system(size: 10, weight: .bold))
+                                                    .foregroundColor(Color(hex: "059669"))
                                             }
-                                        }
-                                        Spacer()
-                                        Button(action: {
-                                            let path = "\(monitor.rootPath)/\(agent)/\(done.file)"
-                                            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                                        }) {
-                                            Text("查看回信")
-                                                .font(.system(size: 8.5, weight: .semibold))
-                                                .foregroundColor(accentColor)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 3)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(done.title)
+                                                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
+                                                    .foregroundColor(primaryTextColor)
+                                                    .lineLimit(1)
+                                                HStack(spacing: 4) {
+                                                    Text("回件: \(done.from) ➔ \(done.to)")
+                                                        .font(.system(size: 9.5, weight: .medium))
+                                                        .foregroundColor(secondaryTextColor)
+                                                    Text("•").font(.system(size: 8)).foregroundColor(secondaryTextColor.opacity(0.5))
+                                                    Text(done.date)
+                                                        .font(.system(size: 9.5))
+                                                        .foregroundColor(secondaryTextColor)
+                                                }
+                                            }
+                                            Spacer()
+                                            
+                                            Button(action: {
+                                                monitor.toggleTaskExpanded(done.id)
+                                            }) {
+                                                HStack(spacing: 2) {
+                                                    Image(systemName: "sparkles")
+                                                        .font(.system(size: 8.5))
+                                                    Text(monitor.expandedTaskId == done.id ? "收起" : "重点")
+                                                        .font(.system(size: 10, weight: .bold))
+                                                }
+                                                .foregroundColor(monitor.expandedTaskId == done.id ? Color.white : accentColor)
+                                                .padding(.horizontal, 7)
+                                                .padding(.vertical, 3.5)
                                                 .background(
-                                                    Capsule()
-                                                        .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                    Capsule().fill(monitor.expandedTaskId == done.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
                                                 )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
+                                            
+                                            Button(action: {
+                                                let path = "\(monitor.rootPath)/\(agent)/\(done.file)"
+                                                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                            }) {
+                                                Text("原文")
+                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .foregroundColor(secondaryTextColor)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 3.5)
+                                                    .background(
+                                                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                                    )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
                                         }
-                                        .buttonStyle(PressableScaleButtonStyle())
+                                        
+                                        // 点开回信卡片展开核心提炼重点！
+                                        if monitor.expandedTaskId == done.id {
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: "text.quote")
+                                                        .font(.system(size: 9, weight: .bold))
+                                                        .foregroundColor(accentColor)
+                                                    Text("核心提炼重点")
+                                                        .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                                                        .foregroundColor(accentColor)
+                                                }
+                                                Text(done.highlights.isEmpty ? "（本回信暂无正文摘要）" : done.highlights)
+                                                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                                                    .foregroundColor(primaryTextColor)
+                                                    .lineSpacing(3)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
+                                            .padding(8)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                                    .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                                            )
+                                        }
                                     }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4.5)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
                                     .background(squircleCardBackground)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        monitor.toggleTaskExpanded(done.id)
+                                    }
                                 }
                             }
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 14)
                         }
                     }
                 }
+                .padding(.vertical, 4)
             }
-            .frame(maxHeight: 215)
             
             // Bottom Guidance Line
-            HStack {
+            HStack(spacing: 5) {
                 Image(systemName: "hand.raised.fill")
-                    .font(.system(size: 7.5))
+                    .font(.system(size: 9))
                     .foregroundColor(Color(hex: "D97706"))
                 Text("露露掌握最高裁决权 · 见真实回信与产物方可收口")
-                    .font(.system(size: 8.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                     .foregroundColor(secondaryTextColor.opacity(0.85))
             }
-            .padding(.bottom, 6)
+            .padding(.bottom, 8)
         }
     }
-    
+
     var squircleCardBackground: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
@@ -1635,14 +1894,9 @@ struct DynamicIslandView: View {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
             return Color(hex: "EF4444")
         }
-        if monitor.totalSubmitted > 0 {
-            return Color(hex: "8B5CF6") // 极光紫：送达待验高光！
-        }
-        if monitor.totalAccepted > 0 {
-            return Color(hex: "3B82F6") // 动感蓝：履约中！
-        }
-        if monitor.totalDispatched > 0 {
-            return Color(hex: "F59E0B") // 琥珀黄：待接单
+        let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
+        if totalWorking > 0 {
+            return Color(hex: "3B82F6") // 动感蓝：系统调度履约中，不催促用户
         }
         return Color(hex: "10B981") // 薄荷绿：全员就绪
     }
@@ -1651,14 +1905,9 @@ struct DynamicIslandView: View {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
             return "exclamationmark.triangle.fill"
         }
-        if monitor.totalSubmitted > 0 {
-            return "bell.badge.fill"
-        }
-        if monitor.totalAccepted > 0 {
+        let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
+        if totalWorking > 0 {
             return "bolt.fill"
-        }
-        if monitor.totalDispatched > 0 {
-            return "shippingbox.fill"
         }
         return "checkmark.shield.fill"
     }
@@ -1669,19 +1918,29 @@ struct DynamicIslandView: View {
     
     var contentWidth: CGFloat {
         switch monitor.currentMode {
-        case .compact: return monitor.totalSubmitted > 0 || monitor.totalAccepted > 0 ? 186 : 170
-        case .notification: return 320
+        case .compact: return monitor.totalSubmitted > 0 || monitor.totalAccepted > 0 ? 196 : 176
+        case .notification: return 340
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 520 : 496 // 宽大通透大面板！
+            return 520
         }
     }
     
     var contentHeight: CGFloat {
         switch monitor.currentMode {
         case .compact: return 28
-        case .notification: return 34
+        case .notification: return 32
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 390 : 286 // 宽大多端大面板！
+            let extra = monitor.expandedTaskId != nil ? 65 : 0
+            if monitor.selectedDrawerAgent != nil {
+                let ag = monitor.selectedDrawerAgent ?? ""
+                let tCount = agentTasks(ag).count
+                let dCount = agentDoneTasks(ag).count
+                return CGFloat(((tCount + dCount <= 4) ? 260 : 330) + extra)
+            } else if monitor.showTopology {
+                return 248
+            } else {
+                return CGFloat((monitor.pendingConfirms.isEmpty ? 204 : 278) + extra)
+            }
         }
     }
     
@@ -1701,14 +1960,9 @@ struct DynamicIslandView: View {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
             return "通道异常"
         }
-        if monitor.totalSubmitted > 0 {
-            return "\(monitor.totalSubmitted) 待验收"
-        }
-        if monitor.totalAccepted > 0 {
-            return "\(monitor.totalAccepted) 履约中"
-        }
-        if monitor.totalDispatched > 0 {
-            return "\(monitor.totalDispatched) 待接单"
+        let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
+        if totalWorking > 0 {
+            return "\(totalWorking) 项履约中"
         }
         return "全员就绪"
     }
@@ -1923,18 +2177,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         switch mode {
         case .compact:
-            windowWidth = 200
-            windowHeight = 48
+            windowWidth = 220
+            windowHeight = 36
         case .notification:
-            windowWidth = 360
-            windowHeight = 54
+            windowWidth = 364
+            windowHeight = 40
         case .expanded:
+            windowWidth = 544
+            let extra = monitor.expandedTaskId != nil ? 65 : 0
             if monitor.selectedDrawerAgent != nil {
-                windowWidth = 416
-                windowHeight = 340
+                let ag = monitor.selectedDrawerAgent ?? ""
+                let tCount = (ag == "agy" ? monitor.agyTasks.count : (ag == "alma" ? monitor.almaTasks.count : monitor.pingTasks.count))
+                let dCount = (ag == "agy" ? monitor.agyDoneTasks.count : (ag == "alma" ? monitor.almaDoneTasks.count : monitor.pingDoneTasks.count))
+                windowHeight = CGFloat(((tCount + dCount <= 4) ? 276 : 346) + extra)
+            } else if monitor.showTopology {
+                windowHeight = 264
             } else {
-                windowWidth = 390
-                windowHeight = 265
+                windowHeight = CGFloat((monitor.pendingConfirms.isEmpty ? 220 : 294) + extra)
             }
         }
         
