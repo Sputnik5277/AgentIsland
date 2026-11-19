@@ -5,6 +5,26 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.4.0] - 2026-11-19
+
+### 🎨 Theme Customization & Light Mode Parity / 状态栏调色盘与浅色模式原厂重构
+
+- **🎨 原生状态栏主题切换与 5 色调色盘（Native Theme & Accent Palette）**
+  - 在菜单栏 `🏝️ 3A` 原生菜单中深度植入【🌓 外观模式】与【🎨 主题强调色】两大级联子菜单；
+  - **三态外观模式**：随时切换 `⚙️ 跟随系统` / `☀️ 浅色模式` / `🌙 深色模式`，带系统原生 `✓` 勾选标记，即点即变；
+  - **5 档主题强调色（对齐 context-viewer 调色盘）**：支持切换 **🔵 经典蓝 (Apple Blue)** / **🟣 极光紫 (Context Purple)** / **🟡 琥珀黄 (Warm Amber)** / **🟢 薄荷绿 (Fresh Green)** / **🔴 珊瑚红 (Coral Red)**，全局主图标与光晕实时联动换色；
+  - **本地永久记忆（UserDefaults）**：用户的外观与色彩配置自动持久化落盘，开机与重启后永久保留。
+- **💎 浅色模式原生白瓷玉石质感深度重构（Light Mode Ceramic Parity）**
+  - 彻底攻克浅色顶栏下胶囊“发黑发虚”问题；
+  - 浅色模式采用 `92% 高透白瓷玉质底`（`#FFFFFF`）＋ `#1D1D1F` 纯黑深字 ＋ `#059669` 透亮森林绿，完美融入 macOS 浅色系统菜单栏。
+- **🛑 原生撤单通知智能闭环（Cancel Notice Interception）**
+  - 引入 `cancel-*.md` 撤单通知原生拦截引擎；
+  - 对方发送的“任务取消不用做了”通知单，系统自动识别并直接结案，绝不再误标为待办，同时自动闭环关联的原任务单。
+- **📝 机械化总账流水留痕（Automated Ledger Logging）**
+  - 在 `handoff.py` 底层植入发单与回单自动记账门禁，落盘瞬间自动向 `handoffs/交流.md` 追加标准流水，彻底消灭“靠自觉写总账”的漏洞。
+
+---
+
 ## [v1.3.0] - 2026-11-19
 
 ### 🚀 Architecture Evolution / 架构升级与双核中控

@@ -76,7 +76,33 @@ enum IslandMode: Equatable {
     }
 }
 
+enum ThemeMode: String {
+    case auto = "auto"
+    case light = "light"
+    case dark = "dark"
+}
+
+enum AccentPreset: String, CaseIterable {
+    case blue = "007AFF"
+    case purple = "9053F8"
+    case yellow = "EAB308"
+    case green = "22C55E"
+    case red = "EF4444"
+    
+    var name: String {
+        switch self {
+        case .blue: return "🔵 经典蓝 (Apple Blue)"
+        case .purple: return "🟣 极光紫 (Context Purple)"
+        case .yellow: return "🟡 琥珀黄 (Warm Amber)"
+        case .green: return "🟢 薄荷绿 (Fresh Green)"
+        case .red: return "🔴 珊瑚红 (Coral Red)"
+        }
+    }
+}
+
 class AgentMonitor: ObservableObject {
+    @Published var themeMode: ThemeMode = .auto
+    @Published var accentHex: String = "007AFF"
     @Published var agyPending: Int = 0
     @Published var almaPending: Int = 0
     @Published var pingPending: Int = 0
@@ -129,19 +155,62 @@ class AgentMonitor: ObservableObject {
     let handoffScript = "/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts/handoff.py"
     
     init() {
+        if let savedTheme = UserDefaults.standard.string(forKey: "agent_island_theme_mode"),
+           let tm = ThemeMode(rawValue: savedTheme) {
+            self.themeMode = tm
+        }
+        if let savedAccent = UserDefaults.standard.string(forKey: "agent_island_accent_hex") {
+            self.accentHex = savedAccent
+        }
         checkAppearance()
         refreshAll()
         startTimers()
     }
     
     func checkAppearance() {
-        let dark = NSApplication.shared.effectiveAppearance.name.rawValue.lowercased().contains("dark")
+        let dark: Bool
+        switch themeMode {
+        case .auto:
+            dark = NSApplication.shared.effectiveAppearance.name.rawValue.lowercased().contains("dark")
+        case .light:
+            dark = false
+        case .dark:
+            dark = true
+        }
         DispatchQueue.main.async {
             if self.isDarkMode != dark {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     self.isDarkMode = dark
                 }
             }
+        }
+    }
+    
+    func setThemeMode(_ mode: ThemeMode) {
+        DispatchQueue.main.async {
+            self.themeMode = mode
+            UserDefaults.standard.set(mode.rawValue, forKey: "agent_island_theme_mode")
+            let isDark: Bool
+            switch mode {
+            case .auto:
+                isDark = NSApplication.shared.effectiveAppearance.name.rawValue.lowercased().contains("dark")
+            case .light:
+                isDark = false
+            case .dark:
+                isDark = true
+            }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                self.isDarkMode = isDark
+            }
+            self.objectWillChange.send()
+        }
+    }
+    
+    func setAccentHex(_ hex: String) {
+        DispatchQueue.main.async {
+            self.accentHex = hex
+            UserDefaults.standard.set(hex, forKey: "agent_island_accent_hex")
+            self.objectWillChange.send()
         }
     }
     
@@ -339,7 +408,7 @@ for b in boxes:
     if not b_dir.is_dir(): continue
     for p in b_dir.iterdir():
         if not p.is_file() or handoff.is_ignored_file(p): continue
-        if handoff.REPLY_RE.search(p.name):
+        if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-'):
             base = handoff.re.sub(r'-reply\\d*\\.md$', '.md', p.name, flags=handoff.re.IGNORECASE)
             global_replied.add(base)
             global_replied.add(p.stem)
@@ -366,7 +435,7 @@ for box in boxes:
     all_md = [p for p in inbox_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
     items = []
     for p in all_md:
-        if handoff.REPLY_RE.search(p.name):
+        if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-'):
             continue
         if p.name in acked_names:
             continue
@@ -479,6 +548,10 @@ struct PressableScaleButtonStyle: ButtonStyle {
 struct DynamicIslandView: View {
     @ObservedObject var monitor: AgentMonitor
     
+    var accentColor: Color {
+        Color(hex: monitor.accentHex)
+    }
+    
     var body: some View {
         ZStack {
             Color.clear
@@ -492,27 +565,31 @@ struct DynamicIslandView: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 
-                // Layer 2: Adaptive Glass Tint
+                // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，对标 context-viewer)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .fill(
-                        monitor.isDarkMode
-                            ? Color(hex: "0A1526").opacity(0.40)
-                            : Color.white.opacity(0.35)
+                        monitor.currentMode == .compact
+                            ? (monitor.isDarkMode
+                                ? Color.black.opacity(0.90)
+                                : Color(hex: "FFFFFF").opacity(0.92))
+                            : (monitor.isDarkMode
+                                ? Color(hex: "080B12").opacity(0.88)
+                                : Color.white.opacity(0.92))
                     )
                 
-                // Layer 3: Razor Specular Border
+                // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(
                         LinearGradient(
                             stops: [
-                                .init(color: Color.white.opacity(monitor.isDarkMode ? 0.55 : 0.88), location: 0.0),
-                                .init(color: Color.white.opacity(monitor.isDarkMode ? 0.18 : 0.45), location: 0.45),
-                                .init(color: Color.white.opacity(monitor.isDarkMode ? 0.08 : 0.20), location: 1.0)
+                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.65) : Color.white.opacity(0.98), location: 0.0),
+                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.20) : Color.black.opacity(0.08), location: 0.45),
+                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.10) : Color.black.opacity(0.14), location: 1.0)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
                         ),
-                        lineWidth: 1.0
+                        lineWidth: 0.9
                     )
                 
                 // Content View
@@ -567,9 +644,9 @@ struct DynamicIslandView: View {
             // Blue/Green Status Badge Icon
             ZStack {
                 Circle()
-                    .fill(allHealthy ? Color(hex: "007AFF") : Color(hex: "FF9500"))
+                    .fill(allHealthy ? accentColor : Color(hex: "FF9500"))
                     .frame(width: 15, height: 15)
-                    .shadow(color: (allHealthy ? Color(hex: "007AFF") : Color(hex: "FF9500")).opacity(0.4), radius: 2)
+                    .shadow(color: (allHealthy ? accentColor : Color(hex: "FF9500")).opacity(0.4), radius: 2)
                 
                 Image(systemName: allHealthy ? "cpu.fill" : "exclamationmark")
                     .font(.system(size: 8, weight: .bold))
@@ -581,7 +658,7 @@ struct DynamicIslandView: View {
                 .foregroundColor(primaryTextColor)
             
             Text("•")
-                .foregroundColor(secondaryTextColor.opacity(0.8))
+                .foregroundColor(secondaryTextColor)
                 .font(.system(size: 9))
             
             Text(statusSummary)
@@ -625,7 +702,7 @@ struct DynamicIslandView: View {
                 HStack(spacing: 6) {
                     ZStack {
                         Circle()
-                            .fill(Color(hex: "007AFF"))
+                            .fill(accentColor)
                             .frame(width: 17, height: 17)
                         Image(systemName: "slider.horizontal.3")
                             .foregroundColor(.white)
@@ -667,7 +744,7 @@ struct DynamicIslandView: View {
                 VStack(spacing: 6) {
                     controlCenterPill(
                         icon: "apple.terminal.fill",
-                        iconBg: Color(hex: "007AFF"),
+                        iconBg: accentColor,
                         title: "白 / AGY",
                         subtitle: monitor.agyPending == 0 ? "空闲就绪" : "\(monitor.agyPending) 待办",
                         hasPending: monitor.agyPending > 0
@@ -722,7 +799,7 @@ struct DynamicIslandView: View {
                         HStack(spacing: 3) {
                             Image(systemName: "circle.hexagongrid.fill")
                                 .font(.system(size: 8))
-                                .foregroundColor(Color(hex: "007AFF"))
+                                .foregroundColor(accentColor)
                             Text(monitor.tokenTotal)
                                 .font(.system(size: 9.5, weight: .bold, design: .rounded))
                                 .foregroundColor(primaryTextColor)
@@ -895,7 +972,7 @@ struct DynamicIslandView: View {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(Color(hex: "007AFF"))
+                    .foregroundColor(accentColor)
                 Text(label)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundColor(primaryTextColor)
@@ -954,11 +1031,11 @@ struct DynamicIslandView: View {
                         Text("返回")
                             .font(.system(size: 10, weight: .bold, design: .rounded))
                     }
-                    .foregroundColor(Color(hex: "007AFF"))
+                    .foregroundColor(accentColor)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3.5)
                     .background(
-                        Capsule().fill(Color(hex: "007AFF").opacity(monitor.isDarkMode ? 0.20 : 0.12))
+                        Capsule().fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.12))
                     )
                 }
                 .buttonStyle(PressableScaleButtonStyle())
@@ -1040,12 +1117,12 @@ struct DynamicIslandView: View {
                                 }) {
                                     Text("查看单据")
                                         .font(.system(size: 9, weight: .semibold))
-                                        .foregroundColor(Color(hex: "007AFF"))
+                                        .foregroundColor(accentColor)
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 3.5)
                                         .background(
                                             Capsule()
-                                                .fill(Color(hex: "007AFF").opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                .fill(accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
                                         )
                                 }
                                 .buttonStyle(PressableScaleButtonStyle())
@@ -1077,22 +1154,22 @@ struct DynamicIslandView: View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
                 monitor.isDarkMode
-                    ? Color.white.opacity(0.12)
-                    : Color.white.opacity(0.70)
+                    ? Color.white.opacity(0.16)
+                    : Color.white.opacity(0.88)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(
                         monitor.isDarkMode
-                            ? Color.white.opacity(0.16)
-                            : Color.white.opacity(0.85),
-                        lineWidth: 0.8
+                            ? Color.white.opacity(0.22)
+                            : Color.white.opacity(0.95),
+                        lineWidth: 0.9
                     )
             )
             .shadow(
-                color: Color.black.opacity(monitor.isDarkMode ? 0.20 : 0.04),
-                radius: 2,
-                y: 1
+                color: Color.black.opacity(monitor.isDarkMode ? 0.28 : 0.06),
+                radius: 2.5,
+                y: 1.2
             )
     }
     
@@ -1106,7 +1183,7 @@ struct DynamicIslandView: View {
     }
     
     var secondaryTextColor: Color {
-        monitor.isDarkMode ? Color(hex: "86868B") : Color(hex: "6E6E73")
+        monitor.isDarkMode ? Color(hex: "9E9EA5") : Color(hex: "515156")
     }
     
     var statusTextColor: Color {
@@ -1194,13 +1271,18 @@ class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var islandPanel: DynamicIslandPanel!
     var monitor = AgentMonitor()
     
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
+    
+    var themeAutoItem: NSMenuItem?
+    var themeLightItem: NSMenuItem?
+    var themeDarkItem: NSMenuItem?
+    var accentMenuItems: [String: NSMenuItem] = [:]
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1282,14 +1364,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
+        menu.delegate = self
         menu.addItem(NSMenuItem(title: "🏝️ 打开/收起中控台", action: #selector(toggleIsland), keyEquivalent: "i"))
-        menu.addItem(NSMenuItem(title: "🔍 全网核验与对齐", action: #selector(reconcileAll), keyEquivalent: "k"))
+        menu.addItem(NSMenuItem(title: "🔍 全网核验与归档", action: #selector(reconcileAll), keyEquivalent: "k"))
         menu.addItem(NSMenuItem(title: "📁 打开 Spaces 产物库", action: #selector(openSpaces), keyEquivalent: "s"))
         menu.addItem(NSMenuItem(title: "📝 打开《交流.md》", action: #selector(openCommLog), keyEquivalent: "c"))
         menu.addItem(NSMenuItem(title: "🌐 检查 Funnel 健康状态", action: #selector(openFunnelHealth), keyEquivalent: "f"))
         menu.addItem(NSMenuItem.separator())
+        
+        // 1. 外观模式子菜单 (Appearance Submenu)
+        let themeMenu = NSMenu()
+        let aItem = NSMenuItem(title: "⚙️ 跟随系统", action: #selector(setThemeAuto), keyEquivalent: "")
+        aItem.target = self
+        let lItem = NSMenuItem(title: "☀️ 浅色模式", action: #selector(setThemeLight), keyEquivalent: "")
+        lItem.target = self
+        let dItem = NSMenuItem(title: "🌙 深色模式", action: #selector(setThemeDark), keyEquivalent: "")
+        dItem.target = self
+        themeMenu.addItem(aItem)
+        themeMenu.addItem(lItem)
+        themeMenu.addItem(dItem)
+        themeAutoItem = aItem
+        themeLightItem = lItem
+        themeDarkItem = dItem
+        
+        let themeParent = NSMenuItem(title: "🌓 外观模式", action: nil, keyEquivalent: "")
+        themeParent.submenu = themeMenu
+        menu.addItem(themeParent)
+        
+        // 2. 主题强调色子菜单 (Accent Color Submenu)
+        let accentMenu = NSMenu()
+        accentMenuItems.removeAll()
+        for preset in AccentPreset.allCases {
+            let it = NSMenuItem(title: preset.name, action: #selector(setAccentPresetAction(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = preset.rawValue
+            accentMenu.addItem(it)
+            accentMenuItems[preset.rawValue] = it
+        }
+        let accentParent = NSMenuItem(title: "🎨 主题强调色", action: nil, keyEquivalent: "")
+        accentParent.submenu = accentMenu
+        menu.addItem(accentParent)
+        
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "🚪 退出 AgentIsland", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
+        
+        updateMenuCheckmarks()
     }
     
     func setupIslandPanel() {
@@ -1377,6 +1497,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openFunnelHealth() {
         if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
             NSWorkspace.shared.open(u)
+        }
+    }
+    
+    func menuWillOpen(_ menu: NSMenu) {
+        updateMenuCheckmarks()
+    }
+    
+    func updateMenuCheckmarks() {
+        themeAutoItem?.state = monitor.themeMode == .auto ? .on : .off
+        themeLightItem?.state = monitor.themeMode == .light ? .on : .off
+        themeDarkItem?.state = monitor.themeMode == .dark ? .on : .off
+        
+        for (hex, it) in accentMenuItems {
+            it.state = monitor.accentHex == hex ? .on : .off
+        }
+    }
+    
+    @objc func setThemeAuto() {
+        monitor.setThemeMode(.auto)
+        updateMenuCheckmarks()
+    }
+    
+    @objc func setThemeLight() {
+        monitor.setThemeMode(.light)
+        updateMenuCheckmarks()
+    }
+    
+    @objc func setThemeDark() {
+        monitor.setThemeMode(.dark)
+        updateMenuCheckmarks()
+    }
+    
+    @objc func setAccentPresetAction(_ sender: NSMenuItem) {
+        if let hex = sender.representedObject as? String {
+            monitor.setAccentHex(hex)
+            updateMenuCheckmarks()
         }
     }
     
