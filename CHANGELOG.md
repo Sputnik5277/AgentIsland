@@ -5,6 +5,28 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.6.0] - 2026-11-19
+
+### 🚴 Meituan Delivery Live Activity & Stepper / 美团外卖实时履约与四态灵动岛重构
+
+- **🚴 深度对标美团外卖实时履约模型（Meituan Live Activity Stepper）**
+  - 彻底抛弃粗暴的“待办 vs 办结”二值模型，全面升级为美团 4 阶段状态机：`①派单 (dispatched)` ➔ `②接单 (accepted)` ➔ `③送达待验 (submitted)` ➔ `④结案核销 (confirmed)`；
+  - 任务列表每笔工单原位引入【美团四段式 Stepper 履约指示灯】，履约推进到哪一步，哪一步高亮，黑箱状态彻底清零。
+- **📦 交付待验高光专区（Pending Confirmation Shelf · 骑手已送达）**
+  - 彻底修复将 `status: 待确认` 单据误报进已办结流的严重漏洞；
+  - 当检测到任何任务处于交付待验状态时，抽屉与控制中心顶部常驻醒目的【美团待验收专区】极光紫高亮卡片；
+  - 显示交付物路径，并提供 `[查看单据]` 与 `[✅ 一键结案 (confirm)]` 快捷操作，实现桌面端直接一键收货核销。
+- **🔔 顶部胶囊（Compact Island）四态动态变色与呼吸**
+  - **待验收高光**：存在待确认任务时，胶囊点亮极光紫（`#8B5CF6`），显示 `🔔 N 单待验收`；
+  - **履约推进中**：Agent 正在接单跑代码时，胶囊点亮动感蓝（`#3B82F6`），显示 `⚡ N 单履约中`；
+  - **待接单等待**：工单未接单时，胶囊点亮琥珀黄（`#F59E0B`），显示 `📦 N 单待接单`；
+  - **全员妥投就绪**：全部结案且通道健康时，点亮薄荷绿（`#10B981`），显示 `3 Agents • 全员就绪 (0 积压)`。
+- **🛠️ 底座健壮性补强**：
+  - 修复 `scripts/handoff.py` 中 `target.resolve().relative_to(HANDOFFS_ROOT.resolve())` 相对路径崩错问题；
+  - 增加 `--artifacts` 物理文件存在性校验，杜绝虚假产物挂账。
+
+---
+
 ## [v1.5.0] - 2026-11-19
 
 ### 🕒 Done Feed & Real-Time Accountability / 已办结流与成果透明化

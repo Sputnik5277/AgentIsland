@@ -59,6 +59,10 @@ struct TaskItem: Identifiable, Hashable {
     let to: String
     let date: String
     let title: String
+    var stage: String = "dispatched" // dispatched, accepted, submitted, confirmed
+    var statusText: String = "待接单"
+    var artifacts: String = ""
+    var eta: String = ""
 }
 
 enum IslandMode: Equatable {
@@ -106,6 +110,11 @@ class AgentMonitor: ObservableObject {
     @Published var agyPending: Int = 0
     @Published var almaPending: Int = 0
     @Published var pingPending: Int = 0
+
+    @Published var pendingConfirms: [TaskItem] = []
+    @Published var totalDispatched: Int = 0
+    @Published var totalAccepted: Int = 0
+    @Published var totalSubmitted: Int = 0
     
     @Published var agyTasks: [TaskItem] = []
     @Published var almaTasks: [TaskItem] = []
@@ -256,10 +265,12 @@ class AgentMonitor: ObservableObject {
                 let pingArr = data["ping"] ?? []
                 let agyArr = data["agy"] ?? []
                 let almaArr = data["alma"] ?? []
+                let confirms = data["pending_confirms"] ?? []
                 
                 self.pingTasks = pingArr
                 self.agyTasks = agyArr
                 self.almaTasks = almaArr
+                self.pendingConfirms = confirms
                 
                 self.pingDoneTasks = data["ping_done"] ?? []
                 self.agyDoneTasks = data["agy_done"] ?? []
@@ -268,6 +279,11 @@ class AgentMonitor: ObservableObject {
                 self.pingPending = pingArr.count
                 self.agyPending = agyArr.count
                 self.almaPending = almaArr.count
+                
+                let allActive = pingArr + agyArr + almaArr
+                self.totalSubmitted = confirms.count
+                self.totalAccepted = allActive.filter { $0.stage == "accepted" }.count
+                self.totalDispatched = allActive.filter { $0.stage == "dispatched" }.count
                 
                 self.funnelOnline = fOnline
                 self.nutstoreOnline = nOnline
@@ -286,6 +302,24 @@ class AgentMonitor: ObservableObject {
                 }
                 self.lastKnownTotalPending = currentTotal
             }
+        }
+    }
+    
+    func confirmTask(file: String, dispatcher: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = [
+                self.handoffScript,
+                "confirm",
+                "--from", dispatcher,
+                "--to-file", file,
+                "--verdict", "灵动岛一键验收结案"
+            ]
+            try? p.run()
+            p.waitUntilExit()
+            self.refreshAll()
         }
     }
     
@@ -432,8 +466,11 @@ for b in boxes:
             except Exception:
                 pass
 
-# Phase 2: Per-box pending extraction
+# Phase 2: Per-box pending extraction (Meituan 4-stage tracking)
 res = {}
+total_dispatched = 0
+total_accepted = 0
+
 for box in boxes:
     inbox_dir = ROOT / box
     if not inbox_dir.is_dir():
@@ -453,31 +490,92 @@ for box in boxes:
             text = p.read_text(encoding='utf-8', errors='replace')
             meta, body = handoff.parse_frontmatter(text)
             status = str(meta.get('status', '')).strip()
-            if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考')):
+            if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考', '已结案')):
                 continue
             frm = str(meta.get('from', '')).strip().lower()
             if frm == box:
                 continue
+
+            base_stem = p.stem
+            accept_file = p.parent / f"{base_stem}-accept.md"
+            stage = "dispatched"
+            status_text = "待接单"
+            eta = ""
+            if accept_file.exists():
+                stage = "accepted"
+                status_text = "履约中"
+                total_accepted += 1
+                try:
+                    a_meta, a_body = handoff.parse_frontmatter(accept_file.read_text(encoding='utf-8', errors='replace'))
+                    eta = str(a_meta.get('eta', '履约推进中'))
+                except Exception: pass
+            else:
+                total_dispatched += 1
+
             items.append({
                 'file': p.name,
                 'from': str(meta.get('from', '未知')),
                 'to': str(meta.get('to', box)),
                 'date': str(meta.get('date', '-')),
                 'title': handoff.first_heading(body) or p.stem,
-                'mtime': p.stat().st_mtime
+                'mtime': p.stat().st_mtime,
+                'stage': stage,
+                'statusText': status_text,
+                'artifacts': '',
+                'eta': eta
             })
         except Exception:
             pass
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
 
-    # Phase 2.5: Extract recent completed replies (Done Feed)
+# Phase 3: Pending Confirmations (Meituan Step 3: Submitted waiting for Confirm)
+pending_confirms = []
+for b in boxes:
+    b_dir = ROOT / b
+    if not b_dir.is_dir(): continue
+    for p in b_dir.iterdir():
+        if not p.is_file() or handoff.is_ignored_file(p): continue
+        if not handoff.REPLY_RE.search(p.name): continue
+        try:
+            txt = p.read_text(encoding='utf-8', errors='replace')
+            meta, body = handoff.parse_frontmatter(txt)
+            status = str(meta.get('status', '')).strip()
+            if status != '待确认': continue
+            to_agent = str(meta.get('to', '')).strip().lower()
+            acked = handoff.load_ack(to_agent)
+            if p.name in acked: continue
+            artifacts = str(meta.get('artifacts', ''))
+            pending_confirms.append({
+                'file': f'{b}/{p.name}',
+                'from': str(meta.get('from', '未知')),
+                'to': to_agent,
+                'date': str(meta.get('date', '-')),
+                'title': handoff.first_heading(body) or p.stem,
+                'mtime': p.stat().st_mtime,
+                'stage': 'submitted',
+                'statusText': '待验收',
+                'artifacts': artifacts,
+                'eta': '等待验货'
+            })
+        except Exception: pass
+pending_confirms.sort(key=lambda x: x['mtime'], reverse=True)
+res['pending_confirms'] = pending_confirms
+
+# Phase 4: Extract recent completed replies (Done Feed, only confirmed)
+for box in boxes:
+    inbox_dir = ROOT / box
+    if not inbox_dir.is_dir(): continue
+    all_md = [p for p in inbox_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
     done_items = []
     for p in all_md:
         if handoff.REPLY_RE.search(p.name):
             try:
                 txt = p.read_text(encoding='utf-8', errors='replace')
                 meta, body = handoff.parse_frontmatter(txt)
+                status = str(meta.get('status', '')).strip()
+                if status == '待确认':
+                    continue # 关键拦截：待确认单据严禁混入已办结流！
                 title = handoff.first_heading(body) or p.stem
                 done_items.append({
                     'file': p.name,
@@ -485,7 +583,11 @@ for box in boxes:
                     'to': str(meta.get('to', box)),
                     'date': str(meta.get('date', '-')),
                     'title': title,
-                    'mtime': p.stat().st_mtime
+                    'mtime': p.stat().st_mtime,
+                    'stage': 'confirmed',
+                    'statusText': '已结案',
+                    'artifacts': str(meta.get('artifacts', '')),
+                    'eta': ''
                 })
             except Exception:
                 pass
@@ -537,7 +639,11 @@ print(json.dumps(res, ensure_ascii=False))
                               let to = d["to"] as? String,
                               let date = d["date"] as? String,
                               let title = d["title"] as? String else { return nil }
-                        return TaskItem(file: file, from: from, to: to, date: date, title: title)
+                        let stage = (d["stage"] as? String) ?? "dispatched"
+                        let statusText = (d["statusText"] as? String) ?? "待接单"
+                        let artifacts = (d["artifacts"] as? String) ?? ""
+                        let eta = (d["eta"] as? String) ?? ""
+                        return TaskItem(file: file, from: from, to: to, date: date, title: title, stage: stage, statusText: statusText, artifacts: artifacts, eta: eta)
                     }
                 }
                 return output
@@ -670,15 +776,15 @@ struct DynamicIslandView: View {
     // MARK: - Compact Mode (Matches UURemoteService Status Pill Exactly)
     var compactView: some View {
         HStack(spacing: 6) {
-            // Blue/Green Status Badge Icon
+            // Blue/Green/Purple Status Badge Icon
             ZStack {
                 Circle()
-                    .fill(allHealthy ? accentColor : Color(hex: "FF9500"))
+                    .fill(compactBadgeColor)
                     .frame(width: 15, height: 15)
-                    .shadow(color: (allHealthy ? accentColor : Color(hex: "FF9500")).opacity(0.4), radius: 2)
+                    .shadow(color: compactBadgeColor.opacity(0.4), radius: 2)
                 
-                Image(systemName: allHealthy ? "cpu.fill" : "exclamationmark")
-                    .font(.system(size: 8, weight: .bold))
+                Image(systemName: compactBadgeIcon)
+                    .font(.system(size: 7.5, weight: .bold))
                     .foregroundColor(.white)
             }
             
@@ -766,6 +872,12 @@ struct DynamicIslandView: View {
             }
             .padding(.top, 10)
             .padding(.horizontal, 14)
+
+            // Section 0: Meituan Delivery Shelf (High-Priority Actionable Confirmation Banner)
+            if !monitor.pendingConfirms.isEmpty {
+                pendingConfirmationShelfView
+                    .padding(.horizontal, 12)
+            }
             
             // Section 1: Top 2-Column Grid (Like Wi-Fi / Bluetooth + Now Playing Card in Control Center)
             HStack(spacing: 9) {
@@ -801,24 +913,31 @@ struct DynamicIslandView: View {
                 }
                 .frame(width: 175)
                 
-                // Right Column: Hero Squircle Card (Like the "未在播放" card in Control Center)
+                // Right Column: Hero Squircle Card (Meituan Order Live Tracking)
                 VStack(spacing: 8) {
                     HStack {
                         ZStack {
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669"))
+                                .fill(monitor.totalSubmitted > 0 ? Color(hex: "8B5CF6") : (totalPending > 0 ? Color(hex: "D97706") : Color(hex: "059669")))
                                 .frame(width: 22, height: 22)
-                            Image(systemName: totalPending > 0 ? "hourglass" : "checkmark.shield.fill")
+                            Image(systemName: monitor.totalSubmitted > 0 ? "bell.badge.fill" : (totalPending > 0 ? "hourglass" : "checkmark.shield.fill"))
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(.white)
                         }
                         VStack(alignment: .leading, spacing: 1) {
-                            Text("全网待办")
+                            Text(monitor.totalSubmitted > 0 ? "美团履约 · 待验收" : "美团实时履约")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
-                            Text("\(totalPending) 项")
-                                .font(.system(size: 15, weight: .bold, design: .rounded))
-                                .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
+                            HStack(spacing: 4) {
+                                if monitor.totalSubmitted > 0 {
+                                    Text("\(monitor.totalSubmitted) 待验")
+                                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                                        .foregroundColor(Color(hex: "8B5CF6"))
+                                }
+                                Text("\(totalPending) 待办")
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                    .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
+                            }
                         }
                         Spacer()
                     }
@@ -1054,6 +1173,114 @@ struct DynamicIslandView: View {
         default: return []
         }
     }
+
+    func meituanStepperView(stage: String) -> some View {
+        HStack(spacing: 2) {
+            stepperNode(name: "①派单", active: true, done: stage != "dispatched")
+            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
+            stepperNode(name: "②接单", active: stage != "dispatched", done: stage == "submitted" || stage == "confirmed")
+            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
+            stepperNode(name: "③待验", active: stage == "submitted", done: stage == "confirmed", highlight: stage == "submitted")
+            Text("→").font(.system(size: 6.5)).foregroundColor(secondaryTextColor.opacity(0.5))
+            stepperNode(name: "④结案", active: stage == "confirmed", done: stage == "confirmed")
+        }
+    }
+
+    func stepperNode(name: String, active: Bool, done: Bool, highlight: Bool = false) -> some View {
+        Text(name)
+            .font(.system(size: 7, weight: active ? .bold : .medium, design: .rounded))
+            .foregroundColor(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.4)))
+            .padding(.horizontal, 3.5)
+            .padding(.vertical, 1)
+            .background(
+                Capsule().fill(highlight ? Color(hex: "8B5CF6").opacity(0.18) : (active ? (done ? Color(hex: "10B981").opacity(0.12) : accentColor.opacity(0.10)) : Color.clear))
+            )
+    }
+
+    var pendingConfirmationShelfView: some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 4) {
+                ZStack {
+                    Circle()
+                        .fill(Color(hex: "8B5CF6"))
+                        .frame(width: 15, height: 15)
+                    Image(systemName: "bell.fill")
+                        .font(.system(size: 7.5, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                Text("美团履约 · 产物已送达待验收 (\(monitor.pendingConfirms.count))")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundColor(Color(hex: "8B5CF6"))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 2)
+            
+            ForEach(monitor.pendingConfirms) { confirm in
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text(confirm.title)
+                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                            .foregroundColor(primaryTextColor)
+                            .lineLimit(1)
+                        HStack(spacing: 3) {
+                            Text("\(confirm.from) ➔ \(confirm.to)")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundColor(Color(hex: "8B5CF6"))
+                            if !confirm.artifacts.isEmpty {
+                                Text("•")
+                                    .font(.system(size: 6.5))
+                                    .foregroundColor(secondaryTextColor)
+                                Text("产物: \(confirm.artifacts)")
+                                    .font(.system(size: 7.5, weight: .medium))
+                                    .foregroundColor(secondaryTextColor)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    Spacer()
+                    
+                    Button(action: {
+                        let path = "\(monitor.rootPath)/\(confirm.file)"
+                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    }) {
+                        Text("查看")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(primaryTextColor)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2.5)
+                            .background(squircleCardBackground)
+                    }
+                    .buttonStyle(PressableScaleButtonStyle())
+                    
+                    Button(action: {
+                        monitor.confirmTask(file: confirm.file, dispatcher: confirm.to)
+                    }) {
+                        HStack(spacing: 2) {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 7, weight: .bold))
+                            Text("结案")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2.5)
+                        .background(
+                            Capsule().fill(Color(hex: "8B5CF6"))
+                        )
+                    }
+                    .buttonStyle(PressableScaleButtonStyle())
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
+                )
+            }
+        }
+        .padding(.horizontal, 4)
+    }
     
     func agentTaskDrawerView(agent: String) -> some View {
         let tasks = agentTasks(agent)
@@ -1105,6 +1332,11 @@ struct DynamicIslandView: View {
             // Task List + Done Feed Section
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 8) {
+                    // 0. Meituan Pending Confirmation Shelf (if any)
+                    if !monitor.pendingConfirms.isEmpty {
+                        pendingConfirmationShelfView
+                    }
+
                     // 1. Pending Tasks Section (if any)
                     if !tasks.isEmpty {
                         LazyVStack(spacing: 5) {
@@ -1112,11 +1344,11 @@ struct DynamicIslandView: View {
                                 HStack(spacing: 7) {
                                     ZStack {
                                         Circle()
-                                            .fill(Color(hex: "FF9500").opacity(0.18))
+                                            .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18))
                                             .frame(width: 20, height: 20)
-                                        Image(systemName: "doc.text.fill")
+                                        Image(systemName: task.stage == "accepted" ? "bolt.fill" : "doc.text.fill")
                                             .font(.system(size: 9, weight: .bold))
-                                            .foregroundColor(Color(hex: "D97706"))
+                                            .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : Color(hex: "D97706"))
                                     }
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(task.title)
@@ -1124,15 +1356,18 @@ struct DynamicIslandView: View {
                                             .foregroundColor(primaryTextColor)
                                             .lineLimit(1)
                                         HStack(spacing: 4) {
-                                            Text("\(task.from) → \(task.to)")
-                                                .font(.system(size: 8, weight: .medium))
-                                                .foregroundColor(secondaryTextColor)
+                                            meituanStepperView(stage: task.stage)
                                             Text("•")
                                                 .font(.system(size: 7))
                                                 .foregroundColor(secondaryTextColor.opacity(0.6))
-                                            Text(task.date)
+                                            Text("\(task.from) → \(task.to)")
                                                 .font(.system(size: 8, weight: .medium))
                                                 .foregroundColor(secondaryTextColor)
+                                            if !task.eta.isEmpty {
+                                                Text("• \(task.eta)")
+                                                    .font(.system(size: 7.5, weight: .medium))
+                                                    .foregroundColor(Color(hex: "3B82F6"))
+                                            }
                                         }
                                     }
                                     Spacer()
@@ -1292,21 +1527,48 @@ struct DynamicIslandView: View {
         monitor.isDarkMode ? Color(hex: "9E9EA5") : Color(hex: "515156")
     }
     
-    var statusTextColor: Color {
-        let total = totalPending
-        if total == 0 {
-            return Color(hex: "059669")
-        } else {
-            return Color(hex: "D97706")
+    var compactBadgeColor: Color {
+        if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
+            return Color(hex: "EF4444")
         }
+        if monitor.totalSubmitted > 0 {
+            return Color(hex: "8B5CF6") // 极光紫：送达待验高光！
+        }
+        if monitor.totalAccepted > 0 {
+            return Color(hex: "3B82F6") // 动感蓝：履约中！
+        }
+        if monitor.totalDispatched > 0 {
+            return Color(hex: "F59E0B") // 琥珀黄：待接单
+        }
+        return Color(hex: "10B981") // 薄荷绿：全员就绪
+    }
+
+    var compactBadgeIcon: String {
+        if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
+            return "exclamationmark.triangle.fill"
+        }
+        if monitor.totalSubmitted > 0 {
+            return "bell.badge.fill"
+        }
+        if monitor.totalAccepted > 0 {
+            return "bolt.fill"
+        }
+        if monitor.totalDispatched > 0 {
+            return "shippingbox.fill"
+        }
+        return "checkmark.shield.fill"
+    }
+
+    var statusTextColor: Color {
+        compactBadgeColor
     }
     
     var contentWidth: CGFloat {
         switch monitor.currentMode {
-        case .compact: return 165
+        case .compact: return monitor.totalSubmitted > 0 || monitor.totalAccepted > 0 ? 186 : 170
         case .notification: return 320
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 386 : 356
+            return monitor.selectedDrawerAgent != nil ? 396 : 366
         }
     }
     
@@ -1315,7 +1577,7 @@ struct DynamicIslandView: View {
         case .compact: return 28
         case .notification: return 34
         case .expanded:
-            return monitor.selectedDrawerAgent != nil ? 310 : 238
+            return monitor.selectedDrawerAgent != nil ? 340 : 258
         }
     }
     
@@ -1328,16 +1590,23 @@ struct DynamicIslandView: View {
     }
     
     var allHealthy: Bool {
-        return monitor.funnelOnline && monitor.nutstoreOnline && monitor.tailscaleOnline && totalPending == 0
+        return monitor.funnelOnline && monitor.nutstoreOnline && monitor.tailscaleOnline && totalPending == 0 && monitor.totalSubmitted == 0
     }
     
     var statusSummary: String {
-        let total = totalPending
-        if total == 0 {
-            return "全空闲"
-        } else {
-            return "\(total) 待办"
+        if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
+            return "通道异常"
         }
+        if monitor.totalSubmitted > 0 {
+            return "\(monitor.totalSubmitted) 待验收"
+        }
+        if monitor.totalAccepted > 0 {
+            return "\(monitor.totalAccepted) 履约中"
+        }
+        if monitor.totalDispatched > 0 {
+            return "\(monitor.totalDispatched) 待接单"
+        }
+        return "全员就绪"
     }
 }
 
