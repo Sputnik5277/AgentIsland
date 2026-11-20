@@ -46,6 +46,15 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 - 🌓 **Instant Theme Adaptation & Accent Palette**: Native status menu supporting System / Light / Dark modes plus a 5-color accent palette (Blue, Purple, Yellow, Green, Red) with permanent UserDefaults persistence.
 - 🛡️ **Zero Token & 100% Offline**: Pure local file and port polling. Uses zero LLM tokens and ~15MB RAM.
 
+### UX Redesign (2026-11-20)
+
+- 🏝️ **Collapsed summary + hover expand**: the capsule shows one prioritized line (pending confirmations, unread counts, or all-read / channel-normal) instead of three green dots; approaching the pointer auto-expands the Control Center after 0.18s and collapses 0.7s after leaving.
+- 🎨 **Fixed agent identity colors**: AGY `#0A84FF`, Alma `#FF9F0A`, Ping `#7C3AED` are used consistently across collapsed dots, overview chips, inbox cards, drawer headers, and the topology view.
+- 🧱 **Three-tier channel hierarchy**: base `Tailscale` → primary `Funnel 443` → cold backup `Nutstore`, replacing the three equal-weight buttons.
+- 🖱️ **Five-group context menu + merged Appearance submenu**: 中控台 / 打开 / 自检 / 外观 / 退出 groups; Option shortcuts `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`; SF Symbols only (no emoji); one 「外观设置」 submenu covering theme, skin, form, 80–140% scale, dock edge, and accent color.
+- 🔤 **Typography floor**: body text ≥13pt, secondary text ≥11pt, `.semibold` minimum, opaque text colors; the expanded panel stays ≤420pt tall with layered 8 / 18–20 / 24–28px spacing.
+- 🖼️ **Full-size AppIcon**: `.icns` with 16/32/128/256/512/1024px, declared via `CFBundleIconFile`, packaged by `build.sh`, and installed in `~/Applications/AgentIsland.app`.
+
 ### Quick Start
 
 #### Build from Source
@@ -86,6 +95,15 @@ open /Applications/AgentIsland.app
 - 🖥️ **活跃屏幕智能跟随**：精准检测鼠标当前所在的外接显示器（如 4K 宽屏），胶囊自动平滑就位，绝不跑飞。
 - 🌓 **状态栏两级外观与 5 色调色盘**：点击状态栏图标直接切换「⚙️ 跟随系统 / ☀️ 浅色白瓷 / 🌙 深色黑曜石」，并支持 5 档主题强调色（经典蓝 / 极光紫 / 琥珀黄 / 薄荷绿 / 珊瑚红），即点即变且自动持久化。
 - 🛡️ **零 Token 纯本地运行**：纯 Python / Swift 底层读取本地台账与端口，0 API 消耗，极低 CPU 占用（内存约 15MB）。
+
+### 本次 UX 重构（2026-11-20）
+
+- 🏝️ **收起态摘要 + 悬停展开**：胶囊只显示一行按优先级取出的摘要（待验收、未读数，或全员已读 / 链路正常），不再用三个绿点；鼠标靠近 0.18s 自动展开，离开 0.7s 自动收起。
+- 🎨 **三个 Agent 固定身份色**：AGY `#0A84FF`、Alma `#FF9F0A`、Ping `#7C3AED`，在收起态圆点、总览 chips、收件箱卡片、抽屉标题、链路架构中保持一致。
+- 🧱 **通道分三层显示**：底座 `Tailscale` → 主通道 `Funnel 443` → 冷备 `坚果云`，替代原来三个同权重按钮。
+- 🖱️ **右键菜单五组结构 + 外观设置合并子菜单**：中控台 / 打开 / 自检 / 外观 / 退出；Option 快捷键 `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`；全部 SF Symbols、零 emoji；原「外观模式」「主题强调色」合并进单一「外观设置」子菜单，内含明暗模式、皮肤、形态、80–140% 尺寸、停靠边与强调色。
+- 🔤 **字号下限**：正文 ≥13pt、次要 ≥11pt，字重最低 `.semibold`，文字实色；展开态总高 ≤420pt，按 8 / 18–20 / 24–28px 三层留白。
+- 🖼️ **全尺寸 AppIcon**：`.icns` 覆盖 16/32/128/256/512/1024px，`Info.plist` 声明 `CFBundleIconFile`，`build.sh` 打包进 `Contents/Resources`，并安装到 `~/Applications/AgentIsland.app`。
 
 ### 快速开始
 

@@ -5,6 +5,28 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.7.2] - 2026-11-20
+
+### 🧭 UX Redesign, Five-Group Menu & Full-Size AppIcon / UX 重构、五组菜单与全尺寸 AppIcon
+
+> 归属说明：本版覆盖未推送的 `ec12ee7`（交互 / 排版 / 配色）与 `ff1a5f6`（右键菜单 / AppIcon）；v1.7.1 条目仅记录胶囊与面板留白，不重复本批内容。
+
+- **🏝️ 收起态一句话摘要 + 悬停自动展开**
+  - 胶囊从「三个绿点 + 3 Agents」改为按优先级显示待验收 / 未读 / 全员已读摘要；鼠标靠近 0.18s 自动展开，离开 0.7s 收起。
+- **🎨 三个 Agent 固定身份色**
+  - AGY `#0A84FF`、Alma `#FF9F0A`、Ping `#7C3AED` 贯穿收起态圆点、总览 chips、收件箱、抽屉标题与链路架构。
+- **🧱 通道分三层**
+  - 底座 `Tailscale` → 主通道 `Funnel 443` → 冷备 `坚果云`，替代三个同权重按钮。
+- **🖱️ 右键菜单五组结构 + 外观设置合并子菜单**
+  - 中控台 / 打开 / 自检 / 外观 / 退出；快捷键 `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`；全部 SF Symbols、零 emoji；
+  - 原「外观模式」「主题强调色」合并为单一「外观设置」子菜单，内含明暗模式、皮肤、形态、80–140% 尺寸、停靠边、强调色。
+- **🔤 可读性硬指标**
+  - 正文 ≥13pt、次要 ≥11pt、字重最低 `.semibold`、文字实色；展开态 `584×385pt`（≤420），按 8 / 18–20 / 24–28px 三层留白。
+- **🖼️ 全尺寸 AppIcon**
+  - `Resources/AppIcon.icns` 覆盖 16/32/128/256/512/1024px；`Info.plist` 增加 `CFBundleIconFile=AppIcon`；`build.sh` 打包进 `Contents/Resources/`；已安装到 `~/Applications/AgentIsland.app`。
+
+---
+
 ## [v1.7.1] - 2026-11-20
 
 ### 📐 Compact Spacing & Zero Dead-Gap / 消除上下冗余留白与紧凑排版
