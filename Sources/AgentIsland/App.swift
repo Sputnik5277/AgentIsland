@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Foundation
+import UniformTypeIdentifiers
 
 // MARK: - Color Hex Extension
 extension Color {
@@ -93,7 +94,7 @@ enum AccentPreset: String, CaseIterable {
     case yellow = "EAB308"
     case green = "22C55E"
     case red = "EF4444"
-    
+
     var name: String {
         switch self {
         case .blue: return "🔵 经典蓝 (Apple Blue)"
@@ -103,6 +104,96 @@ enum AccentPreset: String, CaseIterable {
         case .red: return "🔴 珊瑚红 (Coral Red)"
         }
     }
+}
+
+// MARK: - Agent Identity (固定色彩 · 靠色认人 · 任何位置颜色不变)
+struct AgentIdentity: Identifiable, Hashable {
+    let key: String
+    let title: String
+    let short: String
+    let symbol: String
+    let hex: String
+    var id: String { key }
+    var color: Color { Color(hex: hex) }
+}
+
+enum AgentRoster {
+    static let agy = AgentIdentity(key: "agy", title: "AGY", short: "AGY", symbol: "apple.terminal.fill", hex: "0A84FF")
+    static let alma = AgentIdentity(key: "alma", title: "Alma", short: "Alma", symbol: "wrench.and.screwdriver.fill", hex: "FF9F0A")
+    static let ping = AgentIdentity(key: "ping", title: "Ping", short: "Ping", symbol: "cloud.fill", hex: "7C3AED")
+    static let all: [AgentIdentity] = [agy, alma, ping]
+
+    static func identity(for key: String?) -> AgentIdentity? {
+        guard let key = key?.lowercased() else { return nil }
+        return all.first { $0.key == key }
+    }
+}
+
+// MARK: - 外观 / 形态 / 停靠边（可调项，全部落 UserDefaults）
+enum DockEdge: String, CaseIterable, Identifiable {
+    case top, left, right
+    var id: String { rawValue }
+    var name: String {
+        switch self {
+        case .top: return "顶部"
+        case .left: return "左侧"
+        case .right: return "右侧"
+        }
+    }
+}
+
+enum IslandSkin: String, CaseIterable, Identifiable {
+    case glass, obsidian, ceramic
+    var id: String { rawValue }
+    var name: String {
+        switch self {
+        case .glass: return "通透玻璃"
+        case .obsidian: return "曜石深色"
+        case .ceramic: return "陶瓷实心"
+        }
+    }
+    /// 收起态与展开态的底色透明度（0~1）
+    var compactTint: (dark: Double, light: Double) {
+        switch self {
+        case .glass: return (0.97, 0.99)
+        case .obsidian: return (0.97, 0.985)
+        case .ceramic: return (1.0, 1.0)
+        }
+    }
+    var expandedTint: (dark: Double, light: Double) {
+        switch self {
+        case .glass: return (0.97, 0.99)
+        case .obsidian: return (0.97, 0.985)
+        case .ceramic: return (1.0, 1.0)
+        }
+    }
+}
+
+enum IslandForm: String, CaseIterable, Identifiable {
+    case capsule, card
+    var id: String { rawValue }
+    var name: String {
+        switch self {
+        case .capsule: return "胶囊"
+        case .card: return "卡片"
+        }
+    }
+}
+
+enum PanelSectionKey: String, CaseIterable, Identifiable {
+    case overview, confirm, inboxes, channels, assets
+    var id: String { rawValue }
+    var name: String {
+        switch self {
+        case .overview: return "总览摘要"
+        case .confirm: return "待你验收"
+        case .inboxes: return "三个收件箱"
+        case .channels: return "三层通道"
+        case .assets: return "快捷资产"
+        }
+    }
+    static let defaultOrder: [String] = allCases.map { $0.rawValue }
+    static let defaults: [String: Bool] = Dictionary(uniqueKeysWithValues: allCases.map { ($0.rawValue, true) })
 }
 
 class AgentMonitor: ObservableObject {
@@ -117,6 +208,9 @@ class AgentMonitor: ObservableObject {
     @Published var totalAccepted: Int = 0
     @Published var totalSubmitted: Int = 0
     @Published var activeConfirmIndex: Int = 0
+    @Published var fusedCount: Int = 0
+    @Published var fusedSummary: String = ""
+    @Published var lastFunnelEvent: String = "等待广播..."
     
     @Published var agyTasks: [TaskItem] = []
     @Published var almaTasks: [TaskItem] = []
@@ -137,7 +231,24 @@ class AgentMonitor: ObservableObject {
     @Published var showTopology: Bool = false {
         didSet { self.onDrawerChange?() }
     }
+    @Published var showSettings: Bool = false {
+        didSet { self.onDrawerChange?() }
+    }
     @Published var expandedTaskId: String? = nil
+
+    // 数据可信度：读取失败时显示「未知」，绝不假装有数据
+    @Published var dataUnknown: Bool = false
+    @Published var lastRefreshAt: Date? = nil
+
+    // 外观 × 形态 × 尺寸 × 停靠边 × 模块开关/排序
+    @Published var uiScale: Double = 1.0
+    @Published var dockEdge: DockEdge = .top
+    @Published var skin: IslandSkin = .glass
+    @Published var islandForm: IslandForm = .capsule
+    @Published var enabledSections: [String: Bool] = PanelSectionKey.defaults
+    @Published var sectionOrder: [String] = PanelSectionKey.defaultOrder
+    /// 拖拽排序时的临时来源（不参与渲染）
+    var draggingSectionStore: String? = nil
     
     func toggleTaskExpanded(_ id: String) {
         DispatchQueue.main.async {
@@ -161,8 +272,93 @@ class AgentMonitor: ObservableObject {
     
     var onModeChange: ((IslandMode) -> Void)?
     var onDrawerChange: (() -> Void)?
+    var onLayoutChange: (() -> Void)?
     
     private var lastKnownTotalPending: Int = -1
+    private var lastKnownSubmitted: Int = -1
+
+    /// 谁有几件没读：按未读数降序，完全来自真实收件箱
+    var unreadLeaders: [(AgentIdentity, Int)] {
+        AgentRoster.all
+            .map { ($0, pendingCount(for: $0.key)) }
+            .filter { $0.1 > 0 }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    func pendingCount(for key: String) -> Int {
+        switch key {
+        case "agy": return agyPending
+        case "alma": return almaPending
+        case "ping": return pingPending
+        default: return 0
+        }
+    }
+
+    var totalUnread: Int { agyPending + almaPending + pingPending }
+
+    var compactHeadText: String {
+        if dataUnknown { return "数据未知" }
+        if fusedCount > 0 { return "M1 熔断 \(fusedCount) 项" }
+        if totalSubmitted > 0 { return "\(totalSubmitted) 件待你验收" }
+        if let lead = unreadLeaders.first { return "\(lead.0.short) \(lead.1) 件未读" }
+        return "全员已读"
+    }
+
+    var compactTailText: String {
+        if dataUnknown { return "· 收件箱读取失败" }
+        if fusedCount > 0 { return "· 待露露终裁" }
+        if totalSubmitted > 0 {
+            let unread = unreadLeaders.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
+            if !unread.isEmpty { return "· 未读 \(unread)" }
+            let names = Set(pendingConfirms.compactMap { AgentRoster.identity(for: $0.from.lowercased())?.short })
+            let joined = names.isEmpty ? "Agent" : names.sorted().joined(separator: " / ")
+            return "· 来自 \(joined)"
+        }
+        let others = unreadLeaders.dropFirst()
+        if !others.isEmpty {
+            return "· " + others.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
+        }
+        return totalUnread > 0 ? "" : "· 0 待办"
+    }
+
+    var preferredCompactWidth: CGFloat {
+        let len = CGFloat(compactHeadText.count) * 15.5 + CGFloat(compactTailText.count) * 11.5
+        return max(272, min(520, 68 + len))
+    }
+
+    /// 展开态内容高度（视图与窗口共用同一套数值，避免裁切）
+    var expandedContentHeight: CGFloat {
+        let extra: CGFloat = expandedTaskId != nil ? 65 : 0
+        if let ag = selectedDrawerAgent {
+            let tCount = pendingCount(for: ag)
+            let dCount: Int = {
+                switch ag {
+                case "agy": return agyDoneTasks.count
+                case "alma": return almaDoneTasks.count
+                case "ping": return pingDoneTasks.count
+                default: return 0
+                }
+            }()
+            return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
+        }
+        if showTopology { return 380 + extra }
+        if showSettings { return 560 + extra }
+
+        var h: CGFloat = 26
+        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 16 }
+        if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
+            h += pendingConfirms.isEmpty ? 49 : 92
+        }
+        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 40 }
+        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 93 }
+        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 18 }
+        let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
+            partial + ((enabledSections[key.rawValue] ?? true) ? 1 : 0)
+        }
+        let gaps = CGFloat(max(0, enabledSectionCount - 1)) * 16
+        let verticalPadding: CGFloat = 10 + 10
+        return max(120, h + gaps + verticalPadding) + extra
+    }
     private var timer: Timer?
     private var breathTimer: Timer?
     private var lastToggleTime: Date = Date.distantPast
@@ -195,6 +391,31 @@ class AgentMonitor: ObservableObject {
         }
         if let savedAccent = UserDefaults.standard.string(forKey: "agent_island_accent_hex") {
             self.accentHex = savedAccent
+        }
+        if let savedScale = UserDefaults.standard.object(forKey: "agent_island_ui_scale") as? Double {
+            self.uiScale = min(1.4, max(0.8, savedScale))
+        }
+        if let savedDock = UserDefaults.standard.string(forKey: "agent_island_dock_edge"),
+           let edge = DockEdge(rawValue: savedDock) {
+            self.dockEdge = edge
+        }
+        if let savedSkin = UserDefaults.standard.string(forKey: "agent_island_skin"),
+           let sk = IslandSkin(rawValue: savedSkin) {
+            self.skin = sk
+        }
+        if let savedForm = UserDefaults.standard.string(forKey: "agent_island_form"),
+           let fm = IslandForm(rawValue: savedForm) {
+            self.islandForm = fm
+        }
+        if let savedOrder = UserDefaults.standard.stringArray(forKey: "agent_island_section_order") {
+            let valid = savedOrder.filter { PanelSectionKey(rawValue: $0) != nil }
+            let missing = PanelSectionKey.defaultOrder.filter { !valid.contains($0) }
+            self.sectionOrder = valid + missing
+        }
+        if let savedSections = UserDefaults.standard.dictionary(forKey: "agent_island_sections") as? [String: Bool] {
+            var merged = PanelSectionKey.defaults
+            for (k, v) in savedSections where merged[k] != nil { merged[k] = v }
+            self.enabledSections = merged
         }
         checkAppearance()
         refreshAll()
@@ -250,9 +471,73 @@ class AgentMonitor: ObservableObject {
     
     func setMode(_ mode: IslandMode) {
         DispatchQueue.main.async {
+            if case .compact = mode { self.showSettings = false }
             self.currentMode = mode
             self.onModeChange?(mode)
+            print("[AgentIsland] setMode -> \(mode)")
         }
+    }
+
+    func setUIScale(_ value: Double) {
+        let clamped = min(1.4, max(0.8, (value * 20).rounded() / 20))
+        DispatchQueue.main.async {
+            self.uiScale = clamped
+            UserDefaults.standard.set(clamped, forKey: "agent_island_ui_scale")
+            self.onLayoutChange?()
+        }
+    }
+
+    func setDockEdge(_ edge: DockEdge) {
+        DispatchQueue.main.async {
+            self.dockEdge = edge
+            UserDefaults.standard.set(edge.rawValue, forKey: "agent_island_dock_edge")
+            self.onLayoutChange?()
+        }
+    }
+
+    func setSkin(_ value: IslandSkin) {
+        DispatchQueue.main.async {
+            self.skin = value
+            UserDefaults.standard.set(value.rawValue, forKey: "agent_island_skin")
+        }
+    }
+
+    func setIslandForm(_ value: IslandForm) {
+        DispatchQueue.main.async {
+            self.islandForm = value
+            UserDefaults.standard.set(value.rawValue, forKey: "agent_island_form")
+        }
+    }
+
+    func toggleSection(_ key: String) {
+        DispatchQueue.main.async {
+            guard PanelSectionKey(rawValue: key) != nil else { return }
+            self.enabledSections[key] = !(self.enabledSections[key] ?? true)
+            UserDefaults.standard.set(self.enabledSections, forKey: "agent_island_sections")
+            self.onLayoutChange?()
+        }
+    }
+
+    func moveSection(_ key: String, before target: String) {
+        guard key != target,
+              let from = sectionOrder.firstIndex(of: key),
+              let to = sectionOrder.firstIndex(of: target) else { return }
+        var order = sectionOrder
+        order.remove(at: from)
+        let insertIndex = to > from ? to - 1 : to
+        order.insert(key, at: insertIndex)
+        sectionOrder = order
+        UserDefaults.standard.set(order, forKey: "agent_island_section_order")
+    }
+
+    func moveSection(_ key: String, by delta: Int) {
+        guard let idx = sectionOrder.firstIndex(of: key) else { return }
+        let dest = idx + delta
+        guard dest >= 0 && dest < sectionOrder.count else { return }
+        var order = sectionOrder
+        order.swapAt(idx, dest)
+        sectionOrder = order
+        UserDefaults.standard.set(order, forKey: "agent_island_section_order")
     }
     
     func startTimers() {
@@ -271,7 +556,9 @@ class AgentMonitor: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            let data = self.fetchInboxesJSON()
+            let snapshot = self.fetchInboxesJSON()
+            let dataOK = snapshot != nil
+            let data = snapshot ?? [:]
             let fOnline = self.checkPort(host: "127.0.0.1", port: 8081)
             let nOnline = NSWorkspace.shared.runningApplications.contains {
                 $0.bundleIdentifier?.lowercased().contains("nutstore") == true ||
@@ -283,11 +570,23 @@ class AgentMonitor: ObservableObject {
             }
             
             DispatchQueue.main.async {
+                self.funnelOnline = fOnline
+                self.nutstoreOnline = nOnline
+                self.tailscaleOnline = tOnline
+
+                guard dataOK else {
+                    // 读取失败：保留上一份真数据，但明确标记「未知」，不假装有数据
+                    self.dataUnknown = true
+                    return
+                }
+                self.dataUnknown = false
+                self.lastRefreshAt = Date()
+
                 let pingArr = data["ping"] ?? []
                 let agyArr = data["agy"] ?? []
                 let almaArr = data["alma"] ?? []
                 let confirms = data["pending_confirms"] ?? []
-                
+
                 self.pingTasks = pingArr
                 self.agyTasks = agyArr
                 self.almaTasks = almaArr
@@ -306,22 +605,42 @@ class AgentMonitor: ObservableObject {
                 self.totalAccepted = allActive.filter { $0.stage == "accepted" }.count
                 self.totalDispatched = allActive.filter { $0.stage == "dispatched" }.count
                 
-                self.funnelOnline = fOnline
-                self.nutstoreOnline = nOnline
-                self.tailscaleOnline = tOnline
-                
                 if let telem = data["__telemetry__"]?.first {
                     self.tokenTotal = telem.file
                     self.tokenCacheRate = telem.title
                     self.tokenTopModel = telem.from
                 }
+                if let pl = data["__ping_loop__"]?.first {
+                    self.fusedCount = Int(pl.file) ?? 0
+                    self.lastFunnelEvent = pl.title.isEmpty ? "等待广播..." : pl.title
+                    self.fusedSummary = pl.from
+                }
                 
                 let currentTotal = pingArr.count + agyArr.count + almaArr.count
                 let prevTotal = self.lastKnownTotalPending
                 if prevTotal >= 0 && currentTotal > prevTotal {
-                    self.triggerNotification(title: "📩 多 Agent 新待办到达", subtitle: "Ping: \(pingArr.count) | AGY: \(agyArr.count) | Alma: \(almaArr.count)")
+                    let lead = self.unreadLeaders.first
+                    self.triggerNotification(
+                        title: "📩 \(currentTotal - prevTotal) 件新未读",
+                        subtitle: lead.map { "\($0.0.title) 收件箱 \($0.1) 件未读 · 靠近自动展开" } ?? "靠近自动展开"
+                    )
                 }
                 self.lastKnownTotalPending = currentTotal
+
+                let prevSubmitted = self.lastKnownSubmitted
+                if prevSubmitted >= 0 && confirms.count > prevSubmitted {
+                    let from = confirms.first?.from ?? "Agent"
+                    self.triggerNotification(
+                        title: "🔔 \(confirms.count) 件待你验收",
+                        subtitle: "\(from) 已递交成果 · 点击查看并验收"
+                    )
+                }
+                self.lastKnownSubmitted = confirms.count
+
+                // 收起态单行摘要随数据变化，窗口宽度需同步，避免文字溢出
+                if case .compact = self.currentMode {
+                    self.onLayoutChange?()
+                }
             }
         }
     }
@@ -442,6 +761,47 @@ print(f"RECONCILE_DONE:{reconciled}:{archived}")
         }
     }
     
+    func resolveFusedByLulu() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = ["-c", """
+import sys, json, os, re, subprocess
+from pathlib import Path
+sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
+import handoff
+
+fuse_script = Path('/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/ping-loop/scripts/ping_loop_fuse.py')
+proc = subprocess.run([sys.executable, str(fuse_script), '--json'], capture_output=True, text=True)
+try:
+    data = json.loads(proc.stdout)
+    tasks = data.get('fused_tasks', [])
+    for t in tasks:
+        base = t.get('base')
+        if base:
+            acked = handoff.load_ack('agy')
+            acked[f"{base}.md"] = "confirmed: 露露最高终裁一键结案"
+            handoff.save_ack('agy', acked)
+            p_acked = handoff.load_ack('ping')
+            p_acked[f"{base}.md"] = "confirmed: 露露最高终裁一键结案"
+            handoff.save_ack('ping', p_acked)
+except Exception:
+    pass
+"""]
+            try? p.run()
+            p.waitUntilExit()
+            
+            self.refreshAll()
+            DispatchQueue.main.async {
+                withAnimation(.spring()) {
+                    self.fusedCount = 0
+                    self.reconcileFeedback = "⚖️ 露露终裁已生效：熔断归零 恢复薄荷绿"
+                }
+            }
+        }
+    }
+    
     func triggerNotification(title: String, subtitle: String) {
         setMode(.notification(title, subtitle))
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
@@ -452,7 +812,7 @@ print(f"RECONCILE_DONE:{reconciled}:{archived}")
         }
     }
     
-    private func fetchInboxesJSON() -> [String: [TaskItem]] {
+    private func fetchInboxesJSON() -> [String: [TaskItem]]? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = ["-c", """
@@ -479,23 +839,28 @@ for b in boxes:
     if not b_dir.is_dir(): continue
     for p in b_dir.iterdir():
         if not p.is_file() or handoff.is_ignored_file(p): continue
-        if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-'):
-            base = handoff.re.sub(r'-reply\\d*\\.md$', '.md', p.name, flags=handoff.re.IGNORECASE)
+        if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-') or '-accept' in p.name or '-confirm' in p.name:
+            base = handoff.re.sub(r'-(reply\\d*|accept\\d*|confirm\\d*)\\.md$', '.md', p.name, flags=handoff.re.IGNORECASE)
+            base_clean = re.sub(r'-reply\\d*$', '', base.replace('.md', '')) + '.md'
             global_replied.add(base)
+            global_replied.add(base_clean)
             global_replied.add(p.stem)
+            global_replied.add(p.name)
             try:
                 meta, _ = handoff.parse_frontmatter(p.read_text(encoding='utf-8', errors='replace'))
                 rt = str(meta.get('reply_to', '')).strip()
                 if rt and rt != 'none':
                     global_replied.add(Path(rt).name)
+                    global_replied.add(Path(rt).stem)
                 rel = meta.get('related', [])
                 if isinstance(rel, list):
                     for item in rel:
                         global_replied.add(Path(str(item)).name)
+                        global_replied.add(Path(str(item)).stem)
             except Exception:
                 pass
 
-# Phase 2: Per-box pending extraction (Meituan 4-stage tracking)
+# Phase 2: Per-box pending extraction (Trace ID 强归组模型，露露定版：一个单子一个状态)
 res = {}
 total_dispatched = 0
 total_accepted = 0
@@ -507,55 +872,82 @@ for box in boxes:
         continue
     acked_names = handoff.load_ack(box)
     all_md = [p for p in inbox_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
-    items = []
+    
+    # 彻底过滤中继传令票与取消票，按 trace_id 强聚合（结合最新通报过滤状态与汇报件）
+    trace_groups = {}
     for p in all_md:
-        if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-'):
-            continue
-        if p.name in acked_names:
-            continue
-        if p.name in global_replied or p.stem in global_replied:
+        if p.name.startswith('pingloop-route-') or p.name.startswith('cancel-') or re.search(r"(-status\\.md$|-report\\.md$|state/|loop-probe)", p.name, re.I):
             continue
         try:
-            text = p.read_text(encoding='utf-8', errors='replace')
-            meta, body = handoff.parse_frontmatter(text)
-            status = str(meta.get('status', '')).strip()
-            if any(k in status for k in ('已完成', '作废', '已关闭', '已核销', '参考', '已结案')):
-                continue
-            frm = str(meta.get('from', '')).strip().lower()
-            if frm == box:
-                continue
-
-            base_stem = p.stem
-            accept_file = p.parent / f"{base_stem}-accept.md"
-            stage = "dispatched"
-            status_text = "待接单"
-            eta = ""
-            if accept_file.exists():
-                stage = "accepted"
-                status_text = "履约中"
-                total_accepted += 1
-                try:
-                    a_meta, a_body = handoff.parse_frontmatter(accept_file.read_text(encoding='utf-8', errors='replace'))
-                    eta = str(a_meta.get('eta', '履约推进中'))
-                except Exception: pass
-            else:
-                total_dispatched += 1
-
-            items.append({
-                'file': p.name,
-                'from': str(meta.get('from', '未知')),
-                'to': str(meta.get('to', box)),
-                'date': str(meta.get('date', '-')),
-                'title': handoff.first_heading(body) or p.stem,
-                'mtime': p.stat().st_mtime,
-                'stage': stage,
-                'statusText': status_text,
-                'artifacts': '',
-                'eta': eta,
-                'highlights': handoff.extract_highlights(text)
-            })
+            txt = p.read_text(encoding='utf-8', errors='replace')
+            meta, body = handoff.parse_frontmatter(txt)
+            tid = str(meta.get('trace_id', '')).strip()
+            b_name = p.stem.split('-reply')[0].split('-accept')[0].split('-confirm')[0]
+            if not tid or tid == 'none' or tid == '-':
+                tid = f"base-{b_name}"
+            trace_groups.setdefault(tid, []).append((p, meta, body))
         except Exception:
             pass
+
+    items = []
+    for tid, files in trace_groups.items():
+        base_names = {p.stem.split('-reply')[0].split('-accept')[0].split('-confirm')[0] for p, _, _ in files}
+        is_acked = any(k in [p.name for p, _, _ in files] or k.replace('.md', '') in base_names for k in acked_names)
+        has_confirm = any('-confirm' in p.name for p, _, _ in files) or any(b in global_replied for b in base_names)
+        has_closed = any(any(c in str(meta.get('status', '')) for c in ('已完成', '作废', '已关闭', '已核销', '参考', '已结案')) for _, meta, _ in files)
+
+        if is_acked or has_confirm or has_closed:
+            continue
+
+        files.sort(key=lambda x: x[0].stat().st_mtime, reverse=True)
+        latest_p, latest_meta, latest_body = files[0]
+        
+        # 寻找该组的原始派单方向（排除回执类文件 -accept/-reply/-audit）
+        orig_dispatch = None
+        for p_item, meta_item, body_item in files:
+            if not any(p_item.name.endswith(s) for s in ('-accept.md', '-reply.md', '-audit.md')):
+                orig_dispatch = (p_item, meta_item, body_item)
+                break
+        if orig_dispatch is None:
+            orig_dispatch = files[-1]
+        orig_frm = str(orig_dispatch[1].get('from', '')).strip().lower()
+        orig_to = str(orig_dispatch[1].get('to', '')).strip().lower()
+        # 严格责任边界：收件人不是本箱的（如抄送件、外发件），严禁算作本箱待办！
+        if orig_to and orig_to != box:
+            continue
+        # 只有原单自身就是外发单且非发给当前信箱时才过滤；收到派单并签署 -accept 属于正常履约中，严禁过滤！
+        if orig_frm == box and orig_to != box:
+            continue
+
+        cur_status = str(latest_meta.get('status', '待办'))
+        if cur_status == '履约中' or any('-accept' in p.name for p, _, _ in files):
+            stage = 'accepted'
+            status_text = '履约中'
+            total_accepted += 1
+            eta = str(latest_meta.get('eta', '履约推进中'))
+        elif cur_status == '待确认' or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
+            # 关键分流：待确认属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
+            continue
+        else:
+            stage = 'dispatched'
+            status_text = '待接单'
+            total_dispatched += 1
+            eta = ''
+
+        items.append({
+            'file': latest_p.name,
+            'from': str(latest_meta.get('from', '未知')),
+            'to': str(latest_meta.get('to', box)),
+            'date': str(latest_meta.get('date', '-')),
+            'title': handoff.first_heading(latest_body) or latest_p.stem,
+            'mtime': latest_p.stat().st_mtime,
+            'stage': stage,
+            'statusText': status_text,
+            'artifacts': str(latest_meta.get('artifacts', '')),
+            'eta': eta,
+            'highlights': handoff.extract_highlights(latest_p.read_text(encoding='utf-8', errors='replace'))
+        })
+
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
 
@@ -564,7 +956,8 @@ raw_confirms = []
 for b in boxes:
     b_dir = ROOT / b
     if not b_dir.is_dir(): continue
-    for p in b_dir.iterdir():
+    all_b_files = list(b_dir.iterdir())
+    for p in all_b_files:
         if not p.is_file() or handoff.is_ignored_file(p): continue
         if not handoff.REPLY_RE.search(p.name): continue
         try:
@@ -577,6 +970,18 @@ for b in boxes:
             if b_stem in all_acked_bases: continue
             acked = handoff.load_ack(to_agent)
             if p.name in acked or b_stem in acked: continue
+
+            # 凡同目录存在对应 -confirm 结案回执，或原单已结案，严禁混入待验收！
+            has_confirm_file = any((b_stem in f.name and '-confirm' in f.name) for f in all_b_files)
+            if has_confirm_file:
+                continue
+            orig_p = b_dir / f'{b_stem}.md'
+            if orig_p.is_file():
+                o_txt = orig_p.read_text(encoding='utf-8', errors='replace')
+                o_meta, _ = handoff.parse_frontmatter(o_txt)
+                if any(c in str(o_meta.get('status', '')) for c in ('已完成', '已结案', '已确认', '已核销', '作废')):
+                    continue
+
             raw_confirms.append({
                 'file': f'{b}/{p.name}',
                 'base': b_stem,
@@ -661,6 +1066,23 @@ except Exception:
 
 res['__telemetry__'] = [{'file': telem_total, 'title': telem_cache, 'from': telem_model, 'to': 'self', 'date': '-', 'mtime': 0}]
 
+pl_fused = 0
+pl_event = 'events.log 实时待命'
+pl_summary = ''
+try:
+    sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/ping-loop/scripts')
+    import ping_loop_fuse
+    f_res = ping_loop_fuse.scan_fuse()
+    pl_fused = int(f_res.get('fused_count', 0))
+    pl_event = str(f_res.get('last_event', 'events.log 实时待命'))
+    if f_res.get('fused_tasks'):
+        top_f = f_res['fused_tasks'][0]
+        pl_summary = f"{top_f['base']} ({top_f['rounds']}轮)"
+except Exception:
+    pass
+
+res['__ping_loop__'] = [{'file': str(pl_fused), 'title': pl_event, 'from': pl_summary, 'to': 'self', 'date': '-', 'mtime': 0}]
+
 print(json.dumps(res, ensure_ascii=False))
 """]
         let pipe = Pipe()
@@ -690,7 +1112,7 @@ print(json.dumps(res, ensure_ascii=False))
                 return output
             }
         } catch {}
-        return [:]
+        return nil
     }
     
     private func checkPort(host: String, port: Int32) -> Bool {
@@ -743,15 +1165,7 @@ struct DynamicIslandView: View {
                 
                 // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(
-                        monitor.currentMode == .compact
-                            ? (monitor.isDarkMode
-                                ? Color.black.opacity(0.94)
-                                : Color(hex: "FFFFFF").opacity(0.95))
-                            : (monitor.isDarkMode
-                                ? Color(hex: "080B12").opacity(0.95)
-                                : Color.white.opacity(0.94))
-                    )
+                    .fill(panelFill)
                 
                 // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -771,9 +1185,12 @@ struct DynamicIslandView: View {
                 // Content View
                 contentForCurrentMode
             }
-            .frame(width: contentWidth, height: contentHeight)
+            .frame(width: contentWidth, height: contentHeight, alignment: .top)
+            .scaleEffect(monitor.uiScale, anchor: .top)
+            .frame(width: contentWidth * monitor.uiScale, height: contentHeight * monitor.uiScale, alignment: .top)
             .animation(.spring(response: 0.32, dampingFraction: 0.76), value: monitor.currentMode)
             .animation(.easeInOut(duration: 0.25), value: monitor.isDarkMode)
+            .animation(.easeInOut(duration: 0.22), value: monitor.uiScale)
             // Soft Unclipped Ambient Shadow
             .shadow(
                 color: Color.black.opacity(monitor.isDarkMode ? 0.45 : 0.16),
@@ -814,35 +1231,68 @@ struct DynamicIslandView: View {
         }
     }
     
-    // MARK: - Compact Mode (Matches UURemoteService Status Pill Exactly)
+    // MARK: - Compact Mode（单行摘要：最要紧的一件事，谁有几件没读）
     var compactView: some View {
         HStack(spacing: 6) {
-            // Blue/Green/Purple Status Badge Icon
             ZStack {
                 Circle()
-                    .fill(compactBadgeColor)
-                    .frame(width: 15, height: 15)
-                    .shadow(color: compactBadgeColor.opacity(0.4), radius: 2)
-                
-                Image(systemName: compactBadgeIcon)
-                    .font(.system(size: 7.5, weight: .bold))
+                    .fill(compactAccent)
+                    .frame(width: 19, height: 19)
+                    .shadow(color: compactAccent.opacity(compactIsAlert ? 0.55 : 0.30), radius: compactIsAlert ? 4.5 : 2)
+                    .scaleEffect(compactIsAlert && monitor.pulse ? 1.04 : 1.0)
+                    .animation(.easeInOut(duration: 1.1), value: monitor.pulse)
+
+                Image(systemName: compactGlyphName)
+                    .font(.system(size: 11, weight: .bold))
                     .foregroundColor(.white)
             }
-            
-            Text("3 Agents")
-                .font(.system(size: 11, weight: .bold, design: .rounded))
+
+            Text(compactHead)
+                .font(.system(size: 15, weight: .heavy, design: .rounded))
                 .foregroundColor(primaryTextColor)
-            
-            Text("•")
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
+            Text(compactTail)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
                 .foregroundColor(secondaryTextColor)
-                .font(.system(size: 9))
-            
-            Text(statusSummary)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundColor(statusTextColor)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 0)
+
+            Image(systemName: "chevron.down")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(secondaryTextColor)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
     }
+
+    var compactAccent: Color {
+        if monitor.dataUnknown { return Color(hex: "F59E0B") }
+        if monitor.fusedCount > 0 { return Color(hex: "EF4444") }
+        if monitor.totalSubmitted > 0, let from = monitor.pendingConfirms.first?.from,
+           let agent = AgentRoster.identity(for: from.lowercased()) {
+            return agent.color
+        }
+        if let lead = monitor.unreadLeaders.first { return lead.0.color }
+        return Color(hex: "10B981")
+    }
+
+    var compactIsAlert: Bool {
+        monitor.dataUnknown || monitor.fusedCount > 0 || monitor.totalSubmitted > 0 || monitor.totalUnread > 0
+    }
+
+    var compactGlyphName: String {
+        if monitor.dataUnknown { return "questionmark" }
+        if monitor.fusedCount > 0 { return "exclamationmark" }
+        if monitor.totalSubmitted > 0 { return "bell.fill" }
+        if monitor.totalUnread > 0 { return "tray.fill" }
+        return "checkmark"
+    }
+
+    var compactHead: String { monitor.compactHeadText }
+    var compactTail: String { monitor.compactTailText }
     
     func notificationView(title: String, subtitle: String) -> some View {
         HStack(spacing: 9) {
@@ -852,16 +1302,16 @@ struct DynamicIslandView: View {
                     .frame(width: 18, height: 18)
                 Image(systemName: "bell.fill")
                     .foregroundColor(.white)
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 11, weight: .bold))
             }
             
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
                     .foregroundColor(primaryTextColor)
                     .lineLimit(1)
                 Text(subtitle)
-                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .foregroundColor(secondaryTextColor)
                     .lineLimit(1)
             }
@@ -872,7 +1322,7 @@ struct DynamicIslandView: View {
     
     // MARK: - AgentIsland & Multi-Agent 架构控制中心 (苹果原厂大字阶与四层空间调度)
     var controlCenterExpandedView: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 16) {
             // Layer 1: Header Row (14pt 大标题 + 链路图切换 + 关闭/Esc)
             HStack(spacing: 8) {
                 ZStack {
@@ -881,22 +1331,31 @@ struct DynamicIslandView: View {
                         .frame(width: 22, height: 22)
                     Image(systemName: "slider.horizontal.3")
                         .foregroundColor(.white)
-                        .font(.system(size: 11, weight: .bold))
+                        .font(.system(size: 13, weight: .bold))
                 }
-                Text("AgentIsland 控制中心")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                Text("AgentIsland 总览")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundColor(primaryTextColor)
-                
-                // 顶部视图模式切换：工单流 vs 架构链路图
+
+                if monitor.dataUnknown {
+                    Text("数据未知")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundColor(textAmber)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.16)))
+                }
+
+                // 顶部视图模式切换：待办总览 vs 链路架构
                 HStack(spacing: 2) {
                     Button(action: {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             monitor.showTopology = false
                         }
                     }) {
-                        Text("📋 调度工单")
-                            .font(.system(size: 10.5, weight: !monitor.showTopology ? .bold : .medium, design: .rounded))
-                            .foregroundColor(!monitor.showTopology ? Color.white : secondaryTextColor)
+                        Text("📋 待办总览")
+                            .font(.system(size: 13, weight: !monitor.showTopology ? .bold : .semibold, design: .rounded))
+                            .foregroundColor(!monitor.showTopology ? accentOnColor : secondaryTextColor)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
                             .background(
@@ -910,9 +1369,9 @@ struct DynamicIslandView: View {
                             monitor.showTopology = true
                         }
                     }) {
-                        Text("🌐 全网链路图")
-                            .font(.system(size: 10.5, weight: monitor.showTopology ? .bold : .medium, design: .rounded))
-                            .foregroundColor(monitor.showTopology ? Color.white : secondaryTextColor)
+                        Text("🌐 链路架构")
+                            .font(.system(size: 13, weight: monitor.showTopology ? .bold : .semibold, design: .rounded))
+                            .foregroundColor(monitor.showTopology ? accentOnColor : secondaryTextColor)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
                             .background(
@@ -931,156 +1390,479 @@ struct DynamicIslandView: View {
                 // Status hint / reconcile feedback
                 if let fb = monitor.reconcileFeedback {
                     Text(fb)
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
                         .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
                         .transition(.scale)
                 } else {
                     Text("Esc 收起")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(secondaryTextColor.opacity(0.8))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
                 }
                 
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        monitor.showSettings.toggle()
+                    }
+                }) {
+                    Image(systemName: monitor.showSettings ? "gearshape.fill" : "gearshape")
+                        .foregroundColor(monitor.showSettings ? accentColor : secondaryTextColor)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("外观、尺寸、停靠边与模块开关")
+
                 Button(action: {
                     monitor.setMode(.compact)
                 }) {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(secondaryTextColor.opacity(0.6))
+                        .foregroundColor(secondaryTextColor)
                         .font(.system(size: 16))
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-            .padding(.top, 8)
+            .padding(.top, 10)
             .padding(.horizontal, 16)
-            
+
             // Layer 2: 黄金展示区 (工单流 vs 架构链路图)
-            if monitor.showTopology {
-                // 真正的全网四层立体架构全透明链路图
-                architectureTopologyView
-            } else {
-                if !monitor.pendingConfirms.isEmpty {
-                    liveDispatchHeroCardView
-                        .padding(.horizontal, 14)
-                } else {
-                    autoloopReadyHeroCardView
-                        .padding(.horizontal, 14)
-                }
-                
-                // Layer 3: 三 Agent 实名横向并列卡 (3 Balanced Columns)
-                HStack(spacing: 10) {
-                    agentBalanceCard(
-                        icon: "apple.terminal.fill",
-                        iconBg: accentColor,
-                        title: "白 / AGY",
-                        subtitle: monitor.agyPending == 0 ? "前台就绪" : "\(monitor.agyPending) 项待办",
-                        hasPending: monitor.agyPending > 0
-                    ) {
-                        monitor.setDrawerAgent("agy")
-                    }
-                    
-                    agentBalanceCard(
-                        icon: "bolt.fill",
-                        iconBg: Color(hex: "FF9500"),
-                        title: "Alma",
-                        subtitle: monitor.almaPending == 0 ? "中台巡检" : "\(monitor.almaPending) 项待办",
-                        hasPending: monitor.almaPending > 0
-                    ) {
-                        monitor.setDrawerAgent("alma")
-                    }
-                    
-                    agentBalanceCard(
-                        icon: "cloud.fill",
-                        iconBg: Color(hex: "5856D6"),
-                        title: "Ping (VM)",
-                        subtitle: monitor.pingPending == 0 ? "云端总控" : "\(monitor.pingPending) 项待办",
-                        hasPending: monitor.pingPending > 0
-                    ) {
-                        monitor.setDrawerAgent("ping")
-                    }
-                }
-                .padding(.horizontal, 14)
+            if monitor.fusedCount > 0 {
+                fusedDecisionBannerView
+                    .padding(.horizontal, 14)
             }
             
-            // Layer 4: 底部收拢通道与资产入口 (Slim Footer)
-            HStack(spacing: 10) {
-                // 通道指示灯
-                HStack(spacing: 8) {
-                    channelItem(name: "Funnel 64M", isOk: monitor.funnelOnline) {
-                        if monitor.funnelOnline {
-                            if let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
-                                NSWorkspace.shared.open(u)
+            if monitor.showTopology {
+                // 架构链路是「深挖视图」，首屏默认永远是总览
+                architectureTopologyView
+            } else if monitor.showSettings {
+                settingsView
+            } else {
+                // 模块可单独开关、可拖动排序：先总览，再验收，再三箱，再通道，最后资产
+                ForEach(monitor.sectionOrder, id: \.self) { key in
+                    if monitor.enabledSections[key] ?? true {
+                        panelSectionView(key)
+                    }
+                }
+            }
+
+        }
+        .padding(.bottom, 10)
+    }
+
+    // MARK: - Panel Sections (可单独开关 · 可拖动排序)
+    @ViewBuilder
+    func panelSectionView(_ key: String) -> some View {
+        switch PanelSectionKey(rawValue: key) {
+        case .overview:
+            overviewSummaryStrip
+                .padding(.horizontal, 14)
+        case .confirm:
+            if !monitor.pendingConfirms.isEmpty {
+                liveDispatchHeroCardView
+                    .padding(.horizontal, 14)
+            } else {
+                autoloopReadyHeroCardView
+                    .padding(.horizontal, 14)
+            }
+        case .inboxes:
+            inboxCardsRow
+                .padding(.horizontal, 14)
+        case .channels:
+            channelHierarchyView
+                .padding(.horizontal, 14)
+                .padding(.top, 2)
+        case .assets:
+            assetsRow
+                .padding(.horizontal, 14)
+                .padding(.top, 2)
+        case .none:
+            EmptyView()
+        }
+    }
+
+    /// 首屏总览：三箱未读 + 待验收，一眼看完，不用翻页
+    var overviewSummaryStrip: some View {
+        HStack(spacing: 6) {
+            if monitor.dataUnknown {
+                Text("⚪️ 未知")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(textAmber)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.14)))
+            } else {
+                ForEach(AgentRoster.all) { agent in
+                    let count = monitor.pendingCount(for: agent.key)
+                    HStack(spacing: 4) {
+                        Circle().fill(agent.color).frame(width: 6, height: 6)
+                        Text(agent.short)
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundColor(primaryTextColor)
+                        Text(count == 0 ? "已读" : "\(count) 未读")
+                            .font(.system(size: 11, weight: count == 0 ? .semibold : .bold, design: .rounded))
+                            .foregroundColor(count == 0 ? secondaryTextColor : agent.color)
+                    }
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Capsule().fill(agent.color.opacity(count == 0 ? 0.06 : 0.12)))
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            HStack(spacing: 4) {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(textPurple)
+                Text(monitor.totalSubmitted == 0 ? "无待验收" : "\(monitor.totalSubmitted) 待验收")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(monitor.totalSubmitted == 0 ? secondaryTextColor : Color(hex: "8B5CF6"))
+            }
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(Color(hex: "8B5CF6").opacity(monitor.totalSubmitted == 0 ? 0.05 : 0.13)))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 0)
+        .background(squircleCardBackground)
+    }
+
+    /// 三个固定色收件箱卡（颜色在任何页面都不变）
+    var inboxCardsRow: some View {
+        HStack(spacing: 10) {
+            ForEach(AgentRoster.all) { agent in
+                let count = monitor.pendingCount(for: agent.key)
+                agentBalanceCard(
+                    icon: agent.symbol,
+                    iconBg: agent.color,
+                    textTint: agentTextColor(agent),
+                    title: agent.title,
+                    subtitle: monitor.dataUnknown
+                        ? "读取失败 · 未知"
+                        : (count == 0 ? "收件箱已读" : "收件箱 \(count) 件未读"),
+                    hasPending: !monitor.dataUnknown && count > 0
+                ) {
+                    monitor.setDrawerAgent(agent.key)
+                }
+            }
+        }
+    }
+
+    /// 底部三层通道：底座(网络) → 主通道(Funnel) → 冷备(坚果云)，不再并排混淆
+    var channelHierarchyView: some View {
+        VStack(spacing: 5) {
+            channelTierRow(
+                tier: "底座",
+                name: "Tailscale",
+                detail: "私网底座 · SSH 可达",
+                icon: "network",
+                ok: monitor.tailscaleOnline,
+                tint: monitor.isDarkMode ? Color(hex: "94A3B8") : Color(hex: "475569")
+            ) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
+            }
+            Divider().opacity(0.12).padding(.leading, 74)
+            channelTierRow(
+                tier: "主通道",
+                name: "Funnel 443",
+                detail: "HTTPS 专用通道 · 主传输路径",
+                icon: "bolt.fill",
+                ok: monitor.funnelOnline,
+                tint: monitor.isDarkMode ? Color(hex: "7DD3FC") : Color(hex: "0369A1")
+            ) {
+                if monitor.funnelOnline, let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
+                    NSWorkspace.shared.open(u)
+                }
+            }
+            Divider().opacity(0.12).padding(.leading, 74)
+            channelTierRow(
+                tier: "冷备",
+                name: "坚果云",
+                detail: "只读冷备 · 灾难恢复底仓",
+                icon: "externaldrive.fill",
+                ok: monitor.nutstoreOnline,
+                tint: Color(hex: "9CA3AF"),
+                muted: true
+            ) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files"))
+            }
+        }
+        .background(squircleCardBackground)
+    }
+
+    func channelTierRow(tier: String, name: String, detail: String, icon: String, ok: Bool, tint: Color, muted: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text(tier)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(muted ? secondaryTextColor : tint)
+                    .frame(width: 40, alignment: .leading)
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(muted ? secondaryTextColor : tint)
+                    .frame(width: 14)
+                Text(name)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(muted ? secondaryTextColor : primaryTextColor)
+                Text(detail)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                HStack(spacing: 3) {
+                    Circle().fill(ok ? Color(hex: "10B981") : Color(hex: "EF4444")).frame(width: 5, height: 5)
+                    Text(ok ? "在线" : "离线")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(ok ? Color(hex: "059669") : Color(hex: "DC2626"))
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 0.5)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    /// 快捷资产入口（保留原入口，独立成可关闭模块）
+    var assetsRow: some View {
+        HStack(spacing: 10) {
+            assetButton(icon: "photo.on.rectangle", label: "全景图") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
+            }
+            assetButton(icon: "folder.fill", label: "Spaces") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
+            }
+            assetButton(icon: "bubble.left.and.bubble.right.fill", label: "交流.md") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
+            }
+            Spacer(minLength: 0)
+            Button(action: { monitor.refreshAll() }) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(secondaryTextColor)
+            }
+            .buttonStyle(PlainButtonStyle())
+            Button(action: { monitor.setMode(.compact) }) {
+                Text("收起")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(secondaryTextColor)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .background(squircleCardBackground)
+    }
+
+    // MARK: - 设置：皮肤 × 形态 × 尺寸 × 停靠边 × 模块开关/排序
+    var settingsView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(accentTextColor)
+                Text("外观与面板")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryTextColor)
+                Spacer()
+                Text(monitor.dataUnknown ? "数据未知" : "数据正常")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(monitor.dataUnknown ? Color(hex: "B45309") : Color(hex: "059669"))
+                Button(action: { withAnimation { monitor.showSettings = false } }) {
+                    Text("完成")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(accentTextColor)
+                        .padding(.horizontal, 9).padding(.vertical, 3)
+                        .background(Capsule().fill(accentColor.opacity(0.12)))
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(.horizontal, 14)
+
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 9) {
+                    settingsRow(title: "皮肤") {
+                        HStack(spacing: 4) {
+                            ForEach(IslandSkin.allCases) { sk in
+                                settingsChip(sk.name, selected: monitor.skin == sk) { monitor.setSkin(sk) }
                             }
                         }
                     }
-                    channelItem(name: "坚果云", isOk: monitor.nutstoreOnline) {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files"))
+                    settingsRow(title: "形态") {
+                        HStack(spacing: 4) {
+                            ForEach(IslandForm.allCases) { fm in
+                                settingsChip(fm.name, selected: monitor.islandForm == fm) { monitor.setIslandForm(fm) }
+                            }
+                        }
                     }
-                    channelItem(name: "Tailscale", isOk: monitor.tailscaleOnline) {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
+                    settingsRow(title: "尺寸") {
+                        HStack(spacing: 8) {
+                            Slider(value: Binding(
+                                get: { monitor.uiScale },
+                                set: { monitor.setUIScale($0) }
+                            ), in: 0.8...1.4, step: 0.05)
+                            .frame(width: 150)
+                            Text("\(Int(monitor.uiScale * 100))%")
+                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .foregroundColor(secondaryTextColor)
+                                .frame(width: 38, alignment: .trailing)
+                        }
                     }
+                    settingsRow(title: "停靠边") {
+                        HStack(spacing: 4) {
+                            ForEach(DockEdge.allCases) { edge in
+                                settingsChip(edge.name, selected: monitor.dockEdge == edge) { monitor.setDockEdge(edge) }
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("模块 · 开关与排序（拖动行可换序）")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundColor(secondaryTextColor)
+                        ForEach(monitor.sectionOrder, id: \.self) { key in
+                            sectionSettingsRow(key)
+                                .onDrag {
+                                    monitor.draggingSectionStore = key
+                                    return NSItemProvider(object: key as NSString)
+                                }
+                                .onDrop(of: [UTType.text], isTargeted: nil) { _ in
+                                    if let drag = monitor.draggingSectionStore {
+                                        monitor.moveSection(drag, before: key)
+                                        monitor.draggingSectionStore = nil
+                                    }
+                                    return true
+                                }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(squircleCardBackground)
                 }
-                
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    func settingsRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(secondaryTextColor)
+                .frame(width: 44, alignment: .leading)
+            content()
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(squircleCardBackground)
+    }
+
+    func settingsChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: selected ? .bold : .semibold, design: .rounded))
+                .foregroundColor(selected ? accentOnColor : secondaryTextColor)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3.5)
+                .background(
+                    Capsule().fill(selected ? accentColor : (monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05)))
+                )
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    func sectionSettingsRow(_ key: String) -> some View {
+        let section = PanelSectionKey(rawValue: key)
+        let enabled = monitor.enabledSections[key] ?? true
+        return HStack(spacing: 7) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(secondaryTextColor)
+            Button(action: { monitor.toggleSection(key) }) {
+                Image(systemName: enabled ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(enabled ? accentColor : secondaryTextColor)
+            }
+            .buttonStyle(PlainButtonStyle())
+            Text(section?.name ?? key)
+                .font(.system(size: 13, weight: enabled ? .bold : .semibold, design: .rounded))
+                .foregroundColor(enabled ? primaryTextColor : secondaryTextColor)
+            Spacer(minLength: 0)
+            Button(action: { monitor.moveSection(key, by: -1) }) {
+                Image(systemName: "chevron.up").font(.system(size: 11, weight: .bold))
+            }
+            .buttonStyle(PlainButtonStyle())
+            .foregroundColor(secondaryTextColor)
+            Button(action: { monitor.moveSection(key, by: 1) }) {
+                Image(systemName: "chevron.down").font(.system(size: 11, weight: .bold))
+            }
+            .buttonStyle(PlainButtonStyle())
+            .foregroundColor(secondaryTextColor)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3.5)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(monitor.isDarkMode ? Color.white.opacity(0.04) : Color.black.opacity(0.03)))
+    }
+
+    func assetButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: icon).font(.system(size: 13))
+                Text(label).font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundColor(secondaryTextColor)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+    
+    // MARK: - M1 熔断露露专属决策卡（批奏折专区：有熔断时最高优先级置顶）
+    var fusedDecisionBannerView: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "flame.fill")
+                    .foregroundColor(textRed)
+                    .font(.system(size: 13, weight: .bold))
+                Text("M1 轮次硬熔断停机保护（连续超 3 轮未收敛）")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(textRed)
+                Spacer()
+                Text("待露露终裁")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(textAmber)
+            }
+            
+            HStack(spacing: 10) {
+                Text("任务触发 exit 3 停机保护，已自动拦截下一轮派单，杜绝空烧 Token。")
+                    .font(.system(size: 13))
+                    .foregroundColor(secondaryTextColor)
+                    .lineLimit(2)
                 Spacer()
                 
-                // 快捷资产入口
-                HStack(spacing: 8) {
-                    Button(action: {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
-                    }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "photo.on.rectangle")
-                                .font(.system(size: 10.5))
-                            Text("全景图")
-                                .font(.system(size: 11, weight: .semibold))
-                        }
-                        .foregroundColor(secondaryTextColor)
+                Button(action: {
+                    monitor.resolveFusedByLulu()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.seal.fill")
+                        Text("露露终裁 · 一键结案")
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    
-                    Button(action: {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
-                    }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "folder.fill")
-                                .font(.system(size: 10.5))
-                            Text("Spaces")
-                                .font(.system(size: 11, weight: .semibold))
-                        }
-                        .foregroundColor(secondaryTextColor)
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    
-                    Button(action: {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
-                    }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "bubble.left.and.bubble.right.fill")
-                                .font(.system(size: 10.5))
-                            Text("交流.md")
-                                .font(.system(size: 11, weight: .semibold))
-                        }
-                        .foregroundColor(secondaryTextColor)
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    
-                    Button(action: {
-                        monitor.refreshAll()
-                    }) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10.5, weight: .bold))
-                            .foregroundColor(secondaryTextColor)
-                    }
-                    .buttonStyle(PlainButtonStyle())
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule().fill(Color(hex: "EF4444"))
+                    )
                 }
+                .buttonStyle(PlainButtonStyle())
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
-            )
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(hex: "EF4444").opacity(monitor.isDarkMode ? 0.16 : 0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color(hex: "EF4444").opacity(0.35), lineWidth: 0.9)
+                )
+        )
     }
     
     // 全网四层立体架构全透明链路图 (真实架构拓扑 · 过程100%全透明)
@@ -1090,14 +1872,14 @@ struct DynamicIslandView: View {
             HStack(spacing: 8) {
                 ZStack {
                     Circle().fill(Color(hex: "D97706").opacity(0.18)).frame(width: 24, height: 24)
-                    Image(systemName: "person.crop.circle.fill").font(.system(size: 13, weight: .bold)).foregroundColor(Color(hex: "D97706"))
+                    Image(systemName: "person.crop.circle.fill").font(.system(size: 13, weight: .bold)).foregroundColor(textAmber)
                 }
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("【01 指挥层】露露 (Commander)").font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
-                    Text("iPhone 手机端 / Muse / 微信 — 意图发起与最高裁决").font(.system(size: 9.5, weight: .medium)).foregroundColor(secondaryTextColor)
+                    Text("【01 指挥层】露露 (Commander)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    Text("iPhone 手机端 / Muse / 微信 — 意图发起与最高裁决").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
                 }
                 Spacer()
-                Text("意图源头").font(.system(size: 9, weight: .semibold)).foregroundColor(Color(hex: "D97706")).padding(.horizontal, 5).padding(.vertical, 2).background(Capsule().fill(Color(hex: "D97706").opacity(0.12)))
+                Text("意图源头").font(.system(size: 11, weight: .semibold)).foregroundColor(textAmber).padding(.horizontal, 5).padding(.vertical, 2).background(Capsule().fill(Color(hex: "B45309")))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -1105,24 +1887,24 @@ struct DynamicIslandView: View {
             
             // Arrow 1
             HStack(spacing: 4) {
-                Image(systemName: "arrow.down").font(.system(size: 8.5, weight: .bold)).foregroundColor(secondaryTextColor.opacity(0.5))
-                Text("自然语言意图 / 手机点选决策卡").font(.system(size: 8.5, weight: .medium, design: .monospaced)).foregroundColor(secondaryTextColor.opacity(0.7))
+                Image(systemName: "arrow.down").font(.system(size: 11, weight: .bold)).foregroundColor(secondaryTextColor)
+                Text("自然语言意图 / 手机点选决策卡").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(secondaryTextColor)
             }
             
             // Layer 2: 总控层
             HStack(spacing: 8) {
                 ZStack {
-                    Circle().fill(Color(hex: "5856D6").opacity(0.18)).frame(width: 24, height: 24)
-                    Image(systemName: "cloud.fill").font(.system(size: 12, weight: .bold)).foregroundColor(Color(hex: "5856D6"))
+                    Circle().fill(AgentRoster.ping.color.opacity(0.18)).frame(width: 24, height: 24)
+                    Image(systemName: "cloud.fill").font(.system(size: 13, weight: .bold)).foregroundColor(AgentRoster.ping.color)
                 }
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("【02 总控层】Ping (Dispatcher · 云端 VM)").font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
-                    Text("意图编译、全网派单 (Step 1)、指标核验、发起方结案 (Step 4)").font(.system(size: 9.5, weight: .medium)).foregroundColor(secondaryTextColor)
+                    Text("【02 总控层】Ping (Dispatcher · 云端 VM)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                    Text("意图编译、全网派单 (Step 1)、指标核验、发起方结案 (Step 4)").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
                 }
                 Spacer()
                 HStack(spacing: 3) {
                     Circle().fill(Color(hex: "10B981")).frame(width: 5, height: 5)
-                    Text("云端常驻").font(.system(size: 9, weight: .bold)).foregroundColor(Color(hex: "10B981"))
+                    Text("云端常驻").font(.system(size: 11, weight: .bold)).foregroundColor(textGreen)
                 }
             }
             .padding(.horizontal, 10)
@@ -1132,22 +1914,31 @@ struct DynamicIslandView: View {
             // Arrow 2: Dual Dedicated Channels
             HStack(spacing: 16) {
                 HStack(spacing: 3) {
-                    Image(systemName: "bolt.fill").font(.system(size: 8))
-                    Text("Funnel 443 HTTPS 专线 (100ms)").font(.system(size: 9, weight: .bold, design: .rounded))
+                    Image(systemName: "bolt.fill").font(.system(size: 11, weight: .semibold))
+                    Text("【主通道】Funnel 443 (100ms)").font(.system(size: 11, weight: .bold, design: .rounded))
                 }
-                .foregroundColor(Color(hex: "059669"))
+                .foregroundColor(textGreen)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(Capsule().fill(Color(hex: "059669").opacity(0.14)))
-                
+
                 HStack(spacing: 3) {
-                    Image(systemName: "lock.shield.fill").font(.system(size: 8))
-                    Text("Tailscale SSH 专线").font(.system(size: 9, weight: .bold, design: .rounded))
+                    Image(systemName: "lock.shield.fill").font(.system(size: 11, weight: .semibold))
+                    Text("【底座】Tailscale 私网").font(.system(size: 11, weight: .bold, design: .rounded))
                 }
-                .foregroundColor(Color(hex: "3B82F6"))
+                .foregroundColor(textBlue)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(Capsule().fill(Color(hex: "3B82F6").opacity(0.14)))
+
+                HStack(spacing: 3) {
+                    Image(systemName: "externaldrive.fill").font(.system(size: 11, weight: .semibold))
+                    Text("【冷备】坚果云").font(.system(size: 11, weight: .bold, design: .rounded))
+                }
+                .foregroundColor(textGray)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color(hex: "9CA3AF").opacity(0.14)))
             }
             
             // Layer 3: 执行端双机协同
@@ -1155,11 +1946,11 @@ struct DynamicIslandView: View {
                 // Mac Mini
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 4) {
-                        Image(systemName: "apple.terminal.fill").font(.system(size: 10, weight: .bold)).foregroundColor(accentColor)
-                        Text("【03 执行中台】Mac Mini").font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                        Image(systemName: "apple.terminal.fill").font(.system(size: 11, weight: .bold)).foregroundColor(accentTextColor)
+                        Text("【03 执行中台】Mac Mini").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
                     }
-                    Text("白/AGY (前台交互/代码走查) · Alma (中台)").font(.system(size: 8.5, weight: .medium)).foregroundColor(secondaryTextColor)
-                    Text("Funnel 接收即广播: events.log ➔ autoloop").font(.system(size: 8, weight: .medium, design: .monospaced)).foregroundColor(Color(hex: "059669"))
+                    Text("白/AGY (前台交互/代码走查) · Alma (中台)").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+                    Text("Funnel ➔ ping-loop: \(monitor.lastFunnelEvent)").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(textGreen).lineLimit(1)
                 }
                 .padding(7)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1168,11 +1959,11 @@ struct DynamicIslandView: View {
                 // Simulation PC
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 4) {
-                        Image(systemName: "desktopcomputer").font(.system(size: 10, weight: .bold)).foregroundColor(Color(hex: "3B82F6"))
-                        Text("【04 算力实机】模拟电脑").font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                        Image(systemName: "desktopcomputer").font(.system(size: 11, weight: .bold)).foregroundColor(textBlue)
+                        Text("【04 算力实机】模拟电脑").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
                     }
-                    Text("PFC3D 9012 / FLAC3D 9011 原生求解").font(.system(size: 8.5, weight: .medium)).foregroundColor(secondaryTextColor)
-                    Text("IP 192.168.50.239 · 2400×1600 图件落盘").font(.system(size: 8, weight: .medium, design: .monospaced)).foregroundColor(Color(hex: "3B82F6"))
+                    Text("PFC3D 9012 / FLAC3D 9011 原生求解").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+                    Text("IP 192.168.50.239 · 2400×1600 图件落盘").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(textBlue)
                 }
                 .padding(7)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1190,7 +1981,7 @@ struct DynamicIslandView: View {
             let safeIdx = min(max(0, monitor.activeConfirmIndex), count - 1)
             let item = monitor.pendingConfirms[safeIdx]
             
-            VStack(spacing: 8) {
+            VStack(spacing: 12) {
                 // Header: 调度状态 + 轮播器
                 HStack(spacing: 6) {
                     ZStack {
@@ -1198,12 +1989,12 @@ struct DynamicIslandView: View {
                             .fill(Color(hex: "8B5CF6"))
                             .frame(width: 18, height: 18)
                         Image(systemName: "bell.badge.fill")
-                            .font(.system(size: 9.5, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundColor(.white)
                     }
                     Text("架构调度 · 发起方亲自视觉验收闭环")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundColor(Color(hex: "8B5CF6"))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(textPurple)
                     
                     Spacer()
                     
@@ -1215,7 +2006,7 @@ struct DynamicIslandView: View {
                                 }
                             }) {
                                 Image(systemName: "chevron.left")
-                                    .font(.system(size: 9.5, weight: .bold))
+                                    .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(primaryTextColor)
                                     .frame(width: 18, height: 18)
                                     .background(squircleCardBackground)
@@ -1223,7 +2014,7 @@ struct DynamicIslandView: View {
                             .buttonStyle(PlainButtonStyle())
                             
                             Text("\(safeIdx + 1)/\(count)")
-                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                .font(.system(size: 13, weight: .bold, design: .monospaced))
                                 .foregroundColor(secondaryTextColor)
                             
                             Button(action: {
@@ -1232,7 +2023,7 @@ struct DynamicIslandView: View {
                                 }
                             }) {
                                 Image(systemName: "chevron.right")
-                                    .font(.system(size: 9.5, weight: .bold))
+                                    .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(primaryTextColor)
                                     .frame(width: 18, height: 18)
                                     .background(squircleCardBackground)
@@ -1244,7 +2035,7 @@ struct DynamicIslandView: View {
                 .padding(.horizontal, 4)
                 
                 // Card Body (点击卡片展开提炼重点)
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 12) {
                     // Task Title + 4-Step Stepper
                     HStack(alignment: .center) {
                         Text(item.title)
@@ -1259,19 +2050,19 @@ struct DynamicIslandView: View {
                     HStack(spacing: 8) {
                         HStack(spacing: 4) {
                             Text("履约方: \(item.from)")
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundColor(Color(hex: "3B82F6"))
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(textBlue)
                             Text("➔")
-                                .font(.system(size: 9))
+                                .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                             Text("派单方: \(item.to)")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(Color(hex: "8B5CF6"))
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(textPurple)
                         }
                         
                         if !item.artifacts.isEmpty {
                             Text("•")
-                                .font(.system(size: 8))
+                                .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                             Button(action: {
                                 let ap = item.artifacts.hasPrefix("/") ? item.artifacts : "\(monitor.rootPath)/../\(item.artifacts)"
@@ -1279,12 +2070,12 @@ struct DynamicIslandView: View {
                             }) {
                                 HStack(spacing: 3) {
                                     Image(systemName: "arrow.up.right.square.fill")
-                                        .font(.system(size: 9.5))
+                                        .font(.system(size: 11, weight: .semibold))
                                     Text("产物: \(item.artifacts)")
-                                        .font(.system(size: 10.5, weight: .medium))
+                                        .font(.system(size: 13, weight: .semibold))
                                         .lineLimit(1)
                                 }
-                                .foregroundColor(accentColor)
+                                .foregroundColor(accentTextColor)
                             }
                             .buttonStyle(PlainButtonStyle())
                         }
@@ -1296,13 +2087,13 @@ struct DynamicIslandView: View {
                         }) {
                             HStack(spacing: 2) {
                                 Image(systemName: "sparkles")
-                                    .font(.system(size: 8.5))
+                                    .font(.system(size: 11, weight: .semibold))
                                 Text(monitor.expandedTaskId == item.id ? "收起" : "重点")
-                                    .font(.system(size: 10, weight: .bold))
+                                    .font(.system(size: 11, weight: .bold))
                             }
-                            .foregroundColor(monitor.expandedTaskId == item.id ? Color.white : accentColor)
+                            .foregroundColor(monitor.expandedTaskId == item.id ? accentOnColor : accentTextColor)
                             .padding(.horizontal, 7)
-                            .padding(.vertical, 3.5)
+                            .padding(.vertical, 1.5)
                             .background(
                                 Capsule().fill(monitor.expandedTaskId == item.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
                             )
@@ -1314,10 +2105,10 @@ struct DynamicIslandView: View {
                             NSWorkspace.shared.open(URL(fileURLWithPath: path))
                         }) {
                             Text("原文")
-                                .font(.system(size: 10, weight: .semibold))
+                                .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                                 .padding(.horizontal, 6)
-                                .padding(.vertical, 3.5)
+                                .padding(.vertical, 1.5)
                                 .background(
                                     Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                 )
@@ -1330,14 +2121,14 @@ struct DynamicIslandView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 4) {
                                 Image(systemName: "text.quote")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundColor(accentColor)
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(accentTextColor)
                                 Text("核心提炼重点")
-                                    .font(.system(size: 10.5, weight: .bold, design: .rounded))
-                                    .foregroundColor(accentColor)
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                    .foregroundColor(accentTextColor)
                             }
                             Text(item.highlights.isEmpty ? "（本单据暂无正文摘要）" : item.highlights)
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .font(.system(size: 13, weight: .semibold, design: .rounded))
                                 .foregroundColor(primaryTextColor)
                                 .lineSpacing(3)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1351,7 +2142,7 @@ struct DynamicIslandView: View {
                     }
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.vertical, 1)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
@@ -1361,11 +2152,11 @@ struct DynamicIslandView: View {
                     monitor.toggleTaskExpanded(item.id)
                 }
             }
-            .padding(10)
+            .padding(.horizontal, 2)
             .background(squircleCardBackground)
         }
     }
-    
+
     // 全员就绪态 Hero 卡片 (AgentIsland & Autoloop 中台运行就绪)
     @ViewBuilder
     var autoloopReadyHeroCardView: some View {
@@ -1376,10 +2167,10 @@ struct DynamicIslandView: View {
                     .frame(width: 34, height: 34)
                 Image(systemName: "checkmark.shield.fill")
                     .font(.system(size: 16, weight: .bold))
-                    .foregroundColor(Color(hex: "059669"))
+                    .foregroundColor(textGreen)
             }
             
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 6) {
                     Text("全网架构就绪 · 0 积压待办")
                         .font(.system(size: 13, weight: .bold, design: .rounded))
@@ -1387,28 +2178,28 @@ struct DynamicIslandView: View {
                     Text("•")
                         .foregroundColor(secondaryTextColor)
                     Text("Funnel 443 专线直达")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundColor(Color(hex: "059669"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(textGreen)
                 }
                 
                 HStack(spacing: 6) {
                     HStack(spacing: 3) {
                         Image(systemName: "circle.hexagongrid.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(accentColor)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(accentTextColor)
                         Text(monitor.tokenTotal)
-                            .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
                             .foregroundColor(primaryTextColor)
                     }
                     Text("·")
-                        .font(.system(size: 9))
-                        .foregroundColor(secondaryTextColor.opacity(0.4))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
                     HStack(spacing: 3) {
                         Image(systemName: "bolt.fill")
-                            .font(.system(size: 8.5))
-                            .foregroundColor(Color(hex: "34C759"))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(textGreen)
                         Text("缓存率 \(monitor.tokenCacheRate)")
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
                             .foregroundColor(secondaryTextColor)
                     }
                 }
@@ -1421,9 +2212,9 @@ struct DynamicIslandView: View {
             }) {
                 HStack(spacing: 4) {
                     Image(systemName: "sparkle.magnifyingglass")
-                        .font(.system(size: 10.5, weight: .bold))
+                        .font(.system(size: 13, weight: .bold))
                     Text("全网核验")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
                 }
                 .foregroundColor(.white)
                 .padding(.horizontal, 10)
@@ -1435,39 +2226,40 @@ struct DynamicIslandView: View {
             }
             .buttonStyle(PressableScaleButtonStyle())
         }
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
         .background(squircleCardBackground)
     }
-    
+
     // 横向三等分 Agent 平衡卡片 (3 Balanced Cards)
-    func agentBalanceCard(icon: String, iconBg: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
+    func agentBalanceCard(icon: String, iconBg: Color, textTint: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     ZStack {
                         Circle()
                             .fill(iconBg)
                             .frame(width: 22, height: 22)
                         Image(systemName: icon)
-                            .font(.system(size: 10.5, weight: .bold))
+                            .font(.system(size: 13, weight: .bold))
                             .foregroundColor(.white)
                     }
                     Text(title)
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
                         .foregroundColor(primaryTextColor)
                     Spacer()
                     if hasPending {
                         Circle()
-                            .fill(Color(hex: "8B5CF6"))
+                            .fill(iconBg)
                             .frame(width: 7, height: 7)
                     }
                 }
                 Text(subtitle)
-                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                    .foregroundColor(hasPending ? Color(hex: "8B5CF6") : secondaryTextColor)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundColor(hasPending ? textTint : secondaryTextColor)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.vertical, 0)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(squircleCardBackground)
         }
@@ -1478,11 +2270,11 @@ struct DynamicIslandView: View {
     func lifecycleStepperView(stage: String) -> some View {
         HStack(spacing: 3) {
             stepperNode(name: "派单", active: true, done: stage != "dispatched")
-            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "接单", active: stage == "accepted" || stage == "submitted" || stage == "confirmed", done: stage == "submitted" || stage == "confirmed")
-            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "待验", active: stage == "submitted" || stage == "confirmed", done: stage == "confirmed", highlight: stage == "submitted")
-            Text("›").font(.system(size: 8.5)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "结案", active: stage == "confirmed", done: stage == "confirmed")
         }
     }
@@ -1493,8 +2285,8 @@ struct DynamicIslandView: View {
                 .fill(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.35)))
                 .frame(width: 5, height: 5)
             Text(name)
-                .font(.system(size: 9.5, weight: highlight || done || active ? .bold : .medium, design: .rounded))
-                .foregroundColor(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : primaryTextColor) : secondaryTextColor))
+                .font(.system(size: 11, weight: highlight || done || active ? .bold : .semibold, design: .rounded))
+                .foregroundColor(highlight ? (monitor.isDarkMode ? Color(hex: "BF5AF2") : Color(hex: "6D28D9")) : (active ? (done ? (monitor.isDarkMode ? Color(hex: "30D158") : Color(hex: "047857")) : primaryTextColor) : secondaryTextColor))
         }
         .padding(.horizontal, 4.5)
         .padding(.vertical, 2)
@@ -1511,7 +2303,7 @@ struct DynamicIslandView: View {
                     .frame(width: 6, height: 6)
                     .shadow(color: (isOk ? Color(hex: "10B981") : Color(hex: "EF4444")).opacity(0.5), radius: 1.5)
                 Text(name)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(isOk ? secondaryTextColor : Color(hex: "EF4444"))
             }
         }
@@ -1519,12 +2311,7 @@ struct DynamicIslandView: View {
     }
     
     func agentDisplayName(_ agent: String) -> String {
-        switch agent {
-        case "agy": return "白 / AGY"
-        case "alma": return "Alma"
-        case "ping": return "Ping (VM)"
-        default: return agent
-        }
+        AgentRoster.identity(for: agent)?.title ?? agent
     }
 
     func agentTasks(_ agent: String) -> [TaskItem] {
@@ -1556,11 +2343,11 @@ struct DynamicIslandView: View {
                 }) {
                     HStack(spacing: 5) {
                         Image(systemName: "chevron.left")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(.system(size: 13, weight: .bold))
                         Text("返回")
-                            .font(.system(size: 11.5, weight: .bold, design: .rounded))
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
                     }
-                    .foregroundColor(accentColor)
+                    .foregroundColor(accentTextColor)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(
@@ -1571,9 +2358,13 @@ struct DynamicIslandView: View {
                 
                 Spacer()
                 
-                Text("\(agentDisplayName(agent)) · \(tasks.count) 项真待办")
-                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                    .foregroundColor(primaryTextColor)
+                HStack(spacing: 6) {
+                    Circle().fill(AgentRoster.identity(for: agent)?.color ?? accentColor)
+                        .frame(width: 8, height: 8)
+                    Text("\(agentDisplayName(agent)) 收件箱 · \(tasks.count) 件未读")
+                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                        .foregroundColor(primaryTextColor)
+                }
                 
                 Spacer()
                 
@@ -1582,20 +2373,20 @@ struct DynamicIslandView: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "folder.fill")
-                            .font(.system(size: 10.5))
+                            .font(.system(size: 13))
                         Text("访达")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: 13, weight: .semibold))
                     }
                     .foregroundColor(secondaryTextColor)
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 3.5)
                     .background(
                         Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                     )
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-            .padding(.top, 8)
+            .padding(.top, 4)
             .padding(.horizontal, 16)
             
             // Task List + Done Feed Section (自适应展开 · 杜绝巨幅空白)
@@ -1612,26 +2403,26 @@ struct DynamicIslandView: View {
                                                 .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
                                                 .frame(width: 24, height: 24)
                                             Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.badge.fill" : "doc.text.fill"))
-                                                .font(.system(size: 11, weight: .bold))
+                                                .font(.system(size: 13, weight: .bold))
                                                 .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
                                         }
                                         
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(task.title)
-                                                .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                                                .font(.system(size: 13, weight: .bold, design: .rounded))
                                                 .foregroundColor(primaryTextColor)
                                                 .lineLimit(1)
                                             
                                             HStack(spacing: 6) {
                                                 lifecycleStepperView(stage: task.stage)
-                                                Text("•").font(.system(size: 8)).foregroundColor(secondaryTextColor.opacity(0.6))
+                                                Text("•").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
                                                 Text("\(task.from) ➔ \(task.to)")
-                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .font(.system(size: 11, weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                 if !task.eta.isEmpty {
                                                     Text("• \(task.eta)")
-                                                        .font(.system(size: 10, weight: .semibold))
-                                                        .foregroundColor(Color(hex: "3B82F6"))
+                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .foregroundColor(textBlue)
                                                 }
                                             }
                                         }
@@ -1645,11 +2436,11 @@ struct DynamicIslandView: View {
                                             }) {
                                                 HStack(spacing: 2) {
                                                     Image(systemName: "sparkles")
-                                                        .font(.system(size: 8.5))
+                                                        .font(.system(size: 11, weight: .semibold))
                                                     Text(monitor.expandedTaskId == task.id ? "收起" : "重点")
-                                                        .font(.system(size: 10, weight: .bold))
+                                                        .font(.system(size: 11, weight: .bold))
                                                 }
-                                                .foregroundColor(monitor.expandedTaskId == task.id ? Color.white : accentColor)
+                                                .foregroundColor(monitor.expandedTaskId == task.id ? accentOnColor : accentTextColor)
                                                 .padding(.horizontal, 7)
                                                 .padding(.vertical, 3.5)
                                                 .background(
@@ -1663,7 +2454,7 @@ struct DynamicIslandView: View {
                                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                                             }) {
                                                 Text("原文")
-                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .font(.system(size: 11, weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                     .padding(.horizontal, 6)
                                                     .padding(.vertical, 3.5)
@@ -1680,14 +2471,14 @@ struct DynamicIslandView: View {
                                         VStack(alignment: .leading, spacing: 4) {
                                             HStack(spacing: 4) {
                                                 Image(systemName: "text.quote")
-                                                    .font(.system(size: 9, weight: .bold))
-                                                    .foregroundColor(accentColor)
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundColor(accentTextColor)
                                                 Text("核心提炼重点")
-                                                    .font(.system(size: 10.5, weight: .bold, design: .rounded))
-                                                    .foregroundColor(accentColor)
+                                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                    .foregroundColor(accentTextColor)
                                             }
                                             Text(task.highlights.isEmpty ? "（本单据暂无正文摘要）" : task.highlights)
-                                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                                .font(.system(size: 13, weight: .semibold, design: .rounded))
                                                 .foregroundColor(primaryTextColor)
                                                 .lineSpacing(3)
                                                 .fixedSize(horizontal: false, vertical: true)
@@ -1714,10 +2505,10 @@ struct DynamicIslandView: View {
                         HStack(spacing: 6) {
                             Image(systemName: "checkmark.circle.fill")
                                 .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(Color(hex: "059669"))
+                                .foregroundColor(textGreen)
                             Text("当前无积压待办 · 全员就绪")
-                                .font(.system(size: 12, weight: .bold, design: .rounded))
-                                .foregroundColor(Color(hex: "059669"))
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                .foregroundColor(textGreen)
                         }
                         .padding(.vertical, 8)
                     }
@@ -1727,10 +2518,10 @@ struct DynamicIslandView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 5) {
                                 Image(systemName: "clock.arrow.circlepath")
-                                    .font(.system(size: 10))
+                                    .font(.system(size: 11, weight: .semibold))
                                     .foregroundColor(secondaryTextColor)
                                 Text("最新结案回信 · 已办结流")
-                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
                                     .foregroundColor(secondaryTextColor)
                                 Spacer()
                             }
@@ -1746,21 +2537,21 @@ struct DynamicIslandView: View {
                                                     .fill(Color(hex: "059669").opacity(0.16))
                                                     .frame(width: 22, height: 22)
                                                 Image(systemName: "checkmark")
-                                                    .font(.system(size: 10, weight: .bold))
-                                                    .foregroundColor(Color(hex: "059669"))
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundColor(textGreen)
                                             }
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(done.title)
-                                                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
+                                                    .font(.system(size: 13, weight: .bold, design: .rounded))
                                                     .foregroundColor(primaryTextColor)
                                                     .lineLimit(1)
                                                 HStack(spacing: 4) {
                                                     Text("回件: \(done.from) ➔ \(done.to)")
-                                                        .font(.system(size: 9.5, weight: .medium))
+                                                        .font(.system(size: 11, weight: .semibold))
                                                         .foregroundColor(secondaryTextColor)
-                                                    Text("•").font(.system(size: 8)).foregroundColor(secondaryTextColor.opacity(0.5))
+                                                    Text("•").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
                                                     Text(done.date)
-                                                        .font(.system(size: 9.5))
+                                                        .font(.system(size: 11, weight: .semibold))
                                                         .foregroundColor(secondaryTextColor)
                                                 }
                                             }
@@ -1771,11 +2562,11 @@ struct DynamicIslandView: View {
                                             }) {
                                                 HStack(spacing: 2) {
                                                     Image(systemName: "sparkles")
-                                                        .font(.system(size: 8.5))
+                                                        .font(.system(size: 11, weight: .semibold))
                                                     Text(monitor.expandedTaskId == done.id ? "收起" : "重点")
-                                                        .font(.system(size: 10, weight: .bold))
+                                                        .font(.system(size: 11, weight: .bold))
                                                 }
-                                                .foregroundColor(monitor.expandedTaskId == done.id ? Color.white : accentColor)
+                                                .foregroundColor(monitor.expandedTaskId == done.id ? accentOnColor : accentTextColor)
                                                 .padding(.horizontal, 7)
                                                 .padding(.vertical, 3.5)
                                                 .background(
@@ -1789,7 +2580,7 @@ struct DynamicIslandView: View {
                                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                                             }) {
                                                 Text("原文")
-                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .font(.system(size: 11, weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                     .padding(.horizontal, 6)
                                                     .padding(.vertical, 3.5)
@@ -1805,14 +2596,14 @@ struct DynamicIslandView: View {
                                             VStack(alignment: .leading, spacing: 4) {
                                                 HStack(spacing: 4) {
                                                     Image(systemName: "text.quote")
-                                                        .font(.system(size: 9, weight: .bold))
-                                                        .foregroundColor(accentColor)
+                                                        .font(.system(size: 11, weight: .bold))
+                                                        .foregroundColor(accentTextColor)
                                                     Text("核心提炼重点")
-                                                        .font(.system(size: 10.5, weight: .bold, design: .rounded))
-                                                        .foregroundColor(accentColor)
+                                                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                        .foregroundColor(accentTextColor)
                                                 }
                                                 Text(done.highlights.isEmpty ? "（本回信暂无正文摘要）" : done.highlights)
-                                                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
                                                     .foregroundColor(primaryTextColor)
                                                     .lineSpacing(3)
                                                     .fixedSize(horizontal: false, vertical: true)
@@ -1838,17 +2629,17 @@ struct DynamicIslandView: View {
                         }
                     }
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, 3.5)
             }
             
             // Bottom Guidance Line
             HStack(spacing: 5) {
                 Image(systemName: "hand.raised.fill")
-                    .font(.system(size: 9))
-                    .foregroundColor(Color(hex: "D97706"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(textAmber)
                 Text("露露掌握最高裁决权 · 见真实回信与产物方可收口")
-                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                    .foregroundColor(secondaryTextColor.opacity(0.85))
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundColor(secondaryTextColor)
             }
             .padding(.bottom, 8)
         }
@@ -1858,8 +2649,8 @@ struct DynamicIslandView: View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
                 monitor.isDarkMode
-                    ? Color.white.opacity(0.16)
-                    : Color.white.opacity(0.88)
+                    ? Color.white.opacity(0.20)
+                    : Color.white.opacity(0.96)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1881,17 +2672,99 @@ struct DynamicIslandView: View {
         monitor.agyPending + monitor.almaPending + monitor.pingPending
     }
     
+    /// 皮肤 × 明暗：通透玻璃 / 曜石深色 / 陶瓷实心
+    var panelFill: Color {
+        let tint = monitor.currentMode == .compact ? monitor.skin.compactTint : monitor.skin.expandedTint
+        switch monitor.skin {
+        case .glass:
+            return monitor.isDarkMode
+                ? Color(hex: "0A0D14").opacity(tint.dark)
+                : Color(hex: "FFFFFF").opacity(tint.light)
+        case .obsidian:
+            return monitor.isDarkMode
+                ? Color.black.opacity(tint.dark)
+                : Color(hex: "FFFFFF").opacity(tint.light)
+        case .ceramic:
+            return monitor.isDarkMode
+                ? Color(hex: "1C1C1E").opacity(tint.dark)
+                : Color(hex: "FFFFFF").opacity(tint.light)
+        }
+    }
+
     // Dynamic Typography Colors
     var primaryTextColor: Color {
-        monitor.isDarkMode ? Color.white : Color(hex: "1D1D1F")
+        monitor.isDarkMode ? Color.white : Color(hex: "000000")
     }
     
     var secondaryTextColor: Color {
-        monitor.isDarkMode ? Color(hex: "9E9EA5") : Color(hex: "515156")
+        monitor.isDarkMode ? Color(hex: "E5E5EA") : Color(hex: "1C1C1E")
     }
+
+    /// 正文用强调色（浅色模式下压暗，保证 ≥4.5:1；不靠 opacity 调淡）
+    var accentTextColor: Color {
+        let hex = monitor.accentHex.uppercased()
+        if monitor.isDarkMode {
+            switch hex {
+            case "EAB308": return Color(hex: "FFD60A")
+            case "22C55E": return Color(hex: "30D158")
+            case "9053F8": return Color(hex: "BF5AF2")
+            case "EF4444": return Color(hex: "FF6961")
+            default: return Color(hex: "64D2FF")
+            }
+        } else {
+            switch hex {
+            case "9053F8": return Color(hex: "5E3DB3")
+            case "EAB308": return Color(hex: "7A5C00")
+            case "22C55E": return Color(hex: "0B7A3B")
+            case "EF4444": return Color(hex: "C1121F")
+            default: return Color(hex: "0051D5")
+            }
+        }
+    }
+
+    /// Agent 固定身份色的「文字安全」版本；识别色仍由圆点/图标承担
+    func agentTextColor(_ agent: AgentIdentity) -> Color {
+        if monitor.isDarkMode {
+            switch agent.key {
+            case "agy": return Color(hex: "64D2FF")
+            case "alma": return Color(hex: "FFB340")
+            case "ping": return Color(hex: "BF5AF2")
+            default: return primaryTextColor
+            }
+        } else {
+            switch agent.key {
+            case "agy": return Color(hex: "0051D5")
+            case "alma": return Color(hex: "9A3412")
+            case "ping": return Color(hex: "6D28D9")
+            default: return primaryTextColor
+            }
+        }
+    }
+
+    /// 在强调色实底上选黑/白文字：按相对亮度取对比度更高者
+    var accentOnColor: Color {
+        let hex = monitor.accentHex
+        let chars = Array(hex.uppercased())
+        guard chars.count == 6 else { return .white }
+        func comp(_ i: Int) -> Double {
+            let v = Double(Int(String(chars[i * 2...i * 2 + 1]), radix: 16) ?? 0) / 255.0
+            return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        let lum = 0.2126 * comp(0) + 0.7152 * comp(1) + 0.0722 * comp(2)
+        let onWhite = 1.05 / (lum + 0.05)
+        let onBlack = (lum + 0.05) / 0.05
+        return onWhite >= onBlack ? .white : .black
+    }
+
+    var textGreen: Color { monitor.isDarkMode ? Color(hex: "30D158") : Color(hex: "047857") }
+    var textBlue: Color { monitor.isDarkMode ? Color(hex: "64D2FF") : Color(hex: "1D4ED8") }
+    var textPurple: Color { monitor.isDarkMode ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
+    var textAmber: Color { monitor.isDarkMode ? Color(hex: "FFD60A") : Color(hex: "B45309") }
+    var textRed: Color { monitor.isDarkMode ? Color(hex: "FF6961") : Color(hex: "C1121F") }
+    var textGray: Color { monitor.isDarkMode ? Color(hex: "C7C7CC") : Color(hex: "6B7280") }
     
     var compactBadgeColor: Color {
-        if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
+        if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline || monitor.fusedCount > 0 {
             return Color(hex: "EF4444")
         }
         let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
@@ -1904,6 +2777,9 @@ struct DynamicIslandView: View {
     var compactBadgeIcon: String {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
             return "exclamationmark.triangle.fill"
+        }
+        if monitor.fusedCount > 0 {
+            return "flame.fill"
         }
         let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
         if totalWorking > 0 {
@@ -1918,37 +2794,28 @@ struct DynamicIslandView: View {
     
     var contentWidth: CGFloat {
         switch monitor.currentMode {
-        case .compact: return monitor.totalSubmitted > 0 || monitor.totalAccepted > 0 ? 196 : 176
+        case .compact:
+            return monitor.preferredCompactWidth
         case .notification: return 340
         case .expanded:
-            return 520
+            return 560
         }
     }
     
     var contentHeight: CGFloat {
         switch monitor.currentMode {
-        case .compact: return 28
-        case .notification: return 32
+        case .compact: return 40
+        case .notification: return 38
         case .expanded:
-            let extra = monitor.expandedTaskId != nil ? 65 : 0
-            if monitor.selectedDrawerAgent != nil {
-                let ag = monitor.selectedDrawerAgent ?? ""
-                let tCount = agentTasks(ag).count
-                let dCount = agentDoneTasks(ag).count
-                return CGFloat(((tCount + dCount <= 4) ? 260 : 330) + extra)
-            } else if monitor.showTopology {
-                return 248
-            } else {
-                return CGFloat((monitor.pendingConfirms.isEmpty ? 204 : 278) + extra)
-            }
+            return monitor.expandedContentHeight
         }
     }
     
     var cornerRadius: CGFloat {
         switch monitor.currentMode {
-        case .compact: return 14
-        case .notification: return 17
-        case .expanded: return 18
+        case .compact: return monitor.islandForm == .capsule ? 14 : 10
+        case .notification: return monitor.islandForm == .capsule ? 17 : 14
+        case .expanded: return monitor.islandForm == .capsule ? 18 : 22
         }
     }
     
@@ -1960,9 +2827,21 @@ struct DynamicIslandView: View {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline {
             return "通道异常"
         }
-        let totalWorking = monitor.totalAccepted + monitor.totalSubmitted + monitor.totalDispatched
-        if totalWorking > 0 {
-            return "\(totalWorking) 项履约中"
+        if monitor.fusedCount > 0 {
+            return "M1熔断 \(monitor.fusedCount)项"
+        }
+        var parts: [String] = []
+        if monitor.totalDispatched > 0 {
+            parts.append("\(monitor.totalDispatched)待办")
+        }
+        if monitor.totalAccepted > 0 {
+            parts.append("\(monitor.totalAccepted)履约中")
+        }
+        if monitor.totalSubmitted > 0 {
+            parts.append("\(monitor.totalSubmitted)待验")
+        }
+        if !parts.isEmpty {
+            return parts.joined(separator: " · ")
         }
         return "全员就绪"
     }
@@ -2011,7 +2890,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
-    
+
+    var hoverTimer: Timer?
+    var autoHoverExpanded = false
+    var suppressHoverUntilExit = false
+    var hoverOutsideSince: Date?
+    var hoverInsideSince: Date?
+    /// 仅快照自测使用：让定时轮询也采用同一假鼠标点，模拟真实指针停留。
+    var hoverOverridePoint: NSPoint?
+
     var themeAutoItem: NSMenuItem?
     var themeLightItem: NSMenuItem?
     var themeDarkItem: NSMenuItem?
@@ -2023,12 +2910,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         setupIslandPanel()
         setupAutoDismissMonitors()
-        
+        setupHoverWatcher()
+
         monitor.onModeChange = { [weak self] mode in
             self?.updatePanelFrame(for: mode)
         }
-        
+
         monitor.onDrawerChange = { [weak self] in
+            guard let self = self else { return }
+            self.updatePanelFrame(for: self.monitor.currentMode)
+        }
+
+        monitor.onLayoutChange = { [weak self] in
             guard let self = self else { return }
             self.updatePanelFrame(for: self.monitor.currentMode)
         }
@@ -2058,6 +2951,95 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { [weak self] _ in
             self?.monitor.setMode(.compact)
         }
+
+        // 快照导出（仅在显式传入 AGENT_ISLAND_SNAPSHOT_DIR 时启用；用于本机无录屏权限时自证 UI）
+        if let dir = ProcessInfo.processInfo.environment["AGENT_ISLAND_SNAPSHOT_DIR"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+                guard let self = self else { return }
+                self.autoHoverExpanded = false
+                self.monitor.setMode(.compact)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    self.exportPanelPNG(to: dir + "/compact.png")
+                    // 用与真实鼠标相同的 evaluateHover 路径验证「靠近自动展开」
+                    let hotPoint = NSPoint(x: self.islandPanel.frame.midX, y: self.islandPanel.frame.minY - 20)
+                    self.suppressHoverUntilExit = false
+                    self.hoverInsideSince = nil
+                    self.hoverOverridePoint = hotPoint
+                    self.evaluateHover(at: hotPoint)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.evaluateHover(at: hotPoint)
+                        self.appendSnapshotLog(dir: dir, line: "hover_selftest=\(self.monitor.currentMode)")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                            self.exportPanelPNG(to: dir + "/expanded.png")
+                            self.monitor.showTopology = true
+                            self.updatePanelFrame(for: .expanded)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                self.exportPanelPNG(to: dir + "/topology.png")
+                                self.monitor.showTopology = false
+                                self.monitor.showSettings = true
+                                self.updatePanelFrame(for: .expanded)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    self.exportPanelPNG(to: dir + "/settings.png")
+                                    self.monitor.showSettings = false
+                                    self.monitor.setDrawerAgent("agy")
+                                    self.updatePanelFrame(for: .expanded)
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                        self.exportPanelPNG(to: dir + "/drawer.png")
+                                        self.monitor.selectedDrawerAgent = nil
+                                        self.updatePanelFrame(for: .expanded)
+                                        self.hoverOverridePoint = NSPoint(x: 0, y: 0)
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
+                                            self.appendSnapshotLog(dir: dir, line: "hover_collapse=\(self.monitor.currentMode)")
+                                            self.hoverOverridePoint = nil
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func appendSnapshotLog(dir: String, line: String) {
+        let logURL = URL(fileURLWithPath: dir + "/snapshot.log")
+        guard let d = (line + "\n").data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(d); try? h.close() }
+        } else { try? d.write(to: logURL) }
+    }
+
+    /// 用 AppKit 直接把面板视图渲染为 PNG（不依赖系统屏幕录制权限）
+    func exportPanelPNG(to path: String) {
+        guard let view = islandPanel.contentView, view.bounds.width > 0 else { return }
+        let logLine = "mode=\(monitor.currentMode) panel=\(islandPanel.frame) view=\(view.bounds)\n"
+        let logURL = URL(fileURLWithPath: (path as NSString).deletingLastPathComponent + "/snapshot.log")
+        if let d = logLine.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(d); try? h.close() }
+            } else { try? d.write(to: logURL) }
+        }
+        // 以 2 倍像素密度渲染，保证导出的 PNG 字体锐利（1x 缓存会发虚）
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(view.bounds.width * scale),
+            pixelsHigh: Int(view.bounds.height * scale),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return }
+        rep.size = view.bounds.size
+        view.cacheDisplay(in: view.bounds, to: rep)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: path))
     }
     
     // Auto-Dismiss on Blur (Click outside window to collapse)
@@ -2084,9 +3066,78 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     DispatchQueue.main.async {
                         self.monitor.setMode(.compact)
                     }
+                } else {
+                    // 用户已亲自操作面板 → 转成「钉住」，不再随鼠标离开自动收起
+                    self.autoHoverExpanded = false
                 }
             }
             return event
+        }
+    }
+
+    // MARK: - 靠近自动展开 / 离开自动收起（不依赖 Accessibility 权限，轮询鼠标位置）
+    func setupHoverWatcher() {
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.11, repeats: true) { [weak self] _ in
+            self?.evaluateHover()
+        }
+        if let t = hoverTimer {
+            RunLoop.main.add(t, forMode: .common)
+        }
+    }
+
+    func evaluateHover(at overridePoint: NSPoint? = nil) {
+        guard islandPanel != nil else { return }
+        let mouse = overridePoint ?? hoverOverridePoint ?? NSEvent.mouseLocation
+        let frame = islandPanel.frame
+        if let dbgPath = ProcessInfo.processInfo.environment["AGENT_ISLAND_HOVER_LOG"] {
+            let line = "mode=\(monitor.currentMode) auto=\(autoHoverExpanded) mouse=\(mouse) panel=\(frame) supp=\(suppressHoverUntilExit) inside=\(hoverInsideSince.map { Date().timeIntervalSince($0) } ?? -1) outside=\(hoverOutsideSince.map { Date().timeIntervalSince($0) } ?? -1)\n"
+            if let d = line.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: dbgPath) {
+                    if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: dbgPath)) { h.seekToEndOfFile(); h.write(d); try? h.close() }
+                } else { try? d.write(to: URL(fileURLWithPath: dbgPath)) }
+            }
+        }
+
+        switch monitor.currentMode {
+        case .compact:
+            // 收起态：鼠标靠近面板周边即展开
+            let hot = NSRect(
+                x: frame.minX - 72,
+                y: frame.minY - 48,
+                width: frame.width + 144,
+                height: frame.height + 62
+            )
+            guard hot.contains(mouse) else {
+                suppressHoverUntilExit = false
+                hoverInsideSince = nil
+                return
+            }
+            guard !suppressHoverUntilExit else { return }
+            if hoverInsideSince == nil { hoverInsideSince = Date() }
+            // 停留 0.18s 再展开，避免鼠标路过误触
+            if Date().timeIntervalSince(hoverInsideSince ?? Date()) >= 0.18 {
+                autoHoverExpanded = true
+                hoverOutsideSince = nil
+                monitor.setMode(.expanded)
+            }
+
+        case .expanded:
+            guard autoHoverExpanded else { return }
+            let keep = frame.insetBy(dx: -76, dy: -52)
+            if keep.contains(mouse) {
+                hoverOutsideSince = nil
+            } else {
+                if hoverOutsideSince == nil { hoverOutsideSince = Date() }
+                if Date().timeIntervalSince(hoverOutsideSince ?? Date()) >= 0.7 {
+                    autoHoverExpanded = false
+                    hoverOutsideSince = nil
+                    suppressHoverUntilExit = true
+                    monitor.setMode(.compact)
+                }
+            }
+
+        default:
+            break
         }
     }
     
@@ -2175,33 +3226,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let windowWidth: CGFloat
         let windowHeight: CGFloat
         
+        let scale = monitor.uiScale
         switch mode {
         case .compact:
-            windowWidth = 220
-            windowHeight = 36
+            windowWidth = monitor.preferredCompactWidth * scale + 24
+            windowHeight = 40 * scale + 8
         case .notification:
-            windowWidth = 364
-            windowHeight = 40
+            windowWidth = 340 * scale + 24
+            windowHeight = 38 * scale + 8
         case .expanded:
-            windowWidth = 544
-            let extra = monitor.expandedTaskId != nil ? 65 : 0
-            if monitor.selectedDrawerAgent != nil {
-                let ag = monitor.selectedDrawerAgent ?? ""
-                let tCount = (ag == "agy" ? monitor.agyTasks.count : (ag == "alma" ? monitor.almaTasks.count : monitor.pingTasks.count))
-                let dCount = (ag == "agy" ? monitor.agyDoneTasks.count : (ag == "alma" ? monitor.almaDoneTasks.count : monitor.pingDoneTasks.count))
-                windowHeight = CGFloat(((tCount + dCount <= 4) ? 276 : 346) + extra)
-            } else if monitor.showTopology {
-                windowHeight = 264
-            } else {
-                windowHeight = CGFloat((monitor.pendingConfirms.isEmpty ? 220 : 294) + extra)
-            }
+            windowWidth = 560 * scale + 24
+            windowHeight = monitor.expandedContentHeight * scale + 16
+        }
+
+        let x: CGFloat
+        let y: CGFloat
+        switch monitor.dockEdge {
+        case .top:
+            x = screenFrame.origin.x + (screenFrame.width - windowWidth) / 2.0
+            y = screenFrame.origin.y + screenFrame.height - windowHeight
+        case .left:
+            x = screenFrame.origin.x + 8
+            y = screenFrame.origin.y + (screenFrame.height - windowHeight) / 2.0
+        case .right:
+            x = screenFrame.origin.x + screenFrame.width - windowWidth - 8
+            y = screenFrame.origin.y + (screenFrame.height - windowHeight) / 2.0
         }
         
-        let x = screenFrame.origin.x + (screenFrame.width - windowWidth) / 2.0
-        let y = screenFrame.origin.y + screenFrame.height - windowHeight
-        
-        let targetRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+        // 半像素/非整数坐标会让 Retina 文字发虚：窗口与原点一律取整点
+        let targetRect = NSRect(
+            x: x.rounded(),
+            y: y.rounded(),
+            width: windowWidth.rounded(),
+            height: windowHeight.rounded()
+        )
         islandPanel.setFrame(targetRect, display: true, animate: false)
+        print("[AgentIsland] frame -> \(targetRect) contentH=\(monitor.expandedContentHeight)")
         
         if mode == .expanded {
             islandPanel.makeKey()

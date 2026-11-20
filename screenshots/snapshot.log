@@ -1,0 +1,7 @@
+mode=compact panel=(1063.0, 1392.0, 435.0, 48.0) view=(0.0, 0.0, 435.0, 48.0)
+hover_selftest=expanded
+mode=expanded panel=(988.0, 1055.0, 584.0, 385.0) view=(0.0, 0.0, 584.0, 385.0)
+mode=expanded panel=(988.0, 1044.0, 584.0, 396.0) view=(0.0, 0.0, 584.0, 396.0)
+mode=expanded panel=(988.0, 864.0, 584.0, 576.0) view=(0.0, 0.0, 584.0, 576.0)
+mode=expanded panel=(988.0, 1014.0, 584.0, 426.0) view=(0.0, 0.0, 584.0, 426.0)
+hover_collapse=compact
