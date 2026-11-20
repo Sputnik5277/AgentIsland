@@ -141,6 +141,15 @@ enum AgentRoster {
     }
 }
 
+/// 最近一次真实通讯（来自 Funnel events.log 或 handoff 文件 mtime）
+struct AgentCommPulse: Identifiable, Equatable {
+    let source: String
+    let target: String
+    let count: Int
+    let lastAt: Date
+    var id: String { source + "->" + target }
+}
+
 // MARK: - 外观 / 形态 / 停靠边（可调项，全部落 UserDefaults）
 enum DockEdge: String, CaseIterable, Identifiable {
     case top, left, right
@@ -235,7 +244,11 @@ class AgentMonitor: ObservableObject {
     @Published var funnelOnline: Bool = true
     @Published var nutstoreOnline: Bool = true
     @Published var tailscaleOnline: Bool = true
-    
+
+    /// 最近 15 秒仍有真实通讯的链路；无通讯时为空，视图不绘制任何脉冲
+    @Published var activePulses: [AgentCommPulse] = []
+    @Published var lastCommAt: Date? = nil
+
     @Published var currentMode: IslandMode = .compact
     @Published var selectedDrawerAgent: String? = nil {
         didSet { self.onDrawerChange?() }
@@ -353,7 +366,7 @@ class AgentMonitor: ObservableObject {
             }()
             return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
         }
-        if showTopology { return 380 + extra }
+        if showTopology { return 300 + extra }
         if showSettings { return 560 + extra }
 
         var h: CGFloat = 26
@@ -373,6 +386,7 @@ class AgentMonitor: ObservableObject {
     }
     private var timer: Timer?
     private var breathTimer: Timer?
+    private var commTimer: Timer?
     private var lastToggleTime: Date = Date.distantPast
     
     func canToggle() -> Bool {
@@ -521,6 +535,11 @@ class AgentMonitor: ObservableObject {
         }
     }
 
+    /// 面板实际明暗：曜石深色皮肤无论系统模式如何，都使用深色表面与浅色文字
+    var panelIsDark: Bool {
+        isDarkMode || skin == .obsidian
+    }
+
     func toggleSection(_ key: String) {
         DispatchQueue.main.async {
             guard PanelSectionKey(rawValue: key) != nil else { return }
@@ -560,6 +579,121 @@ class AgentMonitor: ObservableObject {
         breathTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
             DispatchQueue.main.async {
                 self?.pulse.toggle()
+            }
+        }
+        refreshCommPulses()
+        commTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshCommPulses()
+        }
+    }
+
+    // MARK: - 事件驱动通讯脉冲（只认真实文件通讯，静默时不画线）
+
+    private static let isoFull: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let multiRoot = ProcessInfo.processInfo.environment["AGENT_ISLAND_MULTI_ROOT"]
+        ?? "/Users/l/Nutstore Files/Obsidian_/multi-agent"
+    private static let eventLog = ProcessInfo.processInfo.environment["AGENT_ISLAND_EVENT_LOG"]
+        ?? "/Users/l/.local/funnel-sync/events.log"
+
+    private func parseEventTime(_ raw: String) -> Date? {
+        Self.isoFull.date(from: raw) ?? Self.isoPlain.date(from: raw)
+    }
+
+    /// 从 handoff front matter 取实名收发方；只接受 AGY / Alma / Ping 三家
+    private func handoffEndpoints(at url: URL) -> (String, String)? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var from = "", to = ""
+        for line in text.prefix(1600).split(separator: "\n") {
+            let s = String(line).trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("from:") {
+                from = String(s.dropFirst(5)).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "")
+            } else if s.hasPrefix("to:") {
+                to = String(s.dropFirst(3)).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "")
+            }
+            if !from.isEmpty && !to.isEmpty { break }
+        }
+        let f = from.lowercased(), t = to.lowercased()
+        guard AgentRoster.identity(for: f) != nil, AgentRoster.identity(for: t) != nil, f != t else { return nil }
+        return (f, t)
+    }
+
+    private func refreshCommPulses() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let now = Date()
+            let cutoff = now.addingTimeInterval(-15)
+            var hits: [(String, String, Date)] = []
+
+            // 主源：Funnel 443 写入事件（只认 PUT，不认 HEARTBEAT）
+            if let data = FileManager.default.contents(atPath: Self.eventLog),
+               let text = String(data: data, encoding: .utf8) {
+                for line in text.split(separator: "\n").suffix(240) {
+                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)),
+                          let d = obj as? [String: Any],
+                          d["action"] as? String == "PUT",
+                          let path = d["path"] as? String,
+                          path.hasPrefix("handoffs/"),
+                          let raw = d["time"] as? String,
+                          let when = self.parseEventTime(raw),
+                          when >= cutoff else { continue }
+                    let url = URL(fileURLWithPath: Self.multiRoot).appendingPathComponent(path)
+                    if let (from, to) = self.handoffEndpoints(at: url) {
+                        hits.append((from, to, when))
+                    }
+                }
+            }
+
+            // 兜底：events.log 静默时，用 handoff 文件 mtime（15 秒窗口）
+            if hits.isEmpty {
+                let fm = FileManager.default
+                for box in AgentRoster.all.map({ $0.key }) {
+                    let dir = URL(fileURLWithPath: self.rootPath).appendingPathComponent(box)
+                    guard let files = try? fm.contentsOfDirectory(
+                        at: dir,
+                        includingPropertiesForKeys: [.contentModificationDateKey],
+                        options: [.skipsHiddenFiles]
+                    ) else { continue }
+                    for url in files where ["md", "txt"].contains(url.pathExtension.lowercased()) {
+                        let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                        guard mtime >= cutoff, let (from, to) = self.handoffEndpoints(at: url) else { continue }
+                        hits.append((from, to, mtime))
+                    }
+                }
+            }
+
+            var grouped: [String: (from: String, to: String, count: Int, last: Date)] = [:]
+            for (from, to, when) in hits {
+                let key = from + "->" + to
+                if var g = grouped[key] {
+                    g.count += 1
+                    g.last = max(g.last, when)
+                    grouped[key] = g
+                } else {
+                    grouped[key] = (from, to, 1, when)
+                }
+            }
+            let order = Dictionary(uniqueKeysWithValues: AgentRoster.all.enumerated().map { ($1.key, $0) })
+            let pulses = grouped.values.map {
+                AgentCommPulse(source: $0.from, target: $0.to, count: $0.count, lastAt: $0.last)
+            }.sorted {
+                let a = order[$0.source] ?? 99, b = order[$1.source] ?? 99
+                if a != b { return a < b }
+                return (order[$0.target] ?? 99) < (order[$1.target] ?? 99)
+            }
+            let lastAt = pulses.map { $0.lastAt }.max()
+
+            DispatchQueue.main.async {
+                self.activePulses = pulses
+                self.lastCommAt = lastAt
             }
         }
     }
@@ -1170,7 +1304,7 @@ struct DynamicIslandView: View {
             ZStack {
                 // Layer 1: Apple Native Visual Effect Blur (Auto Light / Dark)
                 AppleGlassBackground(
-                    material: monitor.isDarkMode ? .hudWindow : .popover,
+                    material: monitor.panelIsDark ? .hudWindow : .popover,
                     blendingMode: .behindWindow
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -1184,9 +1318,9 @@ struct DynamicIslandView: View {
                     .stroke(
                         LinearGradient(
                             stops: [
-                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.65) : Color.white.opacity(0.98), location: 0.0),
-                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.20) : Color.black.opacity(0.08), location: 0.45),
-                                .init(color: monitor.isDarkMode ? Color.white.opacity(0.10) : Color.black.opacity(0.14), location: 1.0)
+                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.65) : Color.white.opacity(0.98), location: 0.0),
+                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.20) : Color.black.opacity(0.08), location: 0.45),
+                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.14), location: 1.0)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -1201,17 +1335,18 @@ struct DynamicIslandView: View {
             .scaleEffect(monitor.uiScale, anchor: .top)
             .frame(width: contentWidth * monitor.uiScale, height: contentHeight * monitor.uiScale, alignment: .top)
             .animation(.spring(response: 0.32, dampingFraction: 0.76), value: monitor.currentMode)
-            .animation(.easeInOut(duration: 0.25), value: monitor.isDarkMode)
+            .animation(.easeInOut(duration: 0.25), value: monitor.panelIsDark)
+            .animation(.easeInOut(duration: 0.22), value: monitor.skin)
             .animation(.easeInOut(duration: 0.22), value: monitor.uiScale)
             // Soft Unclipped Ambient Shadow
             .shadow(
-                color: Color.black.opacity(monitor.isDarkMode ? 0.45 : 0.16),
-                radius: monitor.isDarkMode ? 12 : 8,
+                color: Color.black.opacity(monitor.panelIsDark ? 0.45 : 0.16),
+                radius: monitor.panelIsDark ? 12 : 8,
                 x: 0,
-                y: monitor.isDarkMode ? 5 : 3
+                y: monitor.panelIsDark ? 5 : 3
             )
             .shadow(
-                color: Color.black.opacity(monitor.isDarkMode ? 0.20 : 0.05),
+                color: Color.black.opacity(monitor.panelIsDark ? 0.20 : 0.05),
                 radius: 1.5,
                 x: 0,
                 y: 1
@@ -1275,7 +1410,7 @@ struct DynamicIslandView: View {
 
             Image(systemName: "chevron.down")
                 .font(.system(size: 11, weight: .bold))
-                .foregroundColor(secondaryTextColor)
+                .foregroundColor(accentColor)
         }
         .padding(.horizontal, 12)
     }
@@ -1394,7 +1529,7 @@ struct DynamicIslandView: View {
                 }
                 .padding(2)
                 .background(
-                    Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
+                    Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
                 )
                 
                 Spacer()
@@ -1564,7 +1699,7 @@ struct DynamicIslandView: View {
                 detail: "私网底座 · SSH 可达",
                 icon: "network",
                 ok: monitor.tailscaleOnline,
-                tint: monitor.isDarkMode ? Color(hex: "94A3B8") : Color(hex: "475569")
+                tint: monitor.panelIsDark ? Color(hex: "94A3B8") : Color(hex: "475569")
             ) {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Tailscale.app"))
             }
@@ -1575,7 +1710,7 @@ struct DynamicIslandView: View {
                 detail: "HTTPS 专用通道 · 主传输路径",
                 icon: "bolt.fill",
                 ok: monitor.funnelOnline,
-                tint: monitor.isDarkMode ? Color(hex: "7DD3FC") : Color(hex: "0369A1")
+                tint: monitor.panelIsDark ? Color(hex: "7DD3FC") : Color(hex: "0369A1")
             ) {
                 if monitor.funnelOnline, let u = URL(string: "https://lmac-mini.tail463092.ts.net/v1/health") {
                     NSWorkspace.shared.open(u)
@@ -1773,7 +1908,7 @@ struct DynamicIslandView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
                 .background(
-                    Capsule().fill(selected ? accentColor : (monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05)))
+                    Capsule().fill(selected ? accentColor : (monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05)))
                 )
         }
         .buttonStyle(PlainButtonStyle())
@@ -1810,7 +1945,7 @@ struct DynamicIslandView: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 3.5)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(monitor.isDarkMode ? Color.white.opacity(0.04) : Color.black.opacity(0.03)))
+            .fill(monitor.panelIsDark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)))
     }
 
     func assetButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
@@ -1869,7 +2004,7 @@ struct DynamicIslandView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(hex: "EF4444").opacity(monitor.isDarkMode ? 0.16 : 0.08))
+                .fill(Color(hex: "EF4444").opacity(monitor.panelIsDark ? 0.16 : 0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .stroke(Color(hex: "EF4444").opacity(0.35), lineWidth: 0.9)
@@ -1877,112 +2012,190 @@ struct DynamicIslandView: View {
         )
     }
     
-    // 全网四层立体架构全透明链路图 (真实架构拓扑 · 过程100%全透明)
+    // 横向多 Agent 拓扑：AGY 左 · Alma 中 · Ping 右；Funnel 443 横贯中部。
+    // 脉冲只来自 events.log / handoff mtime 的真实通讯；静默时零活动连线、零脉冲、零高亮。
     var architectureTopologyView: some View {
-        VStack(spacing: 7) {
-            // Layer 1: 指挥层
-            HStack(spacing: 8) {
-                ZStack {
-                    Circle().fill(Color(hex: "D97706").opacity(0.18)).frame(width: 24, height: 24)
-                    Image(systemName: "person.crop.circle.fill").font(.system(size: 13, weight: .bold)).foregroundColor(textAmber)
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("【01 指挥层】露露 (Commander)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
-                    Text("iPhone 手机端 / Muse / 微信 — 意图发起与最高裁决").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
-                }
-                Spacer()
-                Text("意图源头").font(.system(size: 11, weight: .semibold)).foregroundColor(textAmber).padding(.horizontal, 5).padding(.vertical, 2).background(Capsule().fill(Color(hex: "B45309")))
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(squircleCardBackground)
-            
-            // Arrow 1
-            HStack(spacing: 4) {
-                Image(systemName: "arrow.down").font(.system(size: 11, weight: .bold)).foregroundColor(secondaryTextColor)
-                Text("自然语言意图 / 手机点选决策卡").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(secondaryTextColor)
-            }
-            
-            // Layer 2: 总控层
-            HStack(spacing: 8) {
-                ZStack {
-                    Circle().fill(AgentRoster.ping.color.opacity(0.18)).frame(width: 24, height: 24)
-                    Image(systemName: "cloud.fill").font(.system(size: 13, weight: .bold)).foregroundColor(AgentRoster.ping.color)
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("【02 总控层】Ping (Dispatcher · 云端 VM)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
-                    Text("意图编译、全网派单 (Step 1)、指标核验、发起方结案 (Step 4)").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+        VStack(spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("横向链路 · 事件驱动脉冲")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(primaryTextColor)
+                    Text("AGY 左 · Alma 中 · Ping 右")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
                 }
                 Spacer()
-                HStack(spacing: 3) {
-                    Circle().fill(Color(hex: "10B981")).frame(width: 5, height: 5)
-                    Text("云端常驻").font(.system(size: 11, weight: .bold)).foregroundColor(textGreen)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(squircleCardBackground)
-            
-            // Arrow 2: Dual Dedicated Channels
-            HStack(spacing: 16) {
-                HStack(spacing: 3) {
-                    Image(systemName: "bolt.fill").font(.system(size: 11, weight: .semibold))
-                    Text("【主通道】Funnel 443 (100ms)").font(.system(size: 11, weight: .bold, design: .rounded))
-                }
-                .foregroundColor(textGreen)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color(hex: "059669").opacity(0.14)))
-
-                HStack(spacing: 3) {
-                    Image(systemName: "lock.shield.fill").font(.system(size: 11, weight: .semibold))
-                    Text("【底座】Tailscale 私网").font(.system(size: 11, weight: .bold, design: .rounded))
-                }
-                .foregroundColor(textBlue)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color(hex: "3B82F6").opacity(0.14)))
-
-                HStack(spacing: 3) {
-                    Image(systemName: "externaldrive.fill").font(.system(size: 11, weight: .semibold))
-                    Text("【冷备】坚果云").font(.system(size: 11, weight: .bold, design: .rounded))
+                // 坚果云：右上角小节点，只作冷备，不参与通讯判定
+                HStack(spacing: 4) {
+                    Image(systemName: "externaldrive.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("坚果云 · 冷备")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                    Circle()
+                        .fill(monitor.nutstoreOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
+                        .frame(width: 5, height: 5)
                 }
                 .foregroundColor(textGray)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
                 .background(Capsule().fill(Color(hex: "9CA3AF").opacity(0.14)))
             }
-            
-            // Layer 3: 执行端双机协同
-            HStack(spacing: 8) {
-                // Mac Mini
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "apple.terminal.fill").font(.system(size: 11, weight: .bold)).foregroundColor(accentTextColor)
-                        Text("【03 执行中台】Mac Mini").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+            .padding(.horizontal, 12)
+
+            GeometryReader { geo in
+                let width = geo.size.width
+                let railY: CGFloat = 34
+                ZStack {
+                    // Funnel 443：只在真实通讯时出现；空闲时完全不画线（Tailscale 基座另绘）
+                    if !monitor.activePulses.isEmpty {
+                        Capsule()
+                            .fill(secondaryTextColor.opacity(monitor.panelIsDark ? 0.30 : 0.34))
+                            .frame(width: max(0, width - 28), height: 2)
+                            .position(x: width / 2, y: railY)
                     }
-                    Text("白/AGY (前台交互/代码走查) · Alma (中台)").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
-                    Text("Funnel ➔ ping-loop: \(monitor.lastFunnelEvent)").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(textGreen).lineLimit(1)
-                }
-                .padding(7)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(squircleCardBackground)
-                
-                // Simulation PC
-                VStack(alignment: .leading, spacing: 3) {
+
                     HStack(spacing: 4) {
-                        Image(systemName: "desktopcomputer").font(.system(size: 11, weight: .bold)).foregroundColor(textBlue)
-                        Text("【04 算力实机】模拟电脑").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(primaryTextColor)
+                        Image(systemName: "bolt.horizontal.fill")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Funnel 443 · 主通道")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
                     }
-                    Text("PFC3D 9012 / FLAC3D 9011 原生求解").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
-                    Text("IP 192.168.50.239 · 2400×1600 图件落盘").font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(textBlue)
+                    .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(monitor.activePulses.isEmpty
+                        ? Color(hex: "9CA3AF").opacity(0.14)
+                        : Color(hex: "059669").opacity(0.14)))
+                    .position(x: width / 2, y: railY - 18)
+
+                    ForEach(Array(AgentRoster.all.enumerated()), id: \.element.id) { idx, agent in
+                        topologyNode(
+                            agent: agent,
+                            isActive: monitor.activePulses.contains { $0.source == agent.key || $0.target == agent.key }
+                        )
+                        .position(x: width * [0.16, 0.5, 0.84][idx], y: railY + 20)
+                    }
+
+                    if !monitor.activePulses.isEmpty {
+                        topologyPulseLayer(width: width, railY: railY)
+                            .allowsHitTesting(false)
+                    }
                 }
-                .padding(7)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(squircleCardBackground)
             }
+            .frame(height: 108)
+
+            // Tailscale：底部基座横条
+            HStack(spacing: 7) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(textBlue)
+                Text("Tailscale 私网 · 基座")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryTextColor)
+                Text("跨机底座，不承载业务脉冲")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+                Spacer()
+                Circle()
+                    .fill(monitor.tailscaleOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
+                    .frame(width: 6, height: 6)
+                Text(monitor.tailscaleOnline ? "在线" : "离线")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(monitor.tailscaleOnline ? textGreen : textRed)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(squircleCardBackground)
+
+            // 诚实状态条：没有通讯就明说静默，绝不画假脉冲
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(monitor.activePulses.isEmpty ? textGray : Color(hex: "10B981"))
+                    .frame(width: 5, height: 5)
+                if monitor.activePulses.isEmpty {
+                    Text("最近 15 秒无通讯 · 脉冲静默")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                } else {
+                    Text("最近 15 秒 \(monitor.activePulses.reduce(0) { $0 + $1.count }) 次通讯")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(textGreen)
+                    ForEach(Array(monitor.activePulses.prefix(3))) { pulse in
+                        Text("\(AgentRoster.identity(for: pulse.source)?.short ?? pulse.source) → \(AgentRoster.identity(for: pulse.target)?.short ?? pulse.target) ×\(pulse.count)")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(secondaryTextColor)
+                    }
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
         }
         .padding(.horizontal, 14)
+    }
+
+    func topologyNode(agent: AgentIdentity, isActive: Bool) -> some View {
+        VStack(spacing: 3) {
+            ZStack {
+                Circle()
+                    .fill(agent.color.opacity(isActive ? 0.26 : 0.13))
+                    .frame(width: 40, height: 40)
+                Circle()
+                    .stroke(agent.color.opacity(isActive ? 0.95 : 0.35), lineWidth: isActive ? 2 : 1)
+                    .frame(width: 40, height: 40)
+                    .shadow(color: agent.color.opacity(isActive ? 0.55 : 0), radius: 5)
+                Image(systemName: agent.symbol)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(agent.color)
+            }
+            Text(agent.short)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(primaryTextColor)
+            Text("\(monitor.pendingCount(for: agent.key)) 待办")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(secondaryTextColor)
+        }
+        .frame(width: 100, height: 82, alignment: .top)
+    }
+
+    /// 只有 activePulses 非空时才挂载；光点速度/数量随 15 秒内事件数增加
+    func topologyPulseLayer(width: CGFloat, railY: CGFloat) -> some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+            Canvas { context, size in
+                let now = timeline.date.timeIntervalSinceReferenceDate
+                func anchorX(_ key: String) -> CGFloat {
+                    switch key {
+                    case "agy": return size.width * 0.16
+                    case "ping": return size.width * 0.84
+                    default: return size.width * 0.5
+                    }
+                }
+                for pulse in monitor.activePulses {
+                    let source = AgentRoster.identity(for: pulse.source)
+                    let color = source?.color ?? Color(hex: "60A5FA")
+                    let a = CGPoint(x: anchorX(pulse.source), y: railY)
+                    let b = CGPoint(x: anchorX(pulse.target), y: railY)
+
+                    var line = Path()
+                    line.move(to: a)
+                    line.addLine(to: b)
+                    context.stroke(line, with: .color(color.opacity(0.55)), lineWidth: 1.6)
+
+                    let dots = 2 + min(pulse.count, 3)
+                    let speed = 0.55 + Double(min(pulse.count, 6)) * 0.10
+                    for i in 0..<dots {
+                        let phase = (now * speed + Double(i) / Double(dots)).truncatingRemainder(dividingBy: 1.0)
+                        let x = a.x + (b.x - a.x) * CGFloat(phase)
+                        let glow = CGRect(x: x - 5, y: railY - 5, width: 10, height: 10)
+                        let core = CGRect(x: x - 2.2, y: railY - 2.2, width: 4.4, height: 4.4)
+                        context.fill(Path(ellipseIn: glow), with: .color(color.opacity(0.22)))
+                        context.fill(Path(ellipseIn: core), with: .color(.white.opacity(0.95)))
+                        context.fill(Path(ellipseIn: core.insetBy(dx: 1.2, dy: 1.2)), with: .color(color))
+                    }
+                }
+            }
+            .frame(width: width, height: 108)
+        }
     }
 
     // AgentIsland 架构调度·全透明履约焦点卡 (点开卡片可查看核心提炼重点)
@@ -2107,7 +2320,7 @@ struct DynamicIslandView: View {
                             .padding(.horizontal, 7)
                             .padding(.vertical, 1.5)
                             .background(
-                                Capsule().fill(monitor.expandedTaskId == item.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                Capsule().fill(monitor.expandedTaskId == item.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                             )
                         }
                         .buttonStyle(PlainButtonStyle())
@@ -2122,7 +2335,7 @@ struct DynamicIslandView: View {
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 1.5)
                                 .background(
-                                    Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                    Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                 )
                         }
                         .buttonStyle(PlainButtonStyle())
@@ -2149,7 +2362,7 @@ struct DynamicIslandView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                                .fill(monitor.panelIsDark ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
                         )
                     }
                 }
@@ -2157,7 +2370,7 @@ struct DynamicIslandView: View {
                 .padding(.vertical, 1)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color(hex: "8B5CF6").opacity(monitor.isDarkMode ? 0.16 : 0.08))
+                        .fill(Color(hex: "8B5CF6").opacity(monitor.panelIsDark ? 0.16 : 0.08))
                 )
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -2175,7 +2388,7 @@ struct DynamicIslandView: View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color(hex: "059669").opacity(monitor.isDarkMode ? 0.20 : 0.12))
+                    .fill(Color(hex: "059669").opacity(monitor.panelIsDark ? 0.20 : 0.12))
                     .frame(width: 34, height: 34)
                 Image(systemName: "checkmark.shield.fill")
                     .font(.system(size: 16, weight: .bold))
@@ -2298,7 +2511,7 @@ struct DynamicIslandView: View {
                 .frame(width: 5, height: 5)
             Text(name)
                 .font(.system(size: 11, weight: highlight || done || active ? .bold : .semibold, design: .rounded))
-                .foregroundColor(highlight ? (monitor.isDarkMode ? Color(hex: "BF5AF2") : Color(hex: "6D28D9")) : (active ? (done ? (monitor.isDarkMode ? Color(hex: "30D158") : Color(hex: "047857")) : primaryTextColor) : secondaryTextColor))
+                .foregroundColor(highlight ? (monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9")) : (active ? (done ? (monitor.panelIsDark ? Color(hex: "30D158") : Color(hex: "047857")) : primaryTextColor) : secondaryTextColor))
         }
         .padding(.horizontal, 4.5)
         .padding(.vertical, 2)
@@ -2363,7 +2576,7 @@ struct DynamicIslandView: View {
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(
-                        Capsule().fill(accentColor.opacity(monitor.isDarkMode ? 0.22 : 0.12))
+                        Capsule().fill(accentColor.opacity(monitor.panelIsDark ? 0.22 : 0.12))
                     )
                 }
                 .buttonStyle(PressableScaleButtonStyle())
@@ -2393,7 +2606,7 @@ struct DynamicIslandView: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3.5)
                     .background(
-                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                     )
                 }
                 .buttonStyle(PlainButtonStyle())
@@ -2456,7 +2669,7 @@ struct DynamicIslandView: View {
                                                 .padding(.horizontal, 7)
                                                 .padding(.vertical, 3.5)
                                                 .background(
-                                                    Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                    Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                                                 )
                                             }
                                             .buttonStyle(PlainButtonStyle())
@@ -2471,7 +2684,7 @@ struct DynamicIslandView: View {
                                                     .padding(.horizontal, 6)
                                                     .padding(.vertical, 3.5)
                                                     .background(
-                                                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                                     )
                                             }
                                             .buttonStyle(PlainButtonStyle())
@@ -2499,7 +2712,7 @@ struct DynamicIslandView: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .background(
                                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                                .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                                                .fill(monitor.panelIsDark ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
                                         )
                                     }
                                 }
@@ -2582,7 +2795,7 @@ struct DynamicIslandView: View {
                                                 .padding(.horizontal, 7)
                                                 .padding(.vertical, 3.5)
                                                 .background(
-                                                    Capsule().fill(monitor.expandedTaskId == done.id ? accentColor : accentColor.opacity(monitor.isDarkMode ? 0.20 : 0.10))
+                                                    Capsule().fill(monitor.expandedTaskId == done.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                                                 )
                                             }
                                             .buttonStyle(PlainButtonStyle())
@@ -2597,7 +2810,7 @@ struct DynamicIslandView: View {
                                                     .padding(.horizontal, 6)
                                                     .padding(.vertical, 3.5)
                                                     .background(
-                                                        Capsule().fill(monitor.isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                                     )
                                             }
                                             .buttonStyle(PlainButtonStyle())
@@ -2624,7 +2837,7 @@ struct DynamicIslandView: View {
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .background(
                                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                                    .fill(monitor.isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
+                                                    .fill(monitor.panelIsDark ? Color.white.opacity(0.06) : Color.black.opacity(0.035))
                                             )
                                         }
                                     }
@@ -2660,21 +2873,21 @@ struct DynamicIslandView: View {
     var squircleCardBackground: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
-                monitor.isDarkMode
+                monitor.panelIsDark
                     ? Color.white.opacity(0.20)
                     : Color.white.opacity(0.96)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(
-                        monitor.isDarkMode
+                        monitor.panelIsDark
                             ? Color.white.opacity(0.22)
                             : Color.white.opacity(0.95),
                         lineWidth: 0.9
                     )
             )
             .shadow(
-                color: Color.black.opacity(monitor.isDarkMode ? 0.28 : 0.06),
+                color: Color.black.opacity(monitor.panelIsDark ? 0.28 : 0.06),
                 radius: 2.5,
                 y: 1.2
             )
@@ -2684,38 +2897,41 @@ struct DynamicIslandView: View {
         monitor.agyPending + monitor.almaPending + monitor.pingPending
     }
     
-    /// 皮肤 × 明暗：通透玻璃 / 曜石深色 / 陶瓷实心
+    /// 皮肤 × 明暗：三种皮肤必须真实可见，而不是三个几乎同色的白/黑
+    /// - 通透玻璃：冷白半透明，保留背后折射
+    /// - 曜石深色：不论系统明暗都使用近黑石板，文字自动切浅色
+    /// - 陶瓷实心：暖象牙实底，无透视
     var panelFill: Color {
         let tint = monitor.currentMode == .compact ? monitor.skin.compactTint : monitor.skin.expandedTint
         switch monitor.skin {
         case .glass:
-            return monitor.isDarkMode
-                ? Color(hex: "0A0D14").opacity(tint.dark)
-                : Color(hex: "FFFFFF").opacity(tint.light)
+            return monitor.panelIsDark
+                ? Color(hex: "101A2E").opacity(tint.dark * 0.84)
+                : Color(hex: "F5F9FF").opacity(tint.light * 0.70)
         case .obsidian:
-            return monitor.isDarkMode
-                ? Color.black.opacity(tint.dark)
-                : Color(hex: "FFFFFF").opacity(tint.light)
+            return monitor.panelIsDark
+                ? Color(hex: "050506").opacity(tint.dark)
+                : Color(hex: "050506").opacity(0.97)
         case .ceramic:
-            return monitor.isDarkMode
-                ? Color(hex: "1C1C1E").opacity(tint.dark)
-                : Color(hex: "FFFFFF").opacity(tint.light)
+            return monitor.panelIsDark
+                ? Color(hex: "2A2620").opacity(tint.dark)
+                : Color(hex: "F6F1E7").opacity(tint.light)
         }
     }
 
     // Dynamic Typography Colors
     var primaryTextColor: Color {
-        monitor.isDarkMode ? Color.white : Color(hex: "000000")
+        monitor.panelIsDark ? Color.white : Color(hex: "000000")
     }
     
     var secondaryTextColor: Color {
-        monitor.isDarkMode ? Color(hex: "E5E5EA") : Color(hex: "1C1C1E")
+        monitor.panelIsDark ? Color(hex: "E5E5EA") : Color(hex: "1C1C1E")
     }
 
     /// 正文用强调色（浅色模式下压暗，保证 ≥4.5:1；不靠 opacity 调淡）
     var accentTextColor: Color {
         let hex = monitor.accentHex.uppercased()
-        if monitor.isDarkMode {
+        if monitor.panelIsDark {
             switch hex {
             case "EAB308": return Color(hex: "FFD60A")
             case "22C55E": return Color(hex: "30D158")
@@ -2736,7 +2952,7 @@ struct DynamicIslandView: View {
 
     /// Agent 固定身份色的「文字安全」版本；识别色仍由圆点/图标承担
     func agentTextColor(_ agent: AgentIdentity) -> Color {
-        if monitor.isDarkMode {
+        if monitor.panelIsDark {
             switch agent.key {
             case "agy": return Color(hex: "64D2FF")
             case "alma": return Color(hex: "FFB340")
@@ -2768,12 +2984,12 @@ struct DynamicIslandView: View {
         return onWhite >= onBlack ? .white : .black
     }
 
-    var textGreen: Color { monitor.isDarkMode ? Color(hex: "30D158") : Color(hex: "047857") }
-    var textBlue: Color { monitor.isDarkMode ? Color(hex: "64D2FF") : Color(hex: "1D4ED8") }
-    var textPurple: Color { monitor.isDarkMode ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
-    var textAmber: Color { monitor.isDarkMode ? Color(hex: "FFD60A") : Color(hex: "B45309") }
-    var textRed: Color { monitor.isDarkMode ? Color(hex: "FF6961") : Color(hex: "C1121F") }
-    var textGray: Color { monitor.isDarkMode ? Color(hex: "C7C7CC") : Color(hex: "6B7280") }
+    var textGreen: Color { monitor.panelIsDark ? Color(hex: "30D158") : Color(hex: "047857") }
+    var textBlue: Color { monitor.panelIsDark ? Color(hex: "64D2FF") : Color(hex: "1D4ED8") }
+    var textPurple: Color { monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
+    var textAmber: Color { monitor.panelIsDark ? Color(hex: "FFD60A") : Color(hex: "B45309") }
+    var textRed: Color { monitor.panelIsDark ? Color(hex: "FF6961") : Color(hex: "C1121F") }
+    var textGray: Color { monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "6B7280") }
     
     var compactBadgeColor: Color {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline || monitor.fusedCount > 0 {
