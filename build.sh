@@ -20,6 +20,7 @@ mkdir -p "${OUTPUT_DIR}"
 cp "${APP_NAME}Bin" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 cp Resources/Info.plist "${APP_BUNDLE}/Contents/Info.plist"
+cp Resources/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 
 echo "==> Creating release archive..."
 cp -R "${APP_BUNDLE}" "${OUTPUT_DIR}/"

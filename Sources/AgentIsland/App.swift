@@ -30,6 +30,18 @@ extension Color {
     }
 }
 
+extension NSColor {
+    convenience init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let r = CGFloat((int >> 16) & 0xFF)
+        let g = CGFloat((int >> 8) & 0xFF)
+        let b = CGFloat(int & 0xFF)
+        self.init(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+    }
+}
+
 // MARK: - Native AppKit Visual Effect View (True Apple System Backdrop Blur)
 struct AppleGlassBackground: NSViewRepresentable {
     var material: NSVisualEffectView.Material = .popover
@@ -97,11 +109,11 @@ enum AccentPreset: String, CaseIterable {
 
     var name: String {
         switch self {
-        case .blue: return "🔵 经典蓝 (Apple Blue)"
-        case .purple: return "🟣 极光紫 (Context Purple)"
-        case .yellow: return "🟡 琥珀黄 (Warm Amber)"
-        case .green: return "🟢 薄荷绿 (Fresh Green)"
-        case .red: return "🔴 珊瑚红 (Coral Red)"
+        case .blue: return "经典蓝 (Apple Blue)"
+        case .purple: return "极光紫 (Context Purple)"
+        case .yellow: return "琥珀黄 (Warm Amber)"
+        case .green: return "薄荷绿 (Fresh Green)"
+        case .red: return "珊瑚红 (Coral Red)"
         }
     }
 }
@@ -2903,9 +2915,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var themeLightItem: NSMenuItem?
     var themeDarkItem: NSMenuItem?
     var accentMenuItems: [String: NSMenuItem] = [:]
+    var skinMenuItems: [String: NSMenuItem] = [:]
+    var formMenuItems: [String: NSMenuItem] = [:]
+    var scaleMenuItems: [Int: NSMenuItem] = [:]
+    var edgeMenuItems: [String: NSMenuItem] = [:]
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 仅截图取证：临时以普通 App 身份运行，让 Dock 显示真实 AppIcon（不改变常驻形态）
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_SHOW_DOCK"] == "1" {
+            NSApp.setActivationPolicy(.regular)
+        }
         
         setupStatusItem()
         setupIslandPanel()
@@ -2998,6 +3018,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     }
                 }
+            }
+        }
+
+        // 右键菜单截图（仅显式传入 AGENT_ISLAND_OPEN_MENU=1 时启用；菜单展开会阻塞主线程直至人工关闭）
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_OPEN_MENU"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self = self, let button = self.statusItem.button else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                self.statusItem.menu?.popUp(
+                    positioning: nil,
+                    at: NSPoint(x: 0, y: button.bounds.height + 2),
+                    in: button
+                )
             }
         }
     }
@@ -3144,58 +3177,141 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.title = "🏝️ 3A"
+            let image = NSImage(systemSymbolName: "rectangle.topthird.inset.filled", accessibilityDescription: "AgentIsland")
+            image?.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageLeading
+            button.title = "3A"
         }
-        
+
         let menu = NSMenu()
         menu.delegate = self
-        menu.addItem(NSMenuItem(title: "🏝️ 打开/收起中控台", action: #selector(toggleIsland), keyEquivalent: "i"))
-        menu.addItem(NSMenuItem(title: "🔍 全网核验与归档", action: #selector(reconcileAll), keyEquivalent: "k"))
-        menu.addItem(NSMenuItem(title: "📁 打开 Spaces 产物库", action: #selector(openSpaces), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem(title: "📝 打开《交流.md》", action: #selector(openCommLog), keyEquivalent: "c"))
-        menu.addItem(NSMenuItem(title: "🌐 检查 Funnel 健康状态", action: #selector(openFunnelHealth), keyEquivalent: "f"))
+
+        // 统一图标语义：全部使用 SF Symbols（template），不用 emoji
+        func makeItem(_ title: String, _ symbol: String, _ action: Selector, key: String = "", modifiers: NSEvent.ModifierFlags = .option) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.target = self
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            image?.isTemplate = true
+            item.image = image
+            if !key.isEmpty { item.keyEquivalentModifierMask = modifiers }
+            return item
+        }
+
+        func makeHeader(_ title: String) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+            item.isEnabled = false
+            return item
+        }
+
+        // 1. 中控台
+        menu.addItem(makeItem("打开/收起中控台", "rectangle.topthird.inset.filled", #selector(toggleIsland), key: "1"))
+        menu.addItem(makeItem("全局核验与归档", "checkmark.seal", #selector(reconcileAll), key: "k"))
         menu.addItem(NSMenuItem.separator())
-        
-        // 1. 外观模式子菜单 (Appearance Submenu)
-        let themeMenu = NSMenu()
-        let aItem = NSMenuItem(title: "⚙️ 跟随系统", action: #selector(setThemeAuto), keyEquivalent: "")
-        aItem.target = self
-        let lItem = NSMenuItem(title: "☀️ 浅色模式", action: #selector(setThemeLight), keyEquivalent: "")
-        lItem.target = self
-        let dItem = NSMenuItem(title: "🌙 深色模式", action: #selector(setThemeDark), keyEquivalent: "")
-        dItem.target = self
-        themeMenu.addItem(aItem)
-        themeMenu.addItem(lItem)
-        themeMenu.addItem(dItem)
+
+        // 2. 打开
+        menu.addItem(makeItem("Spaces 产物库", "folder", #selector(openSpaces), key: "s"))
+        menu.addItem(makeItem("交流.md", "bubble.left.and.bubble.right", #selector(openCommLog), key: "c"))
+        menu.addItem(makeItem("全景图", "photo.on.rectangle", #selector(openPanorama), key: "p"))
+        menu.addItem(NSMenuItem.separator())
+
+        // 3. 自检
+        menu.addItem(makeItem("检查 Funnel 健康状态", "waveform.path.ecg", #selector(openFunnelHealth), key: "f"))
+        menu.addItem(NSMenuItem.separator())
+
+        // 4. 外观：明暗模式 / 皮肤 / 形态 / 尺寸 / 停靠边 / 强调色 合并为一个子菜单
+        let appearanceMenu = NSMenu()
+        appearanceMenu.addItem(makeHeader("明暗模式"))
+        let aItem = makeItem("跟随系统", "display", #selector(setThemeAuto))
+        let lItem = makeItem("浅色", "sun.max", #selector(setThemeLight))
+        let dItem = makeItem("深色", "moon", #selector(setThemeDark))
+        appearanceMenu.addItem(aItem)
+        appearanceMenu.addItem(lItem)
+        appearanceMenu.addItem(dItem)
         themeAutoItem = aItem
         themeLightItem = lItem
         themeDarkItem = dItem
-        
-        let themeParent = NSMenuItem(title: "🌓 外观模式", action: nil, keyEquivalent: "")
-        themeParent.submenu = themeMenu
-        menu.addItem(themeParent)
-        
-        // 2. 主题强调色子菜单 (Accent Color Submenu)
-        let accentMenu = NSMenu()
+
+        appearanceMenu.addItem(NSMenuItem.separator())
+        appearanceMenu.addItem(makeHeader("皮肤"))
+        skinMenuItems.removeAll()
+        for skin in IslandSkin.allCases {
+            let it = makeItem(skin.name, "square.on.square", #selector(setSkinAction(_:)))
+            it.representedObject = skin.rawValue
+            appearanceMenu.addItem(it)
+            skinMenuItems[skin.rawValue] = it
+        }
+
+        appearanceMenu.addItem(NSMenuItem.separator())
+        appearanceMenu.addItem(makeHeader("形态"))
+        formMenuItems.removeAll()
+        for form in IslandForm.allCases {
+            let it = makeItem(form.name, form == .capsule ? "capsule" : "rectangle.portrait", #selector(setFormAction(_:)))
+            it.representedObject = form.rawValue
+            appearanceMenu.addItem(it)
+            formMenuItems[form.rawValue] = it
+        }
+
+        appearanceMenu.addItem(NSMenuItem.separator())
+        appearanceMenu.addItem(makeHeader("尺寸"))
+        scaleMenuItems.removeAll()
+        var percent = 80
+        while percent <= 140 {
+            let it = makeItem("\(percent)%", "arrow.up.left.and.arrow.down.right", #selector(setUIScaleAction(_:)))
+            it.tag = percent
+            appearanceMenu.addItem(it)
+            scaleMenuItems[percent] = it
+            percent += 5
+        }
+
+        appearanceMenu.addItem(NSMenuItem.separator())
+        appearanceMenu.addItem(makeHeader("停靠边"))
+        edgeMenuItems.removeAll()
+        for edge in DockEdge.allCases {
+            let it = makeItem(edge.name, "dock.rectangle", #selector(setDockEdgeAction(_:)))
+            it.representedObject = edge.rawValue
+            appearanceMenu.addItem(it)
+            edgeMenuItems[edge.rawValue] = it
+        }
+
+        appearanceMenu.addItem(NSMenuItem.separator())
+        appearanceMenu.addItem(makeHeader("强调色"))
         accentMenuItems.removeAll()
         for preset in AccentPreset.allCases {
-            let it = NSMenuItem(title: preset.name, action: #selector(setAccentPresetAction(_:)), keyEquivalent: "")
-            it.target = self
+            let it = makeItem(preset.name, "circle.fill", #selector(setAccentPresetAction(_:)))
             it.representedObject = preset.rawValue
-            accentMenu.addItem(it)
+            let swatch = NSImage(size: NSSize(width: 13, height: 13))
+            swatch.lockFocus()
+            NSColor(hex: preset.rawValue).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 11, height: 11)).fill()
+            swatch.unlockFocus()
+            it.image = swatch
+            appearanceMenu.addItem(it)
             accentMenuItems[preset.rawValue] = it
         }
-        let accentParent = NSMenuItem(title: "🎨 主题强调色", action: nil, keyEquivalent: "")
-        accentParent.submenu = accentMenu
-        menu.addItem(accentParent)
-        
+
+        let appearanceParent = NSMenuItem(title: "外观设置", action: nil, keyEquivalent: "")
+        let appearanceIcon = NSImage(systemSymbolName: "paintbrush", accessibilityDescription: nil)
+        appearanceIcon?.isTemplate = true
+        appearanceParent.image = appearanceIcon
+        appearanceParent.submenu = appearanceMenu
+        menu.addItem(appearanceParent)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "🚪 退出 AgentIsland", action: #selector(quitApp), keyEquivalent: "q"))
+
+        // 5. 退出
+        menu.addItem(makeItem("退出 AgentIsland", "power", #selector(quitApp), key: "q", modifiers: .command))
         statusItem.menu = menu
-        
+
         updateMenuCheckmarks()
     }
-    
+
     func setupIslandPanel() {
         let initialRect = NSRect(x: 0, y: 0, width: 200, height: 48)
         islandPanel = DynamicIslandPanel(contentRect: initialRect)
@@ -3297,16 +3413,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSWorkspace.shared.open(u)
         }
     }
-    
+
+    @objc func openPanorama() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         updateMenuCheckmarks()
     }
-    
+
     func updateMenuCheckmarks() {
         themeAutoItem?.state = monitor.themeMode == .auto ? .on : .off
         themeLightItem?.state = monitor.themeMode == .light ? .on : .off
         themeDarkItem?.state = monitor.themeMode == .dark ? .on : .off
-        
+
+        for (raw, it) in skinMenuItems {
+            it.state = monitor.skin.rawValue == raw ? .on : .off
+        }
+        for (raw, it) in formMenuItems {
+            it.state = monitor.islandForm.rawValue == raw ? .on : .off
+        }
+        let currentScale = Int((monitor.uiScale * 100).rounded())
+        for (percent, it) in scaleMenuItems {
+            it.state = percent == currentScale ? .on : .off
+        }
+        for (raw, it) in edgeMenuItems {
+            it.state = monitor.dockEdge.rawValue == raw ? .on : .off
+        }
         for (hex, it) in accentMenuItems {
             it.state = monitor.accentHex == hex ? .on : .off
         }
@@ -3325,6 +3458,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func setThemeDark() {
         monitor.setThemeMode(.dark)
         updateMenuCheckmarks()
+    }
+
+    @objc func setSkinAction(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let skin = IslandSkin(rawValue: raw) {
+            monitor.setSkin(skin)
+            updateMenuCheckmarks()
+        }
+    }
+
+    @objc func setFormAction(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let form = IslandForm(rawValue: raw) {
+            monitor.setIslandForm(form)
+            updateMenuCheckmarks()
+        }
+    }
+
+    @objc func setUIScaleAction(_ sender: NSMenuItem) {
+        monitor.setUIScale(Double(sender.tag) / 100)
+        updateMenuCheckmarks()
+    }
+
+    @objc func setDockEdgeAction(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let edge = DockEdge(rawValue: raw) {
+            monitor.setDockEdge(edge)
+            updateMenuCheckmarks()
+        }
     }
     
     @objc func setAccentPresetAction(_ sender: NSMenuItem) {
