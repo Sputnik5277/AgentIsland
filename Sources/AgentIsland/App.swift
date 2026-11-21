@@ -1971,8 +1971,8 @@ struct DynamicIslandView: View {
             .buttonStyle(PlainButtonStyle())
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 2)
-        .background(squircleCardBackground)
+        .padding(.vertical, 4)
+        .background(assetsRowBackground)
     }
 
     // MARK: - 设置：皮肤 × 形态 × 尺寸 × 停靠边 × 模块开关/排序
@@ -3128,8 +3128,66 @@ struct DynamicIslandView: View {
         )
     }
 
+    /// 底部资产条需要更强的可读性：保留玻璃折射，但把透底噪音压住。
+    @ViewBuilder
+    var assetsRowBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        Group {
+            if #available(macOS 26.0, *), !Self.forceGlassFallback {
+                shape
+                    .fill(Color.clear)
+                    .glassEffect(.regular.tint(assetsRowGlassTint), in: shape)
+            } else {
+                shape.fill(assetsRowFallbackFill)
+            }
+        }
+        .overlay(
+            shape.stroke(
+                monitor.panelIsDark
+                    ? Color.white.opacity(0.26)
+                    : Color.white.opacity(0.96),
+                lineWidth: 0.9
+            )
+        )
+        .shadow(
+            color: Color.black.opacity(monitor.panelIsDark ? 0.30 : 0.07),
+            radius: 2.5,
+            y: 1.2
+        )
+    }
+
     static var forceGlassFallback: Bool {
         ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
+    }
+
+    var assetsRowGlassTint: Color {
+        switch monitor.skin {
+        case .glass:
+            return monitor.panelIsDark
+                ? Color(hex: "0B1526").opacity(0.72)
+                : Color(hex: "EAF4FF").opacity(0.68)
+        case .obsidian:
+            return Color(hex: "0A0A0C").opacity(0.72)
+        case .ceramic:
+            return monitor.panelIsDark
+                ? Color(hex: "2A2620").opacity(0.70)
+                : Color(hex: "F7EFDF").opacity(0.72)
+        }
+    }
+
+    var assetsRowFallbackFill: Color {
+        switch monitor.skin {
+        case .glass:
+            return monitor.panelIsDark
+                ? Color(hex: "141418").opacity(0.86)
+                : Color(hex: "FFFFFF").opacity(0.92)
+        case .obsidian:
+            return Color(hex: "141418").opacity(0.94)
+        case .ceramic:
+            return monitor.panelIsDark
+                ? Color(hex: "2A2620").opacity(0.92)
+                : Color(hex: "FBF5E9").opacity(0.94)
+        }
     }
 
     var cardGlassTint: Color {
