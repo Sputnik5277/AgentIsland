@@ -302,6 +302,8 @@ class AgentMonitor: ObservableObject {
     @Published var islandForm: IslandForm = .capsule
     @Published var enabledSections: [String: Bool] = PanelSectionKey.defaults
     @Published var sectionOrder: [String] = PanelSectionKey.defaultOrder
+    @Published var hoverAutoExpand: Bool = false
+    @Published var minimizedToMenuBar: Bool = false
     /// 拖拽排序时的临时来源（不参与渲染）
     var draggingSectionStore: String? = nil
     
@@ -328,6 +330,7 @@ class AgentMonitor: ObservableObject {
     var onModeChange: ((IslandMode) -> Void)?
     var onDrawerChange: (() -> Void)?
     var onLayoutChange: (() -> Void)?
+    var onMinimizeChange: ((Bool) -> Void)?
     
     private var lastKnownTotalPending: Int = -1
     private var lastKnownSubmitted: Int = -1
@@ -507,6 +510,12 @@ class AgentMonitor: ObservableObject {
             for (k, v) in savedSections where merged[k] != nil { merged[k] = v }
             self.enabledSections = merged
         }
+        if let savedHover = preferences?.object(forKey: "agent_island_hover_auto_expand") as? Bool {
+            self.hoverAutoExpand = savedHover
+        }
+        if let savedMin = preferences?.object(forKey: "agent_island_minimized_menubar") as? Bool {
+            self.minimizedToMenuBar = savedMin
+        }
         checkAppearance()
         refreshAll()
         startTimers()
@@ -596,6 +605,21 @@ class AgentMonitor: ObservableObject {
         DispatchQueue.main.async {
             self.islandForm = value
             self.preferences?.set(value.rawValue, forKey: "agent_island_form")
+        }
+    }
+
+    func setHoverAutoExpand(_ enabled: Bool) {
+        DispatchQueue.main.async {
+            self.hoverAutoExpand = enabled
+            self.preferences?.set(enabled, forKey: "agent_island_hover_auto_expand")
+        }
+    }
+
+    func setMinimizedToMenuBar(_ minimized: Bool) {
+        DispatchQueue.main.async {
+            self.minimizedToMenuBar = minimized
+            self.preferences?.set(minimized, forKey: "agent_island_minimized_menubar")
+            self.onMinimizeChange?(minimized)
         }
     }
 
@@ -2097,6 +2121,16 @@ struct DynamicIslandView: View {
                         HStack(spacing: 4) {
                             ForEach(DockEdge.allCases) { edge in
                                 settingsChip(edge.name, selected: monitor.dockEdge == edge) { monitor.setDockEdge(edge) }
+                            }
+                        }
+                    }
+                    settingsRow(title: "防打扰") {
+                        HStack(spacing: 4) {
+                            settingsChip("仅点击展开", selected: !monitor.hoverAutoExpand) {
+                                monitor.setHoverAutoExpand(!monitor.hoverAutoExpand)
+                            }
+                            settingsChip("最小化到菜单栏", selected: monitor.minimizedToMenuBar) {
+                                monitor.setMinimizedToMenuBar(!monitor.minimizedToMenuBar)
                             }
                         }
                     }
@@ -3680,6 +3714,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var themeAutoItem: NSMenuItem?
     var themeLightItem: NSMenuItem?
     var themeDarkItem: NSMenuItem?
+    var minimizeItem: NSMenuItem?
+    var dndItem: NSMenuItem?
     var accentMenuItems: [String: NSMenuItem] = [:]
     var skinMenuItems: [String: NSMenuItem] = [:]
     var formMenuItems: [String: NSMenuItem] = [:]
@@ -3703,7 +3739,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupHoverWatcher()
 
         monitor.onModeChange = { [weak self] mode in
-            self?.updatePanelFrame(for: mode)
+            guard let self = self else { return }
+            if mode == .expanded {
+                self.updatePanelFrame(for: .expanded)
+                self.islandPanel.orderFrontRegardless()
+            } else {
+                self.updatePanelFrame(for: .compact)
+                if self.monitor.minimizedToMenuBar {
+                    self.islandPanel.orderOut(nil)
+                }
+            }
+        }
+
+        monitor.onMinimizeChange = { [weak self] minimized in
+            guard let self = self else { return }
+            if minimized {
+                self.autoHoverExpanded = false
+                self.monitor.showSettings = false
+                self.monitor.currentMode = .compact
+                self.islandPanel.orderOut(nil)
+            } else {
+                self.updatePanelFrame(for: self.monitor.currentMode)
+                self.islandPanel.orderFrontRegardless()
+            }
+            self.updateMenuCheckmarks()
         }
 
         monitor.onDrawerChange = { [weak self] in
@@ -3845,6 +3904,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.monitor.showTopology = true
                     self.updatePanelFrame(for: .expanded)
                     self.verifyVisibleVirtualPanel(phase: "topology", on: self.virtualScreenOrExit(id: id))
+                } else if ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_SETTINGS"] == "1" {
+                    self.monitor.showSettings = true
+                    self.updatePanelFrame(for: .expanded)
+                    self.verifyVisibleVirtualPanel(phase: "settings", on: self.virtualScreenOrExit(id: id))
                 }
             }
         }
@@ -3956,7 +4019,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func evaluateHover(at overridePoint: NSPoint? = nil) {
-        guard islandPanel != nil else { return }
+        guard islandPanel != nil, islandPanel.isVisible, !monitor.minimizedToMenuBar else {
+            hoverInsideSince = nil
+            return
+        }
         let mouse = overridePoint ?? hoverOverridePoint ?? NSEvent.mouseLocation
         let frame = islandPanel.frame
         if let dbgPath = ProcessInfo.processInfo.environment["AGENT_ISLAND_HOVER_LOG"] {
@@ -3970,13 +4036,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         switch monitor.currentMode {
         case .compact:
-            // 收起态：鼠标靠近面板周边即展开
-            let hot = NSRect(
-                x: frame.minX - 72,
-                y: frame.minY - 48,
-                width: frame.width + 144,
-                height: frame.height + 62
-            )
+            // 默认勿扰（仅点击展开）；即使主动开启靠近展开，也禁止拖窗按键时触发并收窄到胶囊本体内部。
+            guard monitor.hoverAutoExpand else {
+                hoverInsideSince = nil
+                suppressHoverUntilExit = false
+                return
+            }
+            guard NSEvent.pressedMouseButtons == 0 else {
+                hoverInsideSince = nil
+                return
+            }
+            let hot = frame.insetBy(dx: 4, dy: 4)
             guard hot.contains(mouse) else {
                 suppressHoverUntilExit = false
                 hoverInsideSince = nil
@@ -3984,8 +4054,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             guard !suppressHoverUntilExit else { return }
             if hoverInsideSince == nil { hoverInsideSince = Date() }
-            // 停留 0.18s 再展开，避免鼠标路过误触
-            if Date().timeIntervalSince(hoverInsideSince ?? Date()) >= 0.18 {
+            // 胶囊本体内停留 0.45s 再展开，彻底避免划过/关网页/拖窗误触
+            if Date().timeIntervalSince(hoverInsideSince ?? Date()) >= 0.45 {
                 autoHoverExpanded = true
                 hoverOutsideSince = nil
                 monitor.setMode(.expanded)
@@ -4050,6 +4120,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // 1. 中控台
         menu.addItem(makeItem("打开/收起中控台", "rectangle.topthird.inset.filled", #selector(toggleIsland), key: "1"))
+        let minIt = makeItem("最小化到菜单栏（隐藏胶囊）", "eye.slash", #selector(toggleMinimizedToMenuBar), key: "m")
+        menu.addItem(minIt)
+        minimizeItem = minIt
+        let dndIt = makeItem("勿扰模式（仅点击展开）", "moon.zzz", #selector(toggleDoNotDisturb), key: "d")
+        menu.addItem(dndIt)
+        dndItem = dndIt
         menu.addItem(makeItem("全局核验与归档", "checkmark.seal", #selector(reconcileAll), key: "k"))
         menu.addItem(NSMenuItem.separator())
 
@@ -4154,7 +4230,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         islandPanel = DynamicIslandPanel(contentRect: initialRect)
         installPanelContent()
         updatePanelFrame(for: .compact)
-        islandPanel.orderFrontRegardless()
+        if !monitor.minimizedToMenuBar {
+            islandPanel.orderFrontRegardless()
+        }
     }
 
     private func installPanelContent() {
@@ -4239,11 +4317,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             monitor.setMode(.compact)
         } else {
             monitor.setMode(.expanded)
+            if !islandPanel.isVisible {
+                updatePanelFrame(for: .expanded)
+                islandPanel.orderFrontRegardless()
+            }
         }
-        if !islandPanel.isVisible {
-            updatePanelFrame(for: monitor.currentMode)
-            islandPanel.orderFrontRegardless()
-        }
+    }
+
+    @objc func toggleMinimizedToMenuBar() {
+        monitor.setMinimizedToMenuBar(!monitor.minimizedToMenuBar)
+        updateMenuCheckmarks()
+    }
+
+    @objc func toggleDoNotDisturb() {
+        monitor.setHoverAutoExpand(!monitor.hoverAutoExpand)
+        updateMenuCheckmarks()
     }
     
     @objc func reconcileAll() {
@@ -4273,6 +4361,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func updateMenuCheckmarks() {
+        minimizeItem?.state = monitor.minimizedToMenuBar ? .on : .off
+        dndItem?.state = !monitor.hoverAutoExpand ? .on : .off
         themeAutoItem?.state = monitor.themeMode == .auto ? .on : .off
         themeLightItem?.state = monitor.themeMode == .light ? .on : .off
         themeDarkItem?.state = monitor.themeMode == .dark ? .on : .off
