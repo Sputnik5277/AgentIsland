@@ -409,7 +409,13 @@ class AgentMonitor: ObservableObject {
         }
     }
     
-    let rootPath = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
+    // 测试/多根模式下与事件解析使用同一根目录，避免兜底扫描串到生产 handoffs
+    let rootPath: String = {
+        if let root = ProcessInfo.processInfo.environment["AGENT_ISLAND_MULTI_ROOT"], !root.isEmpty {
+            return root.hasSuffix("/handoffs") ? root : root + "/handoffs"
+        }
+        return "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
+    }()
     let handoffScript = "/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts/handoff.py"
     
     init() {
@@ -1738,14 +1744,7 @@ struct DynamicIslandView: View {
             }
         }) {
             ZStack {
-                GeometryReader { geo in
-                    Path { p in
-                        p.move(to: CGPoint(x: 18, y: 29))
-                        p.addLine(to: CGPoint(x: max(18, geo.size.width - 18), y: 29))
-                    }
-                    .stroke(linkSkeletonColor, style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
-                }
-
+                // 迷你条也不画空闲底轨：三层通道只用节点/色阶交代，零连线。
                 HStack(spacing: 0) {
                     miniChannelNode(
                         name: "Tailscale",
@@ -1811,12 +1810,6 @@ struct DynamicIslandView: View {
         }
         .foregroundColor(tint)
         .help(detail)
-    }
-
-    var linkSkeletonColor: Color {
-        monitor.panelIsDark
-            ? Color.white.opacity(0.12)
-            : Color(hex: "1C1C1E").opacity(0.12)
     }
 
     var channelHierarchyView: some View {
@@ -2175,13 +2168,8 @@ struct DynamicIslandView: View {
                 let width = geo.size.width
                 let railY: CGFloat = 34
                 ZStack {
-                    // D1：空闲也保留 12% 虚线骨架，只交代架构，不冒充通讯；
-                    // 真实通讯时由 pulseLayer 在对应 source→target 段覆盖实线 + 箭头 + 光点。
-                    Path { p in
-                        p.move(to: CGPoint(x: 14, y: railY))
-                        p.addLine(to: CGPoint(x: max(14, width - 14), y: railY))
-                    }
-                    .stroke(linkSkeletonColor, style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
+                    // 空闲态不画任何线段：没有通讯就没有连线、脉冲和光点。
+                    // 只有 activePulses 非空时才挂载 pulseLayer（实线 + 箭头 + 光点）。
 
                     HStack(spacing: 4) {
                         Image(systemName: "bolt.horizontal.fill")
