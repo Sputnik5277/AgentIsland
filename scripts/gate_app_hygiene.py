@@ -7,6 +7,9 @@
   2. PIPE_STDERR_UNREAD     — 严禁 standardError = Pipe() 无人读取（应使用 FileHandle.nullDevice）
   3. SCALE_EFFECT_ON_PANEL  — 严禁整窗 .scaleEffect(monitor.uiScale) GPU 拉伸（2K 1x 屏文字必糊）
   4. FONT_SUB_HIG_OR_ROUNDED — 严禁 design: .rounded、字号 < 11pt 或 .minimumScaleFactor( 压缩
+  5. V4_DELTA_SNAPSHOT_CONTRACT — 消费 M4/M5/M6 快照及 isStale 陈旧守卫
+  6. V4_BATCH_C2_CONTRACT    — M1/M2/M3 决策卡、打回、已读与剪贴板支持
+  7. V4_BATCH_C3_CONTRACT    — ⌥I 全局热键、底部快发、M7 决定档案及可自定义快捷资产
 """
 from __future__ import annotations
 
@@ -51,6 +54,7 @@ def check_app_swift(path: Path) -> dict:
         "FONT_SUB_HIG_OR_ROUNDED": 0,
         "V4_DELTA_SNAPSHOT_CONTRACT": 0,
         "V4_BATCH_C2_CONTRACT": 0,
+        "V4_BATCH_C3_CONTRACT": 0,
     }
 
     def add_finding(rule: str, line_no: int, snippet: str) -> None:
@@ -118,6 +122,17 @@ def check_app_swift(path: Path) -> dict:
     for token, desc in c2_anchors:
         if token not in joined_code:
             add_finding("V4_BATCH_C2_CONTRACT", 1, desc)
+
+    # Rule 7: V4_BATCH_C3_CONTRACT (⌥I hotkey, quick send, M7 decisions-archive, custom assets)
+    c3_anchors = [
+        ("RegisterEventHotKey", "missing C3 global hotkey RegisterEventHotKey"),
+        ("func quickSendMessage(", "missing C3 quickSendMessage Funnel action"),
+        ('decisions-archive.md"', "missing C3 M7 decisions-archive.md default quick asset"),
+        ('"agent_island_quick_assets"', "missing C3 customizable quick assets UserDefaults key"),
+    ]
+    for token, desc in c3_anchors:
+        if token not in joined_code:
+            add_finding("V4_BATCH_C3_CONTRACT", 1, desc)
 
     verdict = "PASS" if not findings else "FAIL"
     return {

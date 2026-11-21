@@ -3,6 +3,7 @@ import CoreGraphics
 import SwiftUI
 import Foundation
 import UniformTypeIdentifiers
+import Carbon.HIToolbox
 
 // MARK: - Color Hex Extension
 extension Color {
@@ -231,8 +232,23 @@ enum IslandForm: String, CaseIterable, Identifiable {
     }
 }
 
+struct QuickAssetItem: Identifiable, Codable, Equatable {
+    var id: String
+    var label: String
+    var icon: String
+    var path: String
+
+    static let defaults: [QuickAssetItem] = [
+        QuickAssetItem(id: "panorama", label: "全景图", icon: "photo.on.rectangle", path: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"),
+        QuickAssetItem(id: "spaces", label: "Spaces", icon: "folder.fill", path: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"),
+        QuickAssetItem(id: "comm", label: "交流", icon: "bubble.left.and.bubble.right.fill", path: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"),
+        QuickAssetItem(id: "decisions", label: "决定档案", icon: "book.closed.fill", path: "/Users/l/Nutstore Files/Obsidian_/multi-agent/research-notes/decisions-archive.md"),
+        QuickAssetItem(id: "corrections", label: "纠正日志", icon: "exclamationmark.bubble.fill", path: "/Users/l/Nutstore Files/Obsidian_/_state/corrections.tsv"),
+    ]
+}
+
 enum PanelSectionKey: String, CaseIterable, Identifiable {
-    case overview, wake, confirm, inboxes, channels, assets
+    case overview, wake, confirm, inboxes, channels, quickSend, assets
     var id: String { rawValue }
     var name: String {
         switch self {
@@ -241,6 +257,7 @@ enum PanelSectionKey: String, CaseIterable, Identifiable {
         case .confirm: return "待你验收"
         case .inboxes: return "三个收件箱"
         case .channels: return "三层通道"
+        case .quickSend: return "快捷发信"
         case .assets: return "快捷资产"
         }
     }
@@ -431,6 +448,12 @@ class AgentMonitor: ObservableObject {
     @Published var sectionOrder: [String] = PanelSectionKey.defaultOrder
     @Published var hoverAutoExpand: Bool = false
     @Published var minimizedToMenuBar: Bool = false
+    @Published var quickSendTarget: String = "ping"
+    @Published var quickSendText: String = ""
+    @Published var quickSendBusy: Bool = false
+    @Published var quickAssets: [QuickAssetItem] = QuickAssetItem.defaults
+    @Published var newAssetLabel: String = ""
+    @Published var newAssetPath: String = ""
     /// 拖拽排序时的临时来源（不参与渲染）
     var draggingSectionStore: String? = nil
     
@@ -562,7 +585,7 @@ class AgentMonitor: ObservableObject {
         }
         // 内联链路：总览头部 + 迷你条 + 展开拓扑区（含三层通道原文案）
         if showTopology { return 424 + extra }
-        if showSettings { return 560 + extra }
+        if showSettings { return 756 + extra }
 
         // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
@@ -575,6 +598,7 @@ class AgentMonitor: ObservableObject {
         }
         if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 52 }
         if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 50 }
+        if enabledSections[PanelSectionKey.quickSend.rawValue] ?? true { h += 38 }
         if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 32 }
         let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
             partial + ((enabledSections[key.rawValue] ?? (PanelSectionKey.defaults[key.rawValue] ?? true)) ? 1 : 0)
@@ -687,14 +711,26 @@ class AgentMonitor: ObservableObject {
             self.islandForm = fm
         }
         if let savedOrder = preferences?.stringArray(forKey: "agent_island_section_order") {
-            let valid = savedOrder.filter { PanelSectionKey(rawValue: $0) != nil }
-            let missing = PanelSectionKey.defaultOrder.filter { !valid.contains($0) }
-            self.sectionOrder = valid + missing
+            var mergedOrder = savedOrder.filter { PanelSectionKey(rawValue: $0) != nil }
+            for missingKey in PanelSectionKey.defaultOrder where !mergedOrder.contains(missingKey) {
+                if missingKey == PanelSectionKey.quickSend.rawValue,
+                   let assetsIdx = mergedOrder.firstIndex(of: PanelSectionKey.assets.rawValue) {
+                    mergedOrder.insert(missingKey, at: assetsIdx)
+                } else {
+                    mergedOrder.append(missingKey)
+                }
+            }
+            self.sectionOrder = mergedOrder
         }
         if let savedSections = preferences?.dictionary(forKey: "agent_island_sections") as? [String: Bool] {
             var merged = PanelSectionKey.defaults
             for (k, v) in savedSections where merged[k] != nil { merged[k] = v }
             self.enabledSections = merged
+        }
+        if let rawAssets = preferences?.data(forKey: "agent_island_quick_assets"),
+           let decoded = try? JSONDecoder().decode([QuickAssetItem].self, from: rawAssets),
+           !decoded.isEmpty {
+            self.quickAssets = decoded
         }
         if let savedHover = preferences?.object(forKey: "agent_island_hover_auto_expand") as? Bool {
             self.hoverAutoExpand = savedHover
@@ -1504,6 +1540,116 @@ class AgentMonitor: ObservableObject {
             }
             self.refreshAll()
             self.showToast("✅ 已标已读")
+        }
+    }
+
+    private func saveQuickAssets() {
+        if let data = try? JSONEncoder().encode(quickAssets) {
+            preferences?.set(data, forKey: "agent_island_quick_assets")
+        }
+    }
+
+    func addQuickAsset(label: String, path: String) {
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expandedPath = NSString(string: path.trimmingCharacters(in: .whitespacesAndNewlines)).expandingTildeInPath
+        guard !trimmedLabel.isEmpty, !expandedPath.isEmpty else {
+            showToast("请填写名称与路径")
+            return
+        }
+        var isDir: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDir)
+        let icon: String
+        if expandedPath.hasPrefix("http://") || expandedPath.hasPrefix("https://") {
+            icon = "globe"
+        } else {
+            icon = isDir.boolValue ? "folder.fill" : "doc.text.fill"
+        }
+        let item = QuickAssetItem(id: UUID().uuidString, label: trimmedLabel, icon: icon, path: expandedPath)
+        DispatchQueue.main.async {
+            self.quickAssets.append(item)
+            self.newAssetLabel = ""
+            self.newAssetPath = ""
+            self.saveQuickAssets()
+            self.showToast("已添加资产：\(trimmedLabel)")
+        }
+    }
+
+    func removeQuickAsset(id: String) {
+        DispatchQueue.main.async {
+            self.quickAssets.removeAll { $0.id == id }
+            self.saveQuickAssets()
+        }
+    }
+
+    func resetQuickAssets() {
+        DispatchQueue.main.async {
+            self.quickAssets = QuickAssetItem.defaults
+            self.saveQuickAssets()
+            self.showToast("已恢复 5 项默认资产")
+        }
+    }
+
+    func quickSendMessage() {
+        let body = quickSendText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard preferences != nil, !quickSendBusy, !body.isEmpty else { return }
+        let target = quickSendTarget
+        let df = DateFormatter()
+        df.dateFormat = "HHmmss"
+        let slug = "island-msg-\(df.string(from: Date()))"
+        let title = String(body.prefix(24))
+        DispatchQueue.main.async {
+            self.quickSendBusy = true
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = [
+                self.handoffScript,
+                "send",
+                "--from", "lulu",
+                "--to", target,
+                "--slug", slug,
+                "--title", title,
+                "--body", body
+            ]
+            if let rootEnv = ProcessInfo.processInfo.environment["HANDOFFS_ROOT"], !rootEnv.isEmpty {
+                var env = ProcessInfo.processInfo.environment
+                env["HANDOFFS_ROOT"] = rootEnv
+                p.environment = env
+            }
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            var ok = false
+            var t1 = false
+            var errMsg = "发送失败"
+            do {
+                try p.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    ok = (obj["ok"] as? Bool) ?? false
+                    t1 = (obj["t1_verified"] as? Bool) ?? false
+                    if let err = obj["error"] as? String, !err.isEmpty { errMsg = err }
+                } else {
+                    ok = (p.terminationStatus == 0)
+                }
+            } catch {
+                errMsg = error.localizedDescription
+            }
+            DispatchQueue.main.async {
+                self.quickSendBusy = false
+                if ok {
+                    self.quickSendText = ""
+                }
+            }
+            if ok {
+                self.refreshAll()
+                self.showToast("📤 已发给 \(target.uppercased())\(t1 ? " (T1✓)" : "")")
+            } else {
+                self.showToast("⚠️ \(errMsg)")
+            }
         }
     }
     
@@ -2424,6 +2570,9 @@ struct DynamicIslandView: View {
             miniLinkStrip
                 .padding(.horizontal, 14)
                 .padding(.top, 2)
+        case .quickSend:
+            quickSendStrip
+                .padding(.horizontal, 14)
         case .assets:
             assetsRow
                 .padding(.horizontal, 14)
@@ -2834,22 +2983,84 @@ struct DynamicIslandView: View {
         .buttonStyle(PlainButtonStyle())
     }
 
-    /// 快捷资产入口（保留原入口，独立成可关闭模块）
+    /// 底部一句发信：不打开聊天窗口，选收件人直接走 handoff Funnel 发送
+    var quickSendStrip: some View {
+        let targets: [(id: String, label: String)] = [("ping", "Ping"), ("agy", "AGY"), ("alma", "Alma")]
+        let currentLabel = targets.first(where: { $0.id == monitor.quickSendTarget })?.label ?? "Ping"
+        let canSend = !monitor.quickSendBusy && !monitor.quickSendText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return HStack(spacing: 6) {
+            HStack(spacing: 3) {
+                ForEach(targets, id: \.id) { item in
+                    let selected = monitor.quickSendTarget == item.id
+                    Button(action: { monitor.quickSendTarget = item.id }) {
+                        Text(item.label)
+                            .font(.system(size: fs(11), weight: selected ? .bold : .semibold))
+                            .foregroundColor(selected ? accentOnColor : secondaryTextColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule().fill(selected ? accentColor : (monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.06)))
+                            )
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+            TextField(
+                "",
+                text: $monitor.quickSendText,
+                prompt: Text("快发一句话给 \(currentLabel)（回车直达）…").foregroundColor(secondaryTextColor.opacity(0.75))
+            )
+                .textFieldStyle(.plain)
+                .font(.system(size: fs(12)))
+                .foregroundColor(primaryTextColor)
+                .colorScheme(monitor.panelIsDark ? .dark : .light)
+                .onSubmit { monitor.quickSendMessage() }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(monitor.panelIsDark ? Color.white.opacity(0.07) : Color.black.opacity(0.05))
+                )
+            Button(action: { monitor.quickSendMessage() }) {
+                Text(monitor.quickSendBusy ? "发中…" : "发送")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(canSend ? accentOnColor : secondaryTextColor)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(canSend ? accentColor : (monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.06)))
+                    )
+            }
+            .buttonStyle(PlainButtonStyle())
+            .disabled(!canSend)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(squircleCardBackground)
+    }
+
+    /// 快捷资产入口（默认含 M7 决定档案与纠正日志，支持设置页自定义）
     var assetsRow: some View {
-        HStack(spacing: 10) {
-            assetButton(icon: "photo.on.rectangle", label: "全景图") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces/zi-yan-mcp-quan-jing-tu.html"))
+        HStack(spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 9) {
+                    ForEach(monitor.quickAssets) { item in
+                        assetButton(icon: item.icon, label: item.label) {
+                            if item.path.hasPrefix("http://") || item.path.hasPrefix("https://"),
+                               let u = URL(string: item.path) {
+                                NSWorkspace.shared.open(u)
+                            } else {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+                            }
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
             }
-            assetButton(icon: "folder.fill", label: "Spaces") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/spaces"))
-            }
-            assetButton(icon: "bubble.left.and.bubble.right.fill", label: "交流.md") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
-            }
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
             Button(action: { monitor.refreshAll(showFeedback: true) }) {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: fs(13), weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(secondaryTextColor)
             }
             .buttonStyle(PlainButtonStyle())
@@ -2861,13 +3072,13 @@ struct DynamicIslandView: View {
             .buttonStyle(PlainButtonStyle())
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
         .background(assetsRowBackground)
     }
 
     // MARK: - 设置：皮肤 × 形态 × 尺寸 × 停靠边 × 模块开关/排序
     var settingsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: fs(13), weight: .bold))
@@ -2884,14 +3095,17 @@ struct DynamicIslandView: View {
                         .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(accentTextColor)
                         .padding(.horizontal, 9).padding(.vertical, 3)
-                        .background(Capsule().fill(accentColor.opacity(0.12)))
+                        .background(Capsule().fill(accentColor.opacity(0.14)))
                 }
                 .buttonStyle(PlainButtonStyle())
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(squircleCardBackground)
             .padding(.horizontal, 14)
 
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 9) {
+                VStack(alignment: .leading, spacing: 6) {
                     settingsRow(title: "皮肤") {
                         HStack(spacing: 4) {
                             ForEach(IslandSkin.allCases) { sk in
@@ -2931,6 +3145,12 @@ struct DynamicIslandView: View {
                             settingsChip("最小化到菜单栏", selected: monitor.minimizedToMenuBar) {
                                 monitor.setMinimizedToMenuBar(!monitor.minimizedToMenuBar)
                             }
+                            Text("全局热键 ⌥I")
+                                .font(.system(size: fs(11), weight: .semibold))
+                                .foregroundColor(accentTextColor)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(accentColor.opacity(0.12)))
                         }
                     }
 
@@ -2951,6 +3171,96 @@ struct DynamicIslandView: View {
                                     }
                                     return true
                                 }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(squircleCardBackground)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text("快捷资产管理（含 M7 决定档案 / 纠正日志）")
+                                .font(.system(size: fs(12), weight: .bold))
+                                .foregroundColor(secondaryTextColor)
+                            Spacer()
+                            Button(action: { monitor.resetQuickAssets() }) {
+                                Text("恢复默认")
+                                    .font(.system(size: fs(11), weight: .semibold))
+                                    .foregroundColor(accentTextColor)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(accentColor.opacity(0.12)))
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                        ForEach(monitor.quickAssets) { item in
+                            HStack(spacing: 6) {
+                                Image(systemName: item.icon)
+                                    .font(.system(size: fs(11), weight: .semibold))
+                                    .foregroundColor(accentTextColor)
+                                Text(item.label)
+                                    .font(.system(size: fs(12), weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                Text(URL(fileURLWithPath: item.path).lastPathComponent)
+                                    .font(.system(size: fs(11)))
+                                    .foregroundColor(secondaryTextColor)
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Button(action: { monitor.removeQuickAsset(id: item.id) }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: fs(12)))
+                                        .foregroundColor(Color(hex: "DC2626").opacity(0.82))
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(monitor.panelIsDark ? Color.white.opacity(0.04) : Color.black.opacity(0.03))
+                            )
+                        }
+                        HStack(spacing: 5) {
+                            TextField(
+                                "",
+                                text: $monitor.newAssetLabel,
+                                prompt: Text("名称").foregroundColor(secondaryTextColor.opacity(0.75))
+                            )
+                                .textFieldStyle(.plain)
+                                .font(.system(size: fs(11)))
+                                .foregroundColor(primaryTextColor)
+                                .colorScheme(monitor.panelIsDark ? .dark : .light)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .frame(width: 78)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(monitor.panelIsDark ? Color.white.opacity(0.07) : Color.black.opacity(0.05))
+                                )
+                            TextField(
+                                "",
+                                text: $monitor.newAssetPath,
+                                prompt: Text("绝对路径或 URL").foregroundColor(secondaryTextColor.opacity(0.75))
+                            )
+                                .textFieldStyle(.plain)
+                                .font(.system(size: fs(11)))
+                                .foregroundColor(primaryTextColor)
+                                .colorScheme(monitor.panelIsDark ? .dark : .light)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(monitor.panelIsDark ? Color.white.opacity(0.07) : Color.black.opacity(0.05))
+                                )
+                            Button(action: { monitor.addQuickAsset(label: monitor.newAssetLabel, path: monitor.newAssetPath) }) {
+                                Text("添加")
+                                    .font(.system(size: fs(11), weight: .bold))
+                                    .foregroundColor(accentOnColor)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(Capsule().fill(accentColor))
+                            }
+                            .buttonStyle(PlainButtonStyle())
                         }
                     }
                     .padding(.horizontal, 12)
@@ -3028,8 +3338,8 @@ struct DynamicIslandView: View {
     func assetButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 3) {
-                Image(systemName: icon).font(.system(size: fs(13)))
-                Text(label).font(.system(size: fs(13), weight: .semibold))
+                Image(systemName: icon).font(.system(size: fs(12)))
+                Text(label).font(.system(size: fs(12), weight: .semibold))
             }
             .foregroundColor(secondaryTextColor)
         }
@@ -4721,6 +5031,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    private static weak var sharedHotKeyDelegate: AppDelegate?
 
     var hoverTimer: Timer?
     var autoHoverExpanded = false
@@ -4756,6 +5069,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupIslandPanel()
         setupAutoDismissMonitors()
         setupHoverWatcher()
+        setupGlobalHotKey()
 
         monitor.onModeChange = { [weak self] mode in
             guard let self = self else { return }
@@ -5147,7 +5461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // 1. 中控台
-        menu.addItem(makeItem("打开/收起中控台", "rectangle.topthird.inset.filled", #selector(toggleIsland), key: "1"))
+        menu.addItem(makeItem("打开/收起中控台 (⌥I)", "rectangle.topthird.inset.filled", #selector(toggleIsland)))
         let minIt = makeItem("最小化到菜单栏（隐藏胶囊）", "eye.slash", #selector(toggleMinimizedToMenuBar), key: "m")
         menu.addItem(minIt)
         minimizeItem = minIt
@@ -5340,6 +5654,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     
+    private func setupGlobalHotKey() {
+        guard virtualDisplayID == nil else { return }
+        AppDelegate.sharedHotKeyDelegate = self
+        var eventSpec = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, _, _ -> OSStatus in
+                DispatchQueue.main.async {
+                    AppDelegate.sharedHotKeyDelegate?.toggleIsland()
+                }
+                return noErr
+            },
+            1,
+            &eventSpec,
+            nil,
+            &hotKeyHandler
+        )
+        let hotKeyID = EventHotKeyID(signature: 0x41494C44, id: 1)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_I),
+            UInt32(optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+    }
+
     @objc func toggleIsland() {
         if monitor.currentMode == .expanded {
             monitor.setMode(.compact)
@@ -5348,6 +5693,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !islandPanel.isVisible {
                 updatePanelFrame(for: .expanded)
                 islandPanel.orderFrontRegardless()
+            }
+            if virtualDisplayID == nil {
+                islandPanel.makeKey()
             }
         }
     }
@@ -5464,6 +5812,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func quitApp() {
         if let g = globalClickMonitor { NSEvent.removeMonitor(g) }
         if let l = localClickMonitor { NSEvent.removeMonitor(l) }
+        if let hk = hotKeyRef { UnregisterEventHotKey(hk) }
+        if let handler = hotKeyHandler { RemoveEventHandler(handler) }
         NSApp.terminate(nil)
     }
 }
