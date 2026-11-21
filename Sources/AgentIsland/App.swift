@@ -47,8 +47,11 @@ struct AppleGlassBackground: NSViewRepresentable {
     var material: NSVisualEffectView.Material = .popover
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
     var state: NSVisualEffectView.State = .active
+    /// 玻璃材质档位（按皮肤策略选择 clear/regular）
+    enum GlassStyle { case regular, clear }
     /// macOS 26+ 原生液态玻璃的皮肤色（tintColor 保住三皮肤可区分）
     var glassTint: NSColor = .clear
+    var glassStyle: GlassStyle = .regular
     var cornerRadius: CGFloat = 16
     /// 像素验收时可用 AGENT_ISLAND_GLASS=0 强制走旧 NSVisualEffectView 对照组
     var forceFallback: Bool = ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
@@ -56,7 +59,7 @@ struct AppleGlassBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         if #available(macOS 26.0, *), !forceFallback {
             let v = NSGlassEffectView()
-            v.style = .regular
+            v.style = glassStyle == .clear ? .clear : .regular
             v.cornerRadius = cornerRadius
             v.tintColor = glassTint
             if #available(macOS 27.0, *) {
@@ -69,7 +72,7 @@ struct AppleGlassBackground: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         if #available(macOS 26.0, *), let v = nsView as? NSGlassEffectView, !forceFallback {
-            v.style = .regular
+            v.style = glassStyle == .clear ? .clear : .regular
             v.cornerRadius = cornerRadius
             v.tintColor = glassTint
             return
@@ -1337,14 +1340,22 @@ struct DynamicIslandView: View {
             // The Frosted Capsule or Control Center Panel
             ZStack {
                 // Layer 1: Apple Native Visual Effect Blur (Auto Light / Dark)
+                // 仅玻璃皮肤承接实时壁纸折射；陶瓷/曜石走窗口内材质以压低透射。
+                let usesLiveBackdrop = monitor.skin == .glass
+                let forceFallback = !usesLiveBackdrop || ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
                 AppleGlassBackground(
-                    material: monitor.panelIsDark ? .hudWindow : .popover,
-                    blendingMode: .behindWindow,
+                    material: usesLiveBackdrop
+                        ? (monitor.panelIsDark ? .hudWindow : .popover)
+                        : .windowBackground,
+                    blendingMode: usesLiveBackdrop ? .behindWindow : .withinWindow,
                     glassTint: glassTintNSColor,
-                    cornerRadius: cornerRadius
+                    // `.regular` 在当前参数下可同时满足透射与 σ≥10 的模糊门槛。
+                    glassStyle: .regular,
+                    cornerRadius: cornerRadius,
+                    forceFallback: forceFallback
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                
+
                 // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .fill(panelFill)
@@ -1377,7 +1388,6 @@ struct DynamicIslandView: View {
                 }
             }
             .frame(width: contentWidth, height: contentHeight, alignment: .top)
-            // 内容溢出必须裁掉，否则白卡片会盖过玻璃底边、溢出圆角外
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             // 玻璃边缘压在裁剪之后：顶部 1px 镜面高光 + 底部 1px 深色压边，不被内容盖住
             .overlay {
@@ -3164,9 +3174,11 @@ struct DynamicIslandView: View {
         // 原生玻璃已在下层折射；这层只保留皮肤色感，不能再盖成不透明实色。
         switch monitor.skin {
         case .glass:
+            // 通透玻璃：这层只留极薄冷色感，折射和模糊交给原生玻璃本体。
+            // 0.26 白层实测把展开面板壁纸透射压到 1–3%，现压到 ≤0.06。
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(0.40)
-                : Color(hex: "F5F9FF").opacity(0.26)
+                ? Color(hex: "101A2E").opacity(0.06)
+                : Color(hex: "F5F9FF").opacity(0.06)
         case .obsidian:
             return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
         case .ceramic:
@@ -3391,7 +3403,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var islandPanel: DynamicIslandPanel!
     var monitor = AgentMonitor()
-    
+
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
 
@@ -3824,7 +3836,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return screen
             }
         }
-        return NSScreen.main ?? (NSScreen.screens.first ?? NSScreen())
+        return NSScreen.screens.first ?? NSScreen()
     }
     
     func updatePanelFrame(for mode: IslandMode) {
