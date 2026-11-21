@@ -2391,7 +2391,7 @@ struct DynamicIslandView: View {
     }
 
     /// V4：空闲节点环要求四组（浅/深玻璃 + 浅/深陶瓷）全部 ≥2.2:1。
-    /// 这里按明暗给一组“深底用亮环、浅底用深环”的固定对比色，不改结构只改色值。
+    /// 仅改色值：按明暗 + 皮肤分档，特别补强浅玻璃橙环。
     func idleRingColor(for agent: AgentIdentity) -> Color {
         if monitor.panelIsDark {
             switch agent.key {
@@ -2401,30 +2401,77 @@ struct DynamicIslandView: View {
             default: return Color.white.opacity(0.92)
             }
         }
-        switch agent.key {
-        case "agy": return Color(hex: "0A4FB6").opacity(0.90)
-        case "alma": return Color(hex: "9A4300").opacity(0.90)
-        case "ping": return Color(hex: "5B1FB5").opacity(0.90)
-        default: return Color(hex: "334155").opacity(0.88)
+
+        switch monitor.skin {
+        case .glass:
+            switch agent.key {
+            case "agy": return Color(hex: "0A4FB6").opacity(0.90)
+            case "alma": return Color(hex: "9A4300").opacity(0.96)
+            case "ping": return Color(hex: "5B1FB5").opacity(0.90)
+            default: return Color(hex: "334155").opacity(0.88)
+            }
+        case .ceramic:
+            switch agent.key {
+            case "agy": return Color(hex: "0A4FB6").opacity(0.90)
+            case "alma": return Color(hex: "9A4300").opacity(0.90)
+            case "ping": return Color(hex: "5B1FB5").opacity(0.90)
+            default: return Color(hex: "334155").opacity(0.88)
+            }
+        case .obsidian:
+            switch agent.key {
+            case "agy": return Color(hex: "9FD0FF").opacity(0.94)
+            case "alma": return Color(hex: "FFD7A1").opacity(0.94)
+            case "ping": return Color(hex: "E2C6FF").opacity(0.94)
+            default: return Color.white.opacity(0.90)
+            }
         }
     }
 
-    /// V2：活动线独立用高对比配色（浅底用深色，深底用亮色），保证三色都 ≥3:1。
+    /// V2：活动线独立用高对比配色；按「明暗 × 皮肤」分档，避免一套色走天下。
     func activePulseColor(for key: String) -> Color {
         let k = key.lowercased()
+
         if monitor.panelIsDark {
+            switch monitor.skin {
+            case .glass, .ceramic:
+                switch k {
+                case "agy": return Color(hex: "9FCBFF")
+                case "alma": return Color(hex: "FFD4A0")
+                case "ping": return Color(hex: "D9B8FF")
+                default: return Color(hex: "9FCBFF")
+                }
+            case .obsidian:
+                switch k {
+                case "agy": return Color(hex: "84BFFF")
+                case "alma": return Color(hex: "FFC27A")
+                case "ping": return Color(hex: "CFA8FF")
+                default: return Color(hex: "84BFFF")
+                }
+            }
+        }
+
+        switch monitor.skin {
+        case .glass:
+            switch k {
+            case "agy": return Color(hex: "0840A3")
+            case "alma": return Color(hex: "7A3300")
+            case "ping": return Color(hex: "5A20B5")
+            default: return Color(hex: "0840A3")
+            }
+        case .ceramic:
+            switch k {
+            case "agy": return Color(hex: "0B4BB3")
+            case "alma": return Color(hex: "8A3B00")
+            case "ping": return Color(hex: "5A20B5")
+            default: return Color(hex: "0B4BB3")
+            }
+        case .obsidian:
             switch k {
             case "agy": return Color(hex: "9FCBFF")
             case "alma": return Color(hex: "FFD4A0")
             case "ping": return Color(hex: "D9B8FF")
             default: return Color(hex: "9FCBFF")
             }
-        }
-        switch k {
-        case "agy": return Color(hex: "0B4BB3")
-        case "alma": return Color(hex: "8A3B00")
-        case "ping": return Color(hex: "5A20B5")
-        default: return Color(hex: "0B4BB3")
         }
     }
 
@@ -3288,7 +3335,7 @@ struct DynamicIslandView: View {
             // 通透玻璃：这层只留极薄冷色感，折射和模糊交给原生玻璃本体。
             // 0.26 白层实测把展开面板壁纸透射压到 1–3%，现压到 ≤0.06。
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(0.06)
+                ? Color(hex: "101A2E").opacity(0.10)
                 : Color(hex: "F5F9FF").opacity(0.06)
         case .obsidian:
             return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
@@ -3385,7 +3432,7 @@ struct DynamicIslandView: View {
     var textPurple: Color { monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
     var textAmber: Color { monitor.panelIsDark ? Color(hex: "FFD60A") : Color(hex: "B45309") }
     var textRed: Color { monitor.panelIsDark ? Color(hex: "FF6961") : Color(hex: "C1121F") }
-    var textGray: Color { monitor.panelIsDark ? Color(hex: "FFFFFF") : Color(hex: "3D4650") }
+    var textGray: Color { monitor.panelIsDark ? Color(hex: "FFFFFF") : Color(hex: "1F2937") }
     
     var compactBadgeColor: Color {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline || monitor.fusedCount > 0 {
