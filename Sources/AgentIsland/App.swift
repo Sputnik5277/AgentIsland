@@ -1703,6 +1703,7 @@ struct DynamicIslandView: View {
             assetsRow
                 .padding(.horizontal, 14)
                 .padding(.top, 2)
+                .padding(.bottom, 2)
         case .none:
             EmptyView()
         }
@@ -1784,69 +1785,80 @@ struct DynamicIslandView: View {
             }
         }) {
             VStack(spacing: 0) {
-                // 迷你条也不画空闲底轨：三层通道只用节点/色阶交代，零连线。
-                HStack(spacing: 0) {
-                    miniChannelNode(
-                        name: "Tailscale",
+                // ③ 主体改成 AGY/Alma/Ping 三节点 + 1.5pt 主通道线；
+                //    Tailscale/Funnel/坚果云降级为两端小标签，不再占主体。
+                HStack(spacing: 7) {
+                    miniStripChannelTag(
+                        text: "Tailscale",
                         icon: "network",
                         ok: monitor.tailscaleOnline,
-                        tint: monitor.panelIsDark ? Color(hex: "94A3B8") : Color(hex: "475569"),
-                        detail: "底座 · Tailscale：私网底座 · SSH 可达"
+                        tint: monitor.panelIsDark ? Color(hex: "A8B3C2") : Color(hex: "475569")
                     )
-                    .offset(y: 4)
 
-                    Spacer(minLength: 6)
+                    Spacer(minLength: 4)
+
+                    ZStack {
+                        Capsule()
+                            .fill(monitor.panelIsDark ? Color(hex: "9FCBFF") : Color(hex: "0A4FB6"))
+                            .frame(height: 1.5)
+                            .padding(.horizontal, 14)
+
+                        HStack(spacing: 30) {
+                            miniStripAgentNode(agent: AgentRoster.agy)
+                            miniStripAgentNode(agent: AgentRoster.alma)
+                            miniStripAgentNode(agent: AgentRoster.ping)
+                        }
+
+                        HStack {
+                            Spacer()
+                            Image(systemName: monitor.showTopology ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(monitor.panelIsDark ? Color(hex: "D7E6F9") : Color(hex: "1F3A5F"))
+                        }
+                    }
+                    .frame(width: 166, height: 18)
+
+                    Spacer(minLength: 4)
 
                     HStack(spacing: 4) {
-                        Image(systemName: "bolt.horizontal.fill")
-                            .font(.system(size: 10, weight: .bold))
-                        Text("Funnel 443")
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
-                        Image(systemName: monitor.showTopology ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 9, weight: .bold))
+                        miniStripChannelTag(
+                            text: "Funnel 443",
+                            icon: "bolt.horizontal.fill",
+                            ok: monitor.funnelOnline,
+                            tint: monitor.panelIsDark ? Color(hex: "9FDBFF") : Color(hex: "075985")
+                        )
+                        miniStripChannelTag(
+                            text: "坚果云",
+                            icon: "externaldrive.fill",
+                            ok: monitor.nutstoreOnline,
+                            tint: monitor.panelIsDark ? Color(hex: "C4CCD8") : Color(hex: "4B5563")
+                        )
                     }
-                    .foregroundColor(monitor.activePulses.isEmpty
-                        ? (monitor.panelIsDark ? Color(hex: "7DD3FC") : Color(hex: "0369A1"))
-                        : Color(hex: "059669"))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(
-                        monitor.activePulses.isEmpty
-                            ? Color(hex: "0369A1").opacity(0.12)
-                            : Color(hex: "059669").opacity(0.16)
-                    ))
-                    .offset(y: -2)
-
-                    Spacer(minLength: 6)
-
-                    miniChannelNode(
-                        name: "坚果云",
-                        icon: "externaldrive.fill",
-                        ok: monitor.nutstoreOnline,
-                        tint: monitor.panelIsDark ? Color(hex: "9CA3AF") : Color(hex: "4B5563"),
-                        detail: "冷备 · 坚果云：只读冷备 · 灾难恢复底仓"
-                    )
-                    .offset(y: -7)
                 }
                 .padding(.horizontal, 10)
                 .frame(height: 27)
 
-                // V5 补充：迷你条常驻「最近通讯」，直接读 activePulses，不引入新数据模型。
-                Text(miniRecentCommText)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .frame(height: 15)
+                // V5 + ⑨：保留最近通讯行与单光点，并补「最后通讯 N 秒前」。
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(monitor.activePulses.isEmpty ? textGray : textGreen)
+                        .frame(width: 5, height: 5)
+                    Text("\(miniRecentCommText) · \(miniLastCommAgoText)")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .frame(height: 15)
             }
             .frame(height: 44)
             .background(squircleCardBackground)
             .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(PlainButtonStyle())
-        .help("底座 Tailscale：私网底座 · SSH 可达\n主通道 Funnel 443：HTTPS 专用通道 · 主传输路径\n冷备 坚果云：只读冷备 · 灾难恢复底仓\n点击展开/收起横向链路")
+        .help("中轴节点：AGY/Alma/Ping（18px）\n主通道：1.5pt\n侧标：Tailscale / Funnel 443 / 坚果云\n点击展开/收起横向链路")
     }
 
     var miniRecentCommText: String {
@@ -1857,18 +1869,38 @@ struct DynamicIslandView: View {
         return "最近通讯：\(s) → \(t) ×\(p.count)\(extra)"
     }
 
-    func miniChannelNode(name: String, icon: String, ok: Bool, tint: Color, detail: String) -> some View {
-        HStack(spacing: 4) {
+    var miniLastCommAgoText: String {
+        guard let lastAt = monitor.lastCommAt else { return "最后通讯：无通讯" }
+        let seconds = max(0, Int(Date().timeIntervalSince(lastAt)))
+        return "最后通讯 \(seconds) 秒前"
+    }
+
+    func miniStripChannelTag(text: String, icon: String, ok: Bool, tint: Color) -> some View {
+        HStack(spacing: 3) {
             Image(systemName: icon)
-                .font(.system(size: 11, weight: .bold))
-            Text(name)
-                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .font(.system(size: 9.5, weight: .bold))
+            Text(text)
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
             Circle()
                 .fill(ok ? Color(hex: "10B981") : Color(hex: "EF4444"))
-                .frame(width: 5, height: 5)
+                .frame(width: 4, height: 4)
         }
         .foregroundColor(tint)
-        .help(detail)
+    }
+
+    func miniStripAgentNode(agent: AgentIdentity) -> some View {
+        Circle()
+            .fill(agent.color.opacity(0.24))
+            .frame(width: 18, height: 18)
+            .overlay(
+                Circle().stroke(agent.color.opacity(0.96), lineWidth: 1)
+            )
+            .overlay(
+                Circle().fill(Color.white.opacity(monitor.panelIsDark ? 0.88 : 0.72))
+                    .frame(width: 3.5, height: 3.5)
+            )
+            .shadow(color: agent.color.opacity(0.30), radius: 1.5)
+            .help(agent.short)
     }
 
     var channelHierarchyView: some View {
@@ -1971,7 +2003,7 @@ struct DynamicIslandView: View {
             .buttonStyle(PlainButtonStyle())
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .background(assetsRowBackground)
     }
 
@@ -2358,20 +2390,41 @@ struct DynamicIslandView: View {
         .frame(width: 100, height: 82, alignment: .top)
     }
 
-    /// V4：空闲节点环 ≥2.2:1。0.35 实测仅 1.5–1.7:1；0.5 在浅底下仍不足，
-    /// 故浅色按身份色压暗后 0.62、深色 0.70（紫在曜石/陶瓷深底再用 #9572F5 保住对比度）。
+    /// V4：空闲节点环要求四组（浅/深玻璃 + 浅/深陶瓷）全部 ≥2.2:1。
+    /// 这里按明暗给一组“深底用亮环、浅底用深环”的固定对比色，不改结构只改色值。
     func idleRingColor(for agent: AgentIdentity) -> Color {
         if monitor.panelIsDark {
             switch agent.key {
-            case "ping": return Color(hex: "9572F5").opacity(0.70)
-            default: return agent.color.opacity(0.70)
+            case "agy": return Color(hex: "9FD0FF").opacity(0.96)
+            case "alma": return Color(hex: "FFD7A1").opacity(0.96)
+            case "ping": return Color(hex: "E2C6FF").opacity(0.96)
+            default: return Color.white.opacity(0.92)
             }
         }
         switch agent.key {
-        case "agy": return Color(hex: "0A5FCF").opacity(0.62)
-        case "alma": return Color(hex: "B45309").opacity(0.62)
-        case "ping": return Color(hex: "6D28D9").opacity(0.62)
-        default: return agent.color.opacity(0.62)
+        case "agy": return Color(hex: "0A4FB6").opacity(0.90)
+        case "alma": return Color(hex: "9A4300").opacity(0.90)
+        case "ping": return Color(hex: "5B1FB5").opacity(0.90)
+        default: return Color(hex: "334155").opacity(0.88)
+        }
+    }
+
+    /// V2：活动线独立用高对比配色（浅底用深色，深底用亮色），保证三色都 ≥3:1。
+    func activePulseColor(for key: String) -> Color {
+        let k = key.lowercased()
+        if monitor.panelIsDark {
+            switch k {
+            case "agy": return Color(hex: "9FCBFF")
+            case "alma": return Color(hex: "FFD4A0")
+            case "ping": return Color(hex: "D9B8FF")
+            default: return Color(hex: "9FCBFF")
+            }
+        }
+        switch k {
+        case "agy": return Color(hex: "0B4BB3")
+        case "alma": return Color(hex: "8A3B00")
+        case "ping": return Color(hex: "5A20B5")
+        default: return Color(hex: "0B4BB3")
         }
     }
 
@@ -2389,18 +2442,18 @@ struct DynamicIslandView: View {
                 }
                 for (edgeIndex, pulse) in monitor.activePulses.enumerated() {
                     let source = AgentRoster.identity(for: pulse.source)
-                    let color = source?.color ?? Color(hex: "60A5FA")
+                    let color = activePulseColor(for: source?.key ?? pulse.source)
                     let a = CGPoint(x: anchorX(pulse.source), y: railY)
                     let b = CGPoint(x: anchorX(pulse.target), y: railY)
                     let dir: CGFloat = b.x >= a.x ? 1 : -1
                     let start = CGPoint(x: a.x + dir * 22, y: railY)
                     let tip = CGPoint(x: b.x - dir * 24, y: railY)
 
-                    // 实色描边（不再用 55% 低对比度线；深浅色都按实色画）
+                    // V2：活动线使用高对比专色，不再直接取 agent 原色。
                     var line = Path()
                     line.move(to: start)
                     line.addLine(to: CGPoint(x: tip.x - dir * 6, y: railY))
-                    context.stroke(line, with: .color(color.opacity(0.95)), lineWidth: 2.2)
+                    context.stroke(line, with: .color(color), lineWidth: 2.2)
 
                     // 方向箭头
                     var head = Path()
@@ -2408,7 +2461,7 @@ struct DynamicIslandView: View {
                     head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY - 4.5))
                     head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY + 4.5))
                     head.closeSubpath()
-                    context.fill(head, with: .color(color.opacity(0.98)))
+                    context.fill(head, with: .color(color))
 
                     // V5：每条边只有 1 个光点，全边共享 2.4s 周期；半径 3、单层 4px 辉光。
                     // 两条边同时活跃 = 两个点（0.3s 相位差），绝不叠成一串。
@@ -3164,14 +3217,14 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "0B1526").opacity(0.72)
-                : Color(hex: "EAF4FF").opacity(0.68)
+                ? Color(hex: "0B1526").opacity(0.62)
+                : Color(hex: "EAF4FF").opacity(0.60)
         case .obsidian:
-            return Color(hex: "0A0A0C").opacity(0.72)
+            return Color(hex: "0A0A0C").opacity(0.66)
         case .ceramic:
             return monitor.panelIsDark
-                ? Color(hex: "2A2620").opacity(0.70)
-                : Color(hex: "F7EFDF").opacity(0.72)
+                ? Color(hex: "2A2620").opacity(0.64)
+                : Color(hex: "F7EFDF").opacity(0.66)
         }
     }
 
@@ -3179,14 +3232,14 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "141418").opacity(0.86)
-                : Color(hex: "FFFFFF").opacity(0.92)
+                ? Color(hex: "141418").opacity(0.78)
+                : Color(hex: "FFFFFF").opacity(0.86)
         case .obsidian:
-            return Color(hex: "141418").opacity(0.94)
+            return Color(hex: "141418").opacity(0.90)
         case .ceramic:
             return monitor.panelIsDark
-                ? Color(hex: "2A2620").opacity(0.92)
-                : Color(hex: "FBF5E9").opacity(0.94)
+                ? Color(hex: "2A2620").opacity(0.86)
+                : Color(hex: "FBF5E9").opacity(0.90)
         }
     }
 
@@ -3194,14 +3247,14 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "0B1526").opacity(0.45)
-                : Color(hex: "EAF4FF").opacity(0.30)
+                ? Color(hex: "0B1526").opacity(0.78)
+                : Color(hex: "EAF4FF").opacity(0.34)
         case .obsidian:
-            return Color(hex: "0A0A0C").opacity(0.55)
+            return Color(hex: "0A0A0C").opacity(0.66)
         case .ceramic:
             return monitor.panelIsDark
-                ? Color(hex: "2A2620").opacity(0.50)
-                : Color(hex: "F7EFDF").opacity(0.48)
+                ? Color(hex: "2A2620").opacity(0.78)
+                : Color(hex: "F7EFDF").opacity(0.52)
         }
     }
 
@@ -3209,14 +3262,14 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "141418").opacity(0.68)
-                : Color(hex: "FFFFFF").opacity(0.72)
+                ? Color(hex: "141418").opacity(0.84)
+                : Color(hex: "FFFFFF").opacity(0.78)
         case .obsidian:
-            return Color(hex: "141418").opacity(0.86)
+            return Color(hex: "141418").opacity(0.92)
         case .ceramic:
             return monitor.panelIsDark
-                ? Color(hex: "2A2620").opacity(0.80)
-                : Color(hex: "FBF5E9").opacity(0.86)
+                ? Color(hex: "2A2620").opacity(0.88)
+                : Color(hex: "FBF5E9").opacity(0.90)
         }
     }
     
@@ -3332,7 +3385,7 @@ struct DynamicIslandView: View {
     var textPurple: Color { monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
     var textAmber: Color { monitor.panelIsDark ? Color(hex: "FFD60A") : Color(hex: "B45309") }
     var textRed: Color { monitor.panelIsDark ? Color(hex: "FF6961") : Color(hex: "C1121F") }
-    var textGray: Color { monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "4B5563") }
+    var textGray: Color { monitor.panelIsDark ? Color(hex: "FFFFFF") : Color(hex: "3D4650") }
     
     var compactBadgeColor: Color {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline || monitor.fusedCount > 0 {
