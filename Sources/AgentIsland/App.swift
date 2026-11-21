@@ -232,11 +232,12 @@ enum IslandForm: String, CaseIterable, Identifiable {
 }
 
 enum PanelSectionKey: String, CaseIterable, Identifiable {
-    case overview, confirm, inboxes, channels, assets
+    case overview, wake, confirm, inboxes, channels, assets
     var id: String { rawValue }
     var name: String {
         switch self {
         case .overview: return "总览摘要"
+        case .wake: return "后台唤醒"
         case .confirm: return "待你验收"
         case .inboxes: return "三个收件箱"
         case .channels: return "三层通道"
@@ -245,6 +246,38 @@ enum PanelSectionKey: String, CaseIterable, Identifiable {
     }
     static let defaultOrder: [String] = allCases.map { $0.rawValue }
     static let defaults: [String: Bool] = Dictionary(uniqueKeysWithValues: allCases.map { ($0.rawValue, true) })
+}
+
+struct WakeWorkerState: Equatable {
+    var status: String = "idle"
+    var dailyRuns: Int = 0
+    var dailyRunsLimit: Int = 30
+    var dailyTokens: Int = 0
+    var dailyTokensLimit: Int = 500_000
+    var lastFile: String = ""
+    var elapsedS: Double = 0
+    var paused: Bool = false
+    var loaded: Bool = false
+
+    var effectiveStatus: String {
+        paused ? "paused" : status
+    }
+    var tokenRatio: Double {
+        guard dailyTokensLimit > 0 else { return 0 }
+        return min(1.0, max(0.0, Double(dailyTokens) / Double(dailyTokensLimit)))
+    }
+    var tokenPct: Int {
+        Int((tokenRatio * 100).rounded())
+    }
+    var tooltipText: String {
+        let tokK = dailyTokens / 1000
+        let limK = dailyTokensLimit / 1000
+        let shortFile = URL(fileURLWithPath: lastFile).deletingPathExtension().lastPathComponent
+        if shortFile.isEmpty {
+            return "Token 预算：\(tokK)K / \(limK)K · 状态：\(effectiveStatus)"
+        }
+        return "Token 预算：\(tokK)K / \(limK)K · 最近：\(shortFile)（\(String(format: "%.1fs", elapsedS))）"
+    }
 }
 
 class AgentMonitor: ObservableObject {
@@ -278,6 +311,11 @@ class AgentMonitor: ObservableObject {
     /// 最近 15 秒仍有真实通讯的链路；无通讯时为空，视图不绘制任何脉冲
     @Published var activePulses: [AgentCommPulse] = []
     @Published var lastCommAt: Date? = nil
+    /// AGY 后台无头唤醒实时态（监听父目录 ~/.config/alma/state/，抗 os.replace inode 替换）
+    @Published var wakeState: WakeWorkerState = WakeWorkerState()
+    private var wakeDirFD: CInt = -1
+    private var wakeDirSource: DispatchSourceFileSystemObject?
+    private var wakeLastStatKey: String = ""
 
     @Published var currentMode: IslandMode = .compact
     @Published var selectedDrawerAgent: String? = nil {
@@ -406,6 +444,7 @@ class AgentMonitor: ObservableObject {
         // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
         if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 24 }
+        if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 34 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
             h += pendingConfirms.isEmpty ? 62 : 104
         }
@@ -463,6 +502,7 @@ class AgentMonitor: ObservableObject {
                 themeMode = mode
             }
             checkAppearance()
+            reloadWakeState(force: true)
             if !customEventLog.isEmpty && !customMultiRoot.isEmpty {
                 refreshCommPulses()
                 commTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -519,6 +559,80 @@ class AgentMonitor: ObservableObject {
         checkAppearance()
         refreshAll()
         startTimers()
+        startWakeStateWatcher()
+    }
+
+    private var wakeStateDirURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/alma/state", isDirectory: true)
+    }
+
+    func startWakeStateWatcher() {
+        reloadWakeState(force: true)
+        let dirPath = wakeStateDirURL.path
+        try? FileManager.default.createDirectory(atPath: dirPath, withIntermediateDirectories: true)
+        let fd = open(dirPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        wakeDirFD = fd
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .attrib],
+            queue: DispatchQueue.global(qos: .utility)
+        )
+        src.setEventHandler { [weak self] in
+            self?.reloadWakeState(force: false)
+        }
+        src.setCancelHandler {
+            close(fd)
+        }
+        wakeDirSource = src
+        src.resume()
+    }
+
+    func reloadWakeState(force: Bool) {
+        let snapURL = wakeStateDirURL.appendingPathComponent("island-wake-state.json")
+        let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
+        let fm = FileManager.default
+        let snapAttr = try? fm.attributesOfItem(atPath: snapURL.path)
+        let pauseExists = fm.fileExists(atPath: pauseURL.path)
+        let mtime = (snapAttr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let fsize = (snapAttr?[.size] as? NSNumber)?.int64Value ?? 0
+        let statKey = "\(mtime)|\(fsize)|\(pauseExists)"
+        if !force && statKey == wakeLastStatKey { return }
+        wakeLastStatKey = statKey
+
+        var next = WakeWorkerState()
+        next.paused = pauseExists
+        if let data = try? Data(contentsOf: snapURL),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let workers = root["workers"] as? [String: Any],
+           let agy = workers["agy"] as? [String: Any] {
+            next.status = (agy["status"] as? String) ?? "idle"
+            next.dailyRuns = (agy["daily_runs"] as? Int) ?? 0
+            next.dailyRunsLimit = (agy["daily_runs_limit"] as? Int) ?? 30
+            next.dailyTokens = (agy["daily_tokens"] as? Int) ?? 0
+            next.dailyTokensLimit = (agy["daily_tokens_limit"] as? Int) ?? 500_000
+            next.lastFile = (agy["file"] as? String) ?? ""
+            next.elapsedS = (agy["elapsed_s"] as? Double) ?? 0
+            next.loaded = true
+        }
+        DispatchQueue.main.async {
+            if self.wakeState != next {
+                self.wakeState = next
+            }
+        }
+    }
+
+    func toggleAgyWakePaused() {
+        let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: pauseURL.path) {
+            try? fm.removeItem(at: pauseURL)
+        } else {
+            try? fm.createDirectory(at: wakeStateDirURL, withIntermediateDirectories: true)
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            try? ("paused_by_agent_island: \(stamp)\n").data(using: .utf8)?.write(to: pauseURL, options: .atomic)
+        }
+        reloadWakeState(force: true)
     }
     
     func checkAppearance() {
@@ -1740,6 +1854,9 @@ struct DynamicIslandView: View {
         case .overview:
             overviewSummaryStrip
                 .padding(.horizontal, 14)
+        case .wake:
+            wakeWorkerStrip
+                .padding(.horizontal, 14)
         case .confirm:
             if !monitor.pendingConfirms.isEmpty {
                 liveDispatchHeroCardView
@@ -1806,6 +1923,103 @@ struct DynamicIslandView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 0)
+        .background(squircleCardBackground)
+    }
+
+    /// 后台自动唤醒控制条（34pt · 3 块极简布局 · 全 ≥11pt · 监听目录防 os.replace 失效）
+    var wakeWorkerStrip: some View {
+        let ws = monitor.wakeState
+        let st = ws.effectiveStatus
+        let statusColor: Color = {
+            switch st {
+            case "running": return Color(hex: "007AFF")
+            case "paused": return Color(hex: "6B7280")
+            case "fused-m1", "error": return Color(hex: "EF4444")
+            default: return Color(hex: "10B981")
+            }
+        }()
+        let statusLabel: String = {
+            switch st {
+            case "running": return "运行中"
+            case "paused": return "已暂停"
+            case "fused-m1": return "M1熔断"
+            case "error": return "异常"
+            default: return "待命"
+            }
+        }()
+        let barColor: Color = ws.tokenRatio >= 0.8 ? Color(hex: "F59E0B") : statusColor
+        let pulseActive = (st == "running" || st == "fused-m1")
+
+        return HStack(spacing: 8) {
+            // ① 左段：状态呼吸灯 + 身份 + 状态词
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                    .opacity(pulseActive ? (monitor.pulse ? 1.0 : 0.45) : 1.0)
+                Text("AGY后台")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryTextColor)
+                Text(statusLabel)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(statusColor)
+            }
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(statusColor.opacity(0.12)))
+
+            Spacer(minLength: 4)
+
+            // ② 中段：今日次数 + 44×5pt 预算条 + 百分比（详情放 hover tooltip，保持一瞥性）
+            HStack(spacing: 6) {
+                Text("\(ws.dailyRuns)/\(ws.dailyRunsLimit)次")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(primaryTextColor)
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(monitor.panelIsDark ? Color.white.opacity(0.18) : Color.black.opacity(0.14))
+                        .frame(width: 48, height: 5.5)
+                    Capsule()
+                        .fill(barColor)
+                        .frame(width: max(4, 48 * ws.tokenRatio), height: 5.5)
+                }
+                Text("\(ws.tokenPct)%")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(ws.tokenRatio >= 0.8 ? Color(hex: "D97706") : secondaryTextColor)
+            }
+            .help(ws.tooltipText)
+
+            Spacer(minLength: 4)
+
+            // ③ 右段：一键暂停 / 恢复可控胶囊（高对比可点样式）
+            Button(action: { monitor.toggleAgyWakePaused() }) {
+                HStack(spacing: 3) {
+                    Image(systemName: ws.paused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 9, weight: .bold))
+                    Text(ws.paused ? "恢复" : "暂停")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                }
+                .foregroundColor(ws.paused ? (monitor.panelIsDark ? Color(hex: "34D399") : Color(hex: "047857")) : primaryTextColor)
+                .padding(.horizontal, 9).padding(.vertical, 3.5)
+                .background(
+                    Capsule()
+                        .fill(ws.paused
+                            ? Color(hex: "10B981").opacity(monitor.panelIsDark ? 0.24 : 0.18)
+                            : (monitor.panelIsDark ? Color.white.opacity(0.15) : Color.black.opacity(0.08)))
+                        .overlay(
+                            Capsule().stroke(
+                                ws.paused
+                                    ? Color(hex: "10B981").opacity(0.45)
+                                    : (monitor.panelIsDark ? Color.white.opacity(0.24) : Color.black.opacity(0.18)),
+                                lineWidth: 0.8
+                            )
+                        )
+                )
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help(ws.paused ? "恢复 AGY 后台自动唤醒" : "暂停 AGY 后台自动唤醒（不影响前台窗口）")
+        }
+        .frame(height: 34)
+        .padding(.horizontal, 10)
         .background(squircleCardBackground)
     }
 
@@ -3267,61 +3481,55 @@ struct DynamicIslandView: View {
         }
     }
 
-    /// 卡片层：macOS 26+ 用 SwiftUI 原生玻璃；旧系统退回半透明填充。
-    /// 玻璃上的文字仍是实色，只有背景透明，避免“实色层把玻璃盖死”。
+    /// 卡片层（对标 Apple WWDC25 HIG：外层独享原生 NSGlassEffectView，内容层不叠第二层玻璃，改用高区分度明度薄片 + 顶底镜面高光边 + 扎实投影）。
     @ViewBuilder
     var squircleCardBackground: some View {
         let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        Group {
-            if #available(macOS 26.0, *), !Self.forceGlassFallback {
-                shape
-                    .fill(Color.clear)
-                    .glassEffect(.regular.tint(cardGlassTint), in: shape)
-            } else {
-                shape.fill(cardFallbackFill)
+        let cardFill: Color = {
+            switch monitor.skin {
+            case .glass:
+                return monitor.panelIsDark
+                    ? Color(hex: "141D2E").opacity(0.42)
+                    : Color.white.opacity(0.46)
+            case .obsidian:
+                return Color.white.opacity(0.09)
+            case .ceramic:
+                return monitor.panelIsDark
+                    ? Color(hex: "2A2620").opacity(0.84)
+                    : Color(hex: "FBF7EE").opacity(0.90)
             }
-        }
-        .overlay(
-            shape.stroke(
-                monitor.panelIsDark
-                    ? Color.white.opacity(0.22)
-                    : Color.white.opacity(0.95),
-                lineWidth: 0.9
+        }()
+        let borderGradient = LinearGradient(
+            stops: monitor.panelIsDark
+                ? [
+                    .init(color: Color.white.opacity(0.42), location: 0.0),
+                    .init(color: Color.white.opacity(0.16), location: 0.45),
+                    .init(color: Color.white.opacity(0.09), location: 1.0),
+                ]
+                : [
+                    .init(color: Color.white.opacity(0.96), location: 0.0),
+                    .init(color: Color.black.opacity(0.12), location: 0.50),
+                    .init(color: Color.black.opacity(0.20), location: 1.0),
+                ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        shape
+            .fill(cardFill)
+            .overlay(
+                shape.stroke(borderGradient, lineWidth: 1.0)
             )
-        )
-        .shadow(
-            color: Color.black.opacity(monitor.panelIsDark ? 0.28 : 0.06),
-            radius: 2.5,
-            y: 1.2
-        )
+            .shadow(
+                color: Color.black.opacity(monitor.panelIsDark ? 0.46 : 0.14),
+                radius: 4.5,
+                y: 2.0
+            )
     }
 
-    /// 底部资产条需要更强的可读性：保留玻璃折射，但把透底噪音压住。
+    /// 底部资产条：与内容卡片同源高对比薄片，增强底部边界清晰度。
     @ViewBuilder
     var assetsRowBackground: some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        Group {
-            if #available(macOS 26.0, *), !Self.forceGlassFallback {
-                shape
-                    .fill(Color.clear)
-                    .glassEffect(.regular.tint(assetsRowGlassTint), in: shape)
-            } else {
-                shape.fill(assetsRowFallbackFill)
-            }
-        }
-        .overlay(
-            shape.stroke(
-                monitor.panelIsDark
-                    ? Color.white.opacity(0.26)
-                    : Color.white.opacity(0.96),
-                lineWidth: 0.9
-            )
-        )
-        .shadow(
-            color: Color.black.opacity(monitor.panelIsDark ? 0.30 : 0.07),
-            radius: 2.5,
-            y: 1.2
-        )
+        squircleCardBackground
     }
 
     static var forceGlassFallback: Bool {
@@ -3400,12 +3608,12 @@ struct DynamicIslandView: View {
         // 原生玻璃已在下层折射；这层只保留皮肤色感，不能再盖成不透明实色。
         switch monitor.skin {
         case .glass:
-            // 展开态适度保留雾面托底，避免浅色高对比桌面文字穿透串行。
+            // 压薄色罩，把折射留给底层原生 NSGlassEffectView，让外层玻璃与内层卡片形成真实明度分层
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(usesHighTransmissionGlass ? 0.08 : 0.10)
-                : Color(hex: "F5F9FF").opacity(usesHighTransmissionGlass ? 0.16 : 0.06)
+                ? Color(hex: "0C1424").opacity(usesHighTransmissionGlass ? 0.04 : 0.08)
+                : Color(hex: "EDF4FF").opacity(usesHighTransmissionGlass ? 0.04 : 0.05)
         case .obsidian:
-            return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
+            return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.78 : 0.88)
         case .ceramic:
             return monitor.panelIsDark
                 ? Color(hex: "2A2620").opacity(0.74)
@@ -3425,8 +3633,8 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: usesHighTransmissionGlass ? 0.18 : 0.30)
-                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: usesHighTransmissionGlass ? 0.24 : 0.22)
+                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: usesHighTransmissionGlass ? 0.12 : 0.24)
+                : NSColor(srgbRed: 0.820, green: 0.895, blue: 0.995, alpha: usesHighTransmissionGlass ? 0.08 : 0.14)
         case .obsidian:
             return NSColor(srgbRed: 0.020, green: 0.020, blue: 0.024, alpha: 0.55)
         case .ceramic:
@@ -3436,13 +3644,13 @@ struct DynamicIslandView: View {
         }
     }
 
-    // Dynamic Typography Colors
+    // Dynamic Typography Colors（一二级拉开明度层次，同时保持 WCAG ≥4.5:1）
     var primaryTextColor: Color {
         monitor.panelIsDark ? Color.white : Color(hex: "000000")
     }
     
     var secondaryTextColor: Color {
-        monitor.panelIsDark ? Color(hex: "E5E5EA") : Color(hex: "1C1C1E")
+        monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "48484A")
     }
 
     /// 正文用强调色（浅色模式下压暗，保证 ≥4.5:1；不靠 opacity 调淡）
@@ -3818,6 +4026,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                         self.evaluateHover(at: hotPoint)
                         self.appendSnapshotLog(dir: dir, line: "hover_selftest=\(self.monitor.currentMode)")
+                        if case .compact = self.monitor.currentMode {
+                            self.monitor.setMode(.expanded)
+                        }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                             self.exportPanelPNG(to: dir + "/expanded.png")
                             self.monitor.showTopology = true
