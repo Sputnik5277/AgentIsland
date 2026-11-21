@@ -8,6 +8,9 @@ APP_NAME="AgentIsland"
 APP_BUNDLE="${APP_NAME}.app"
 OUTPUT_DIR="dist"
 
+echo "==> Running App.swift static hygiene gate..."
+python3 scripts/gate_app_hygiene.py
+
 echo "==> Building ${APP_NAME} binary..."
 swiftc -O Sources/AgentIsland/App.swift -o "${APP_NAME}Bin"
 
