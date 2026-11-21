@@ -245,7 +245,68 @@ enum PanelSectionKey: String, CaseIterable, Identifiable {
         }
     }
     static let defaultOrder: [String] = allCases.map { $0.rawValue }
-    static let defaults: [String: Bool] = Dictionary(uniqueKeysWithValues: allCases.map { ($0.rawValue, true) })
+    static let defaults: [String: Bool] = Dictionary(uniqueKeysWithValues: allCases.map { ($0.rawValue, $0 != .overview) })
+}
+
+struct PingloopDeltaState: Equatable {
+    var loaded: Bool = false
+    var isStale: Bool = true
+    var healthAgeMin: Int = 0
+    var verdict: String = "PASS"
+    var confirm: Int = 0
+    var confirmDelta: Int? = nil
+    var zombie: Int = 0
+    var todayConfirmed: Int = 0
+    var confirmMatrixText: String = ""
+    var velocityText: String = ""
+    var almaLoaded: Bool = false
+    var almaAgeText: String = "待命"
+    var almaCount: Int = 0
+    var convTotal: Int = 0
+    var convConfirmed: Int = 0
+    var convMeanRounds: Double = 0
+    var convFirstPassPct: Double = 0
+
+    var confirmDeltaText: String {
+        guard let d = confirmDelta else { return "" }
+        if d > 0 { return "(+\(d))" }
+        if d < 0 { return "(\(d))" }
+        return "(±0)"
+    }
+
+    var verifierSummary: String {
+        if convTotal == 0 {
+            return "A级: 观察态(待试点)"
+        }
+        return "A级: \(convConfirmed)单·\(String(format: "%.1f", convMeanRounds))轮·\(Int(convFirstPassPct.rounded()))%"
+    }
+
+    var verifierShortBadge: String {
+        convTotal == 0 ? "观察态" : "\(Int(convFirstPassPct.rounded()))%"
+    }
+
+    func fullTooltip(tokenTotal: String, cacheRate: String) -> String {
+        var lines: [String] = []
+        if loaded {
+            lines.append("体检快照：\(verdict) · \(healthAgeMin) 分钟前\(isStale ? "（已超 30m 陈旧）" : "")")
+        } else {
+            lines.append("体检快照：未加载（M4）")
+        }
+        if !confirmMatrixText.isEmpty {
+            lines.append("待确认矩阵：\n\(confirmMatrixText)")
+        }
+        if !velocityText.isEmpty {
+            lines.append("每日 confirm：\(velocityText)")
+        }
+        if convTotal > 0 {
+            lines.append("M6 A级收敛：\(convConfirmed)/\(convTotal) 单 · 平均 \(String(format: "%.2f", convMeanRounds)) 轮 · 一次率 \(Int(convFirstPassPct.rounded()))%")
+        } else {
+            lines.append("M6 A级收敛：观察态（暂无 enforce 样本）")
+        }
+        lines.append("Alma 后台：\(almaAgeText)（累计 \(almaCount) 项）")
+        lines.append("本月用量：\(tokenTotal) · 缓存率 \(cacheRate)")
+        return lines.joined(separator: "\n")
+    }
 }
 
 struct WakeWorkerState: Equatable {
@@ -326,6 +387,7 @@ class AgentMonitor: ObservableObject {
     @Published var lastCommRoute: String = ""
     /// AGY 后台无头唤醒实时态（监听父目录 ~/.config/alma/state/，抗 os.replace inode 替换）
     @Published var wakeState: WakeWorkerState = WakeWorkerState()
+    @Published var deltaState: PingloopDeltaState = PingloopDeltaState()
     private var wakeDirFD: CInt = -1
     private var wakeDirSource: DispatchSourceFileSystemObject?
     private var wakeLastStatKey: String = ""
@@ -405,29 +467,62 @@ class AgentMonitor: ObservableObject {
 
     var totalUnread: Int { agyPending + almaPending + pingPending }
 
+    private static let todayDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        return f
+    }()
+
+    var todayDatePrefix: String {
+        Self.todayDateFormatter.string(from: Date())
+    }
+
+    func todayCount(for key: String) -> Int {
+        let prefix = todayDatePrefix
+        let arr: [TaskItem]
+        switch key {
+        case "agy": arr = agyTasks
+        case "alma": arr = almaTasks
+        case "ping": arr = pingTasks
+        default: return 0
+        }
+        return arr.filter { $0.date.hasPrefix(prefix) }.count
+    }
+
+    var todayUnreadLeaders: [(AgentIdentity, Int)] {
+        AgentRoster.all
+            .map { ($0, todayCount(for: $0.key)) }
+            .filter { $0.1 > 0 }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    var totalTodayUnread: Int {
+        todayCount(for: "agy") + todayCount(for: "alma") + todayCount(for: "ping")
+    }
+
     var compactHeadText: String {
         if dataUnknown { return "数据未知" }
         if fusedCount > 0 { return "M1 熔断 \(fusedCount) 项" }
         if totalSubmitted > 0 { return "\(totalSubmitted) 件待你验收" }
-        if let lead = unreadLeaders.first { return "\(lead.0.short) \(lead.1) 件未读" }
-        return "全员已读"
+        if totalTodayUnread > 0 { return "今日新单 \(totalTodayUnread) 件" }
+        return "今日清零"
     }
 
     var compactTailText: String {
         if dataUnknown { return "· 收件箱读取失败" }
         if fusedCount > 0 { return "· 待露露终裁" }
         if totalSubmitted > 0 {
-            let unread = unreadLeaders.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
-            if !unread.isEmpty { return "· 未读 \(unread)" }
+            let unread = todayUnreadLeaders.map { "\($0.0.short) +\($0.1)" }.joined(separator: " · ")
+            if !unread.isEmpty { return "· 今日 \(unread)" }
             let names = Set(pendingConfirms.compactMap { AgentRoster.identity(for: $0.from.lowercased())?.short })
             let joined = names.isEmpty ? "Agent" : names.sorted().joined(separator: " / ")
             return "· 来自 \(joined)"
         }
-        let others = unreadLeaders.dropFirst()
-        if !others.isEmpty {
-            return "· " + others.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
+        if totalTodayUnread > 0 {
+            return "· " + todayUnreadLeaders.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
         }
-        return totalUnread > 0 ? "" : "· 0 待办"
+        return totalUnread > 0 ? "· 存量 \(totalUnread)" : "· 0 待办"
     }
 
     var preferredCompactWidth: CGFloat {
@@ -457,16 +552,16 @@ class AgentMonitor: ObservableObject {
 
         // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
-        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 28 }
+        if enabledSections[PanelSectionKey.overview.rawValue] ?? (PanelSectionKey.defaults[PanelSectionKey.overview.rawValue] ?? false) { h += 28 }
         if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 36 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
-            h += pendingConfirms.isEmpty ? 64 : 108
+            h += pendingConfirms.isEmpty ? 68 : 108
         }
         if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 52 }
         if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 50 }
         if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 32 }
         let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
-            partial + ((enabledSections[key.rawValue] ?? true) ? 1 : 0)
+            partial + ((enabledSections[key.rawValue] ?? (PanelSectionKey.defaults[key.rawValue] ?? true)) ? 1 : 0)
         }
         let gaps = CGFloat(enabledSectionCount) * 16
         let verticalPadding: CGFloat = 12 + 14
@@ -608,15 +703,39 @@ class AgentMonitor: ObservableObject {
         src.resume()
     }
 
+    private static let healthTSFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        return f
+    }()
+
+    private static let shortDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        return f
+    }()
+
     func reloadWakeState(force: Bool) {
+        let env = ProcessInfo.processInfo.environment
         let snapURL = wakeStateDirURL.appendingPathComponent("island-wake-state.json")
         let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
+        let healthURL = env["AGENT_ISLAND_HEALTH_STATE"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            ?? wakeStateDirURL.appendingPathComponent("pingloop-health.json")
+        let convURL = env["AGENT_ISLAND_CONVERGENCE_LOG"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            ?? wakeStateDirURL.appendingPathComponent("pingloop-convergence.jsonl")
+        let almaURL = wakeStateDirURL.appendingPathComponent("alma-turn.json")
+
         let fm = FileManager.default
-        let snapAttr = try? fm.attributesOfItem(atPath: snapURL.path)
+        func fileStat(_ url: URL) -> String {
+            let attr = try? fm.attributesOfItem(atPath: url.path)
+            let mt = (attr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let sz = (attr?[.size] as? NSNumber)?.int64Value ?? 0
+            return "\(mt):\(sz)"
+        }
         let pauseExists = fm.fileExists(atPath: pauseURL.path)
-        let mtime = (snapAttr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let fsize = (snapAttr?[.size] as? NSNumber)?.int64Value ?? 0
-        let statKey = "\(mtime)|\(fsize)|\(pauseExists)"
+        let statKey = "\(fileStat(snapURL))|\(pauseExists)|\(fileStat(healthURL))|\(fileStat(convURL))|\(fileStat(almaURL))"
         if !force && statKey == wakeLastStatKey { return }
         wakeLastStatKey = statKey
 
@@ -635,9 +754,107 @@ class AgentMonitor: ObservableObject {
             next.elapsedS = (agy["elapsed_s"] as? Double) ?? 0
             next.loaded = true
         }
+
+        // M4/M5/M6 真实 Δ 与双后台/Verifier 只读快照解析（0 新增轮询）
+        var nextDelta = PingloopDeltaState()
+        let nowDate = Date()
+        let todayMMdd = Self.shortDayFormatter.string(from: nowDate)
+
+        if let hData = try? Data(contentsOf: healthURL),
+           let hRoot = try? JSONSerialization.jsonObject(with: hData) as? [String: Any] {
+            nextDelta.loaded = true
+            nextDelta.verdict = (hRoot["verdict"] as? String) ?? "PASS"
+            nextDelta.confirm = (hRoot["confirm"] as? Int) ?? 0
+            nextDelta.zombie = (hRoot["zombie"] as? Int) ?? 0
+            if let dMap = hRoot["delta"] as? [String: Any] {
+                nextDelta.confirmDelta = dMap["confirm"] as? Int
+            }
+            if let vel = hRoot["velocity"] as? [String: Any] {
+                nextDelta.todayConfirmed = (vel[todayMMdd] as? Int) ?? 0
+                let vParts = vel.keys.sorted().suffix(4).map { k in
+                    "\(k):\(vel[k] as? Int ?? 0)"
+                }
+                nextDelta.velocityText = vParts.joined(separator: " / ")
+            }
+            if let mat = hRoot["confirm_matrix"] as? [String: [String: Any]] {
+                let mLines = mat.sorted { ($0.value["n"] as? Int ?? 0) > ($1.value["n"] as? Int ?? 0) }
+                    .map { (k, v) in
+                        let n = v["n"] as? Int ?? 0
+                        let med = v["median_h"] as? Double ?? 0
+                        return "  \(k): \(n)条 (中位 \(String(format: "%.1f", med))h)"
+                    }
+                nextDelta.confirmMatrixText = mLines.joined(separator: "\n")
+            }
+            let hTime: Date = {
+                if let tsStr = hRoot["ts"] as? String, let parsed = Self.healthTSFormatter.date(from: tsStr) {
+                    return parsed
+                }
+                let attr = try? fm.attributesOfItem(atPath: healthURL.path)
+                return (attr?[.modificationDate] as? Date) ?? Date.distantPast
+            }()
+            let ageSec = max(0, nowDate.timeIntervalSince(hTime))
+            nextDelta.healthAgeMin = Int((ageSec / 60.0).rounded())
+            nextDelta.isStale = ageSec > 1800
+        }
+
+        if let aData = try? Data(contentsOf: almaURL),
+           let aRoot = try? JSONSerialization.jsonObject(with: aData) as? [String: Any] {
+            nextDelta.almaLoaded = true
+            nextDelta.almaCount = aRoot.count
+            var maxTs: Double = 0
+            for val in aRoot.values {
+                if let item = val as? [String: Any], let ts = item["ts"] as? Double, ts > maxTs {
+                    maxTs = ts
+                }
+            }
+            if maxTs > 0 {
+                let ageSec = max(0, Int(nowDate.timeIntervalSince1970 - maxTs))
+                if ageSec < 60 {
+                    nextDelta.almaAgeText = "刚刚"
+                } else if ageSec < 3600 {
+                    nextDelta.almaAgeText = "\(ageSec / 60)m前"
+                } else if ageSec < 86400 {
+                    nextDelta.almaAgeText = "\(ageSec / 3600)h前"
+                } else {
+                    nextDelta.almaAgeText = "待命"
+                }
+            } else {
+                nextDelta.almaAgeText = "待命"
+            }
+        }
+
+        if let cData = try? Data(contentsOf: convURL),
+           let cText = String(data: cData, encoding: .utf8) {
+            var allRows: [[String: Any]] = []
+            for rawLine in cText.split(separator: "\n") {
+                let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                if let obj = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) as? [String: Any] {
+                    allRows.append(obj)
+                }
+            }
+            let enforceRows = allRows.filter { ($0["mode"] as? String) == "enforce" }
+            let metricRows = enforceRows.isEmpty ? allRows : enforceRows
+            if !metricRows.isEmpty {
+                nextDelta.convTotal = metricRows.count
+                let passRows = metricRows.filter {
+                    let oc = ($0["outcome"] as? String) ?? ""
+                    return oc == "confirmed" || oc == "observe_pass"
+                }
+                nextDelta.convConfirmed = passRows.count
+                let roundSum = metricRows.reduce(0) { $0 + (($1["rounds_to_converge"] as? Int) ?? 1) }
+                nextDelta.convMeanRounds = Double(roundSum) / Double(metricRows.count)
+                let firstPass = passRows.filter { (($0["rounds_to_converge"] as? Int) ?? 0) == 1 }.count
+                nextDelta.convFirstPassPct = Double(firstPass) * 100.0 / Double(metricRows.count)
+            }
+        }
+
         DispatchQueue.main.async {
             if self.wakeState != next {
                 self.wakeState = next
+            }
+            if self.deltaState != nextDelta {
+                self.deltaState = nextDelta
             }
         }
     }
@@ -762,10 +979,14 @@ class AgentMonitor: ObservableObject {
         isDarkMode || skin == .obsidian
     }
 
+    func isSectionEnabled(_ key: String) -> Bool {
+        enabledSections[key] ?? (PanelSectionKey.defaults[key] ?? true)
+    }
+
     func toggleSection(_ key: String) {
         DispatchQueue.main.async {
             guard PanelSectionKey(rawValue: key) != nil else { return }
-            self.enabledSections[key] = !(self.enabledSections[key] ?? true)
+            self.enabledSections[key] = !self.isSectionEnabled(key)
             self.preferences?.set(self.enabledSections, forKey: "agent_island_sections")
             self.onLayoutChange?()
         }
@@ -975,6 +1196,7 @@ class AgentMonitor: ObservableObject {
             }
             
             let snapshot = self.fetchInboxesJSON()
+            self.reloadWakeState(force: true)
             let dataOK = snapshot != nil
             let data = snapshot ?? [:]
             let fOnline = self.checkPort(host: "127.0.0.1", port: 8081)
@@ -1813,19 +2035,19 @@ struct DynamicIslandView: View {
            let agent = AgentRoster.identity(for: from.lowercased()) {
             return agent.color
         }
-        if let lead = monitor.unreadLeaders.first { return lead.0.color }
+        if let lead = monitor.todayUnreadLeaders.first { return lead.0.color }
         return Color(hex: "10B981")
     }
 
     var compactIsAlert: Bool {
-        monitor.dataUnknown || monitor.fusedCount > 0 || monitor.totalSubmitted > 0 || monitor.totalUnread > 0
+        monitor.dataUnknown || monitor.fusedCount > 0 || monitor.totalSubmitted > 0 || monitor.totalTodayUnread > 0
     }
 
     var compactGlyphName: String {
         if monitor.dataUnknown { return "questionmark" }
         if monitor.fusedCount > 0 { return "exclamationmark" }
         if monitor.totalSubmitted > 0 { return "bell.fill" }
-        if monitor.totalUnread > 0 { return "tray.fill" }
+        if monitor.totalTodayUnread > 0 { return "tray.fill" }
         return "checkmark"
     }
 
@@ -1962,9 +2184,9 @@ struct DynamicIslandView: View {
             } else if monitor.showSettings {
                 settingsView
             } else {
-                // 模块可单独开关、可拖动排序：先总览，再验收，再三箱，再通道，最后资产
+                // 模块可单独开关、可拖动排序：先后台条，再 M6 飞轮，再三箱，再通道，最后资产
                 ForEach(monitor.sectionOrder, id: \.self) { key in
-                    if monitor.enabledSections[key] ?? true {
+                    if monitor.isSectionEnabled(key) {
                         panelSectionView(key)
                     }
                 }
@@ -2054,9 +2276,10 @@ struct DynamicIslandView: View {
         .background(squircleCardBackground)
     }
 
-    /// 后台自动唤醒控制条（34pt · 3 块极简布局 · 全 ≥11pt · 监听目录防 os.replace 失效）
+    /// 双后台唤醒 + A-Verifier 状态控制条（36pt · 全 ≥11pt · 零新增轮询）
     var wakeWorkerStrip: some View {
         let ws = monitor.wakeState
+        let ds = monitor.deltaState
         let st = ws.effectiveStatus
         let statusColor: Color = {
             switch st {
@@ -2078,37 +2301,34 @@ struct DynamicIslandView: View {
         let barColor: Color = ws.tokenRatio >= 0.8 ? Color(hex: "F59E0B") : statusColor
         let pulseActive = (st == "running" || st == "fused-m1")
 
-        return HStack(spacing: 8) {
-            // ① 左段：状态呼吸灯 + 身份 + 状态词
+        return HStack(spacing: 6) {
+            // ① 左段：AGY 状态 + 预算进度条
             HStack(spacing: 5) {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 7, height: 7)
                     .opacity(pulseActive ? (monitor.pulse ? 1.0 : 0.45) : 1.0)
-                Text("AGY后台")
+                Text("AGY")
                     .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(primaryTextColor)
                 Text(statusLabel)
                     .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(statusColor)
             }
-            .padding(.horizontal, 7).padding(.vertical, 3)
+            .padding(.horizontal, 6).padding(.vertical, 3)
             .background(Capsule().fill(statusColor.opacity(0.12)))
 
-            Spacer(minLength: 4)
-
-            // ② 中段：今日次数 + 44×5pt 预算条 + 百分比（详情放 hover tooltip，保持一瞥性）
-            HStack(spacing: 6) {
-                Text("\(ws.dailyRuns)/\(ws.dailyRunsLimit)次")
+            HStack(spacing: 4) {
+                Text("\(ws.dailyRuns)/\(ws.dailyRunsLimit)")
                     .font(.system(size: fs(12), weight: .semibold, design: .monospaced))
                     .foregroundColor(primaryTextColor)
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(monitor.panelIsDark ? Color.white.opacity(0.18) : Color.black.opacity(0.14))
-                        .frame(width: 48, height: 6)
+                        .frame(width: 36, height: 6)
                     Capsule()
                         .fill(barColor)
-                        .frame(width: max(4, (48 * ws.tokenRatio).rounded()), height: 6)
+                        .frame(width: max(4, (36 * ws.tokenRatio).rounded()), height: 6)
                 }
                 Text("\(ws.tokenPct)%")
                     .font(.system(size: fs(12), weight: .bold, design: .monospaced))
@@ -2118,7 +2338,26 @@ struct DynamicIslandView: View {
 
             Spacer(minLength: 4)
 
-            // ③ 右段：一键暂停 / 恢复可控胶囊（高对比可点样式）
+            // ② 中段：Alma 后台 + A-Verifier 态
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(ds.almaLoaded ? Color(hex: "FF9F0A") : secondaryTextColor.opacity(0.45))
+                    .frame(width: 6, height: 6)
+                Text("Alma \(ds.almaAgeText)")
+                    .font(.system(size: fs(12), weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+                Text("·")
+                    .font(.system(size: fs(12), weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+                Text("A级 \(ds.verifierShortBadge)")
+                    .font(.system(size: fs(12), weight: .bold))
+                    .foregroundColor(ds.convTotal > 0 ? textGreen : accentTextColor)
+            }
+            .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            // ③ 右段：一键暂停 / 恢复可控胶囊
             Button(action: { monitor.toggleAgyWakePaused() }) {
                 HStack(spacing: 3) {
                     Image(systemName: ws.paused ? "play.fill" : "pause.fill")
@@ -2127,7 +2366,7 @@ struct DynamicIslandView: View {
                         .font(.system(size: fs(12), weight: .bold))
                 }
                 .foregroundColor(ws.paused ? (monitor.panelIsDark ? Color(hex: "34D399") : Color(hex: "047857")) : primaryTextColor)
-                .padding(.horizontal, 9).padding(.vertical, 4)
+                .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(
                     Capsule()
                         .fill(ws.paused
@@ -2151,20 +2390,25 @@ struct DynamicIslandView: View {
         .background(squircleCardBackground)
     }
 
-    /// 三个固定色收件箱卡（颜色在任何页面都不变）
+    /// 三个固定色收件箱卡（区分今日新单与历史存量，消除数字焦虑）
     var inboxCardsRow: some View {
         HStack(spacing: 10) {
             ForEach(AgentRoster.all) { agent in
                 let count = monitor.pendingCount(for: agent.key)
+                let tCount = monitor.todayCount(for: agent.key)
+                let sub: String = {
+                    if monitor.dataUnknown { return "读取失败 · 未知" }
+                    if count == 0 { return "收件箱已读" }
+                    if tCount > 0 { return "今日 +\(tCount) · 存量 \(count)" }
+                    return "今日已清 · 存量 \(count)"
+                }()
                 agentBalanceCard(
                     icon: agent.symbol,
                     iconBg: agent.color,
-                    textTint: agentTextColor(agent),
+                    textTint: tCount > 0 ? agentTextColor(agent) : secondaryTextColor,
                     title: agent.title,
-                    subtitle: monitor.dataUnknown
-                        ? "读取失败 · 未知"
-                        : (count == 0 ? "收件箱已读" : "收件箱 \(count) 件未读"),
-                    hasPending: !monitor.dataUnknown && count > 0
+                    subtitle: sub,
+                    hasPending: !monitor.dataUnknown && tCount > 0
                 ) {
                     monitor.setDrawerAgent(agent.key)
                 }
@@ -2546,7 +2790,7 @@ struct DynamicIslandView: View {
 
     func sectionSettingsRow(_ key: String) -> some View {
         let section = PanelSectionKey(rawValue: key)
-        let enabled = monitor.enabledSections[key] ?? true
+        let enabled = monitor.isSectionEnabled(key)
         return HStack(spacing: 7) {
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: fs(12), weight: .bold))
@@ -3131,55 +3375,56 @@ struct DynamicIslandView: View {
         }
     }
 
-    // 全员就绪态 Hero 卡片 (AgentIsland & Autoloop 中台运行就绪)
+    // M6 飞轮真实 Δ 仪表卡（直读 pingloop-health.json 与 pingloop-convergence.jsonl）
     @ViewBuilder
     var autoloopReadyHeroCardView: some View {
+        let ds = monitor.deltaState
+        let healthFresh = ds.loaded && !ds.isStale
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color(hex: "059669").opacity(monitor.panelIsDark ? 0.20 : 0.12))
+                    .fill((healthFresh ? Color(hex: "059669") : Color(hex: "D97706")).opacity(monitor.panelIsDark ? 0.20 : 0.12))
                     .frame(width: 34, height: 34)
-                Image(systemName: "checkmark.shield.fill")
+                Image(systemName: healthFresh ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
                     .font(.system(size: fs(16), weight: .bold))
-                    .foregroundColor(textGreen)
+                    .foregroundColor(healthFresh ? textGreen : textAmber)
             }
             
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     Text(totalPending == 0 ? "全网架构就绪 · 0 积压待办" : "全网链路就绪 · 0 待你验收")
                         .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                     Text("•")
                         .foregroundColor(secondaryTextColor)
-                    Text("Funnel 443 专线直达")
+                    Text(healthFresh ? "体检 \(ds.verdict)" : (ds.loaded ? "快照陈旧(\(ds.healthAgeMin)m)" : "快照待刷新"))
                         .font(.system(size: fs(13), weight: .semibold))
-                        .foregroundColor(textGreen)
+                        .foregroundColor(healthFresh ? textGreen : textAmber)
                 }
+                .lineLimit(1)
                 
-                HStack(spacing: 6) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "circle.hexagongrid.fill")
+                HStack(spacing: 5) {
+                    if !ds.loaded || ds.isStale {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .font(.system(size: fs(12), weight: .semibold))
+                            .foregroundColor(textAmber)
+                        Text(ds.loaded ? "健康快照超 30m（M4）· \(ds.verifierSummary)" : "健康快照未就绪（M4）· \(ds.verifierSummary)")
+                            .font(.system(size: fs(12), weight: .semibold))
+                            .foregroundColor(textAmber)
+                            .lineLimit(1)
+                    } else {
+                        Image(systemName: "chart.line.uptrend.xyaxis")
                             .font(.system(size: fs(12), weight: .semibold))
                             .foregroundColor(accentTextColor)
-                        Text(monitor.tokenTotal)
-                            .font(.system(size: fs(13), weight: .bold))
-                            .foregroundColor(primaryTextColor)
-                    }
-                    Text("·")
-                        .font(.system(size: fs(12), weight: .semibold))
-                        .foregroundColor(secondaryTextColor)
-                    HStack(spacing: 3) {
-                        Image(systemName: "bolt.fill")
-                            .font(.system(size: fs(12), weight: .semibold))
-                            .foregroundColor(textGreen)
-                        Text("缓存率 \(monitor.tokenCacheRate)")
+                        Text("核销 +\(ds.todayConfirmed) · 待验 \(ds.confirm)\(ds.confirmDeltaText) · 僵尸 \(ds.zombie) · \(ds.verifierSummary)")
                             .font(.system(size: fs(12), weight: .semibold))
                             .foregroundColor(secondaryTextColor)
+                            .lineLimit(1)
                     }
                 }
             }
             
-            Spacer()
+            Spacer(minLength: 4)
             
             Button(action: {
                 monitor.triggerVerifyAndReconcile()
@@ -3201,14 +3446,15 @@ struct DynamicIslandView: View {
             .buttonStyle(PressableScaleButtonStyle())
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 2)
+        .padding(.vertical, 6)
         .background(squircleCardBackground)
+        .help(ds.fullTooltip(tokenTotal: monitor.tokenTotal, cacheRate: monitor.tokenCacheRate))
     }
 
     // 横向三等分 Agent 平衡卡片 (3 Balanced Cards)
     func agentBalanceCard(icon: String, iconBg: Color, textTint: Color, title: String, subtitle: String, hasPending: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     ZStack {
                         Circle()
@@ -3229,11 +3475,12 @@ struct DynamicIslandView: View {
                     }
                 }
                 Text(subtitle)
-                    .font(.system(size: fs(13), weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(hasPending ? textTint : secondaryTextColor)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 0)
+            .padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(squircleCardBackground)
         }

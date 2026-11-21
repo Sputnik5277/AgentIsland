@@ -49,6 +49,7 @@ def check_app_swift(path: Path) -> dict:
         "PIPE_STDERR_UNREAD": 0,
         "SCALE_EFFECT_ON_PANEL": 0,
         "FONT_SUB_HIG_OR_ROUNDED": 0,
+        "V4_DELTA_SNAPSHOT_CONTRACT": 0,
     }
 
     def add_finding(rule: str, line_no: int, snippet: str) -> None:
@@ -93,6 +94,18 @@ def check_app_swift(path: Path) -> dict:
             add_finding("SCALE_EFFECT_ON_PANEL", idx, raw_lines[idx - 1])
         if re_rounded.search(code) or re_sub_11.search(code) or re_min_scale.search(code):
             add_finding("FONT_SUB_HIG_OR_ROUNDED", idx, raw_lines[idx - 1])
+
+    # Rule 5: V4_DELTA_SNAPSHOT_CONTRACT (M4/M5/M6 snapshot consumption + freshness guard)
+    joined_code = "\n".join(code_lines)
+    required_anchors = [
+        ('"pingloop-health.json"', "missing pingloop-health.json M6 snapshot reader"),
+        ('"pingloop-convergence.jsonl"', "missing pingloop-convergence.jsonl M6 reader"),
+        ('"alma-turn.json"', "missing alma-turn.json M5 dual-backend reader"),
+        ("isStale", "missing M4 snapshot freshness guard (isStale)"),
+    ]
+    for token, desc in required_anchors:
+        if token not in joined_code:
+            add_finding("V4_DELTA_SNAPSHOT_CONTRACT", 1, desc)
 
     verdict = "PASS" if not findings else "FAIL"
     return {
