@@ -311,6 +311,7 @@ class AgentMonitor: ObservableObject {
     /// 最近 15 秒仍有真实通讯的链路；无通讯时为空，视图不绘制任何脉冲
     @Published var activePulses: [AgentCommPulse] = []
     @Published var lastCommAt: Date? = nil
+    @Published var lastCommRoute: String = ""
     /// AGY 后台无头唤醒实时态（监听父目录 ~/.config/alma/state/，抗 os.replace inode 替换）
     @Published var wakeState: WakeWorkerState = WakeWorkerState()
     private var wakeDirFD: CInt = -1
@@ -837,6 +838,17 @@ class AgentMonitor: ObservableObject {
             let now = Date()
             let cutoff = now.addingTimeInterval(-15)
             var hits: [(String, String, Date)] = []
+            var latestOverall: (from: String, to: String, when: Date)? = nil
+
+            func considerOverall(_ from: String, _ to: String, _ when: Date) {
+                if let cur = latestOverall {
+                    if when > cur.when {
+                        latestOverall = (from, to, when)
+                    }
+                } else {
+                    latestOverall = (from, to, when)
+                }
+            }
 
             // 主源：Funnel 443 写入事件（只认 PUT，不认 HEARTBEAT）
             if let data = FileManager.default.contents(atPath: Self.eventLog),
@@ -848,18 +860,21 @@ class AgentMonitor: ObservableObject {
                           let path = d["path"] as? String,
                           path.hasPrefix("handoffs/"),
                           let raw = d["time"] as? String,
-                          let when = self.parseEventTime(raw),
-                          when >= cutoff else { continue }
+                          let when = self.parseEventTime(raw) else { continue }
                     let url = URL(fileURLWithPath: Self.multiRoot).appendingPathComponent(path)
                     if let (from, to) = self.handoffEndpoints(at: url) {
-                        hits.append((from, to, when))
+                        considerOverall(from, to, when)
+                        if when >= cutoff {
+                            hits.append((from, to, when))
+                        }
                     }
                 }
             }
 
-            // 兜底：events.log 静默时，用 handoff 文件 mtime（15 秒窗口）
-            if hits.isEmpty {
+            // 兜底与全局最近一笔通讯：扫描三箱按 mtime 降序前 8 条非路由文件
+            if !self.rootPath.isEmpty {
                 let fm = FileManager.default
+                let wasHitsEmpty = hits.isEmpty
                 for box in AgentRoster.all.map({ $0.key }) {
                     let dir = URL(fileURLWithPath: self.rootPath).appendingPathComponent(box)
                     guard let files = try? fm.contentsOfDirectory(
@@ -867,10 +882,21 @@ class AgentMonitor: ObservableObject {
                         includingPropertiesForKeys: [.contentModificationDateKey],
                         options: [.skipsHiddenFiles]
                     ) else { continue }
-                    for url in files where ["md", "txt"].contains(url.pathExtension.lowercased()) {
+                    let candidates: [(URL, Date)] = files.compactMap { url in
+                        let ext = url.pathExtension.lowercased()
+                        let name = url.lastPathComponent
+                        guard ext == "md" || ext == "txt" else { return nil }
+                        guard !name.hasPrefix("pingloop-route-"), !name.hasPrefix("cancel-") else { return nil }
                         let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                        guard mtime >= cutoff, let (from, to) = self.handoffEndpoints(at: url) else { continue }
-                        hits.append((from, to, mtime))
+                        return (url, mtime)
+                    }.sorted { $0.1 > $1.1 }
+
+                    for (url, mtime) in candidates.prefix(8) {
+                        guard let (from, to) = self.handoffEndpoints(at: url) else { continue }
+                        considerOverall(from, to, mtime)
+                        if wasHitsEmpty && mtime >= cutoff {
+                            hits.append((from, to, mtime))
+                        }
                     }
                 }
             }
@@ -894,11 +920,22 @@ class AgentMonitor: ObservableObject {
                 if a != b { return a < b }
                 return (order[$0.target] ?? 99) < (order[$1.target] ?? 99)
             }
-            let lastAt = pulses.map { $0.lastAt }.max()
+            let finalLastAt = pulses.map { $0.lastAt }.max() ?? latestOverall?.when
+            var finalRoute = ""
+            if let top = pulses.first {
+                let s = AgentRoster.identity(for: top.source)?.short ?? top.source.uppercased()
+                let t = AgentRoster.identity(for: top.target)?.short ?? top.target.uppercased()
+                finalRoute = "\(s) → \(t)"
+            } else if let ov = latestOverall {
+                let s = AgentRoster.identity(for: ov.from)?.short ?? ov.from.uppercased()
+                let t = AgentRoster.identity(for: ov.to)?.short ?? ov.to.uppercased()
+                finalRoute = "\(s) → \(t)"
+            }
 
             DispatchQueue.main.async {
                 self.activePulses = pulses
-                self.lastCommAt = lastAt
+                self.lastCommAt = finalLastAt
+                self.lastCommRoute = finalRoute
             }
         }
     }
@@ -1196,19 +1233,58 @@ ROOT = handoff.HANDOFFS_ROOT
 
 
 
+TERMINAL_STATUSES = ('已完成', '作废', '已关闭', '已核销', '参考', '已结案', '已确认', '已办', '已回复', '已交付', '已结算')
+
+def clean_title(t):
+    t = re.sub(r'(\\*\\*|__|`)', '', str(t or ''))
+    return re.sub(r'\\s+', ' ', t).strip()
+
 all_acked_bases = set()
+closed_traces = set()
+closed_files = set()
 for b in boxes + ['lulu']:
     for k in handoff.load_ack(b).keys():
+        closed_files.add(k)
+        closed_files.add(Path(k).stem)
         b_stem = k.replace('.md', '').split('-reply')[0].split('-audit')[0].split('-submit')[0]
         all_acked_bases.add(b_stem)
 
-# Phase 1: Global reply index across all boxes (prevents cross-box blindspots)
+# Phase 1: Global reply & closed index across all boxes (prevents cross-box blindspots)
 global_replied = set()
 for b in boxes:
     b_dir = ROOT / b
     if not b_dir.is_dir(): continue
+    acked_b = handoff.load_ack(b)
     for p in b_dir.iterdir():
         if not p.is_file() or handoff.is_ignored_file(p): continue
+        try:
+            txt = p.read_text(encoding='utf-8', errors='replace')
+            meta, _ = handoff.parse_frontmatter(txt)
+        except Exception:
+            txt, meta = '', {}
+        st = str(meta.get('status', '')).strip()
+        tid = str(meta.get('trace_id', '')).strip()
+        is_doc_closed = (
+            any(c in st for c in TERMINAL_STATUSES)
+            or '-confirm' in p.name
+            or p.name in acked_b
+            or '【Step 4' in txt
+        )
+        if is_doc_closed:
+            if tid and tid not in ('none', '-'):
+                closed_traces.add(tid)
+            closed_files.add(p.name)
+            closed_files.add(p.stem)
+            rt = str(meta.get('reply_to', '')).strip()
+            if rt and rt != 'none':
+                closed_files.add(Path(rt).name)
+                closed_files.add(Path(rt).stem)
+            rel = meta.get('related', [])
+            if isinstance(rel, list):
+                for item in rel:
+                    closed_files.add(Path(str(item)).name)
+                    closed_files.add(Path(str(item)).stem)
+
         if handoff.REPLY_RE.search(p.name) or p.name.startswith('cancel-') or '-accept' in p.name or '-confirm' in p.name:
             base = handoff.re.sub(r'-(reply\\d*|accept\\d*|confirm\\d*)\\.md$', '.md', p.name, flags=handoff.re.IGNORECASE)
             base_clean = re.sub(r'-reply\\d*$', '', base.replace('.md', '')) + '.md'
@@ -1216,19 +1292,15 @@ for b in boxes:
             global_replied.add(base_clean)
             global_replied.add(p.stem)
             global_replied.add(p.name)
-            try:
-                meta, _ = handoff.parse_frontmatter(p.read_text(encoding='utf-8', errors='replace'))
-                rt = str(meta.get('reply_to', '')).strip()
-                if rt and rt != 'none':
-                    global_replied.add(Path(rt).name)
-                    global_replied.add(Path(rt).stem)
-                rel = meta.get('related', [])
-                if isinstance(rel, list):
-                    for item in rel:
-                        global_replied.add(Path(str(item)).name)
-                        global_replied.add(Path(str(item)).stem)
-            except Exception:
-                pass
+            rt = str(meta.get('reply_to', '')).strip()
+            if rt and rt != 'none':
+                global_replied.add(Path(rt).name)
+                global_replied.add(Path(rt).stem)
+            rel = meta.get('related', [])
+            if isinstance(rel, list):
+                for item in rel:
+                    global_replied.add(Path(str(item)).name)
+                    global_replied.add(Path(str(item)).stem)
 
 # Phase 2: Per-box pending extraction (Trace ID 强归组模型，露露定版：一个单子一个状态)
 res = {}
@@ -1264,9 +1336,10 @@ for box in boxes:
         base_names = {p.stem.split('-reply')[0].split('-accept')[0].split('-confirm')[0] for p, _, _ in files}
         is_acked = any(k in [p.name for p, _, _ in files] or k.replace('.md', '') in base_names for k in acked_names)
         has_confirm = any('-confirm' in p.name for p, _, _ in files) or any(b in global_replied for b in base_names)
-        has_closed = any(any(c in str(meta.get('status', '')) for c in ('已完成', '作废', '已关闭', '已核销', '参考', '已结案')) for _, meta, _ in files)
+        has_closed = any(any(c in str(meta.get('status', '')) for c in TERMINAL_STATUSES) for _, meta, _ in files)
+        is_cross_closed = (tid in closed_traces) or any(p.name in closed_files or p.stem in closed_files for p, _, _ in files)
 
-        if is_acked or has_confirm or has_closed:
+        if is_acked or has_confirm or has_closed or is_cross_closed:
             continue
 
         files.sort(key=lambda x: x[0].stat().st_mtime, reverse=True)
@@ -1282,6 +1355,9 @@ for box in boxes:
             orig_dispatch = files[-1]
         orig_frm = str(orig_dispatch[1].get('from', '')).strip().lower()
         orig_to = str(orig_dispatch[1].get('to', '')).strip().lower()
+        # 过滤无实名收发头的纯资料/附件文档
+        if not orig_frm and not orig_to:
+            continue
         # 严格责任边界：收件人不是本箱的（如抄送件、外发件），严禁算作本箱待办！
         if orig_to and orig_to != box:
             continue
@@ -1309,7 +1385,7 @@ for box in boxes:
             'from': str(latest_meta.get('from', '未知')),
             'to': str(latest_meta.get('to', box)),
             'date': str(latest_meta.get('date', '-')),
-            'title': handoff.first_heading(latest_body) or latest_p.stem,
+            'title': clean_title(handoff.first_heading(latest_body) or latest_p.stem),
             'mtime': latest_p.stat().st_mtime,
             'stage': stage,
             'statusText': status_text,
@@ -1340,6 +1416,14 @@ for b in boxes:
             if b_stem in all_acked_bases: continue
             acked = handoff.load_ack(to_agent)
             if p.name in acked or b_stem in acked: continue
+            tid = str(meta.get('trace_id', '')).strip()
+            rt = str(meta.get('reply_to', '')).strip()
+            if tid and tid in closed_traces:
+                continue
+            if rt and (Path(rt).name in closed_files or Path(rt).stem in closed_files):
+                continue
+            if p.name in closed_files or b_stem in closed_files:
+                continue
 
             # 凡同目录存在对应 -confirm 结案回执，或原单已结案，严禁混入待验收！
             has_confirm_file = any((b_stem in f.name and '-confirm' in f.name) for f in all_b_files)
@@ -1349,7 +1433,7 @@ for b in boxes:
             if orig_p.is_file():
                 o_txt = orig_p.read_text(encoding='utf-8', errors='replace')
                 o_meta, _ = handoff.parse_frontmatter(o_txt)
-                if any(c in str(o_meta.get('status', '')) for c in ('已完成', '已结案', '已确认', '已核销', '作废')):
+                if any(c in str(o_meta.get('status', '')) for c in TERMINAL_STATUSES):
                     continue
 
             raw_confirms.append({
@@ -1358,7 +1442,7 @@ for b in boxes:
                 'from': str(meta.get('from', '未知')),
                 'to': to_agent,
                 'date': str(meta.get('date', '-')),
-                'title': handoff.first_heading(body) or p.stem,
+                'title': clean_title(handoff.first_heading(body) or p.stem),
                 'mtime': p.stat().st_mtime,
                 'stage': 'submitted',
                 'statusText': '发起方核验中',
@@ -1390,7 +1474,7 @@ for box in boxes:
                 status = str(meta.get('status', '')).strip()
                 if status == '待确认':
                     continue # 关键拦截：待确认单据严禁混入已办结流！
-                title = handoff.first_heading(body) or p.stem
+                title = clean_title(handoff.first_heading(body) or p.stem)
                 done_items.append({
                     'file': p.name,
                     'from': str(meta.get('from', '未知')),
@@ -2149,17 +2233,31 @@ struct DynamicIslandView: View {
     }
 
     var miniRecentCommText: String {
-        guard let p = monitor.activePulses.first else { return "最近通讯：无通讯" }
-        let s = AgentRoster.identity(for: p.source)?.short ?? p.source.uppercased()
-        let t = AgentRoster.identity(for: p.target)?.short ?? p.target.uppercased()
-        let extra = monitor.activePulses.count > 1 ? " · +\(monitor.activePulses.count - 1) 条" : ""
-        return "最近通讯：\(s) → \(t) ×\(p.count)\(extra)"
+        if let p = monitor.activePulses.first {
+            let s = AgentRoster.identity(for: p.source)?.short ?? p.source.uppercased()
+            let t = AgentRoster.identity(for: p.target)?.short ?? p.target.uppercased()
+            let extra = monitor.activePulses.count > 1 ? " · +\(monitor.activePulses.count - 1) 条" : ""
+            return "实时通讯：\(s) → \(t) ×\(p.count)\(extra)"
+        }
+        if !monitor.lastCommRoute.isEmpty {
+            return "最近通讯：\(monitor.lastCommRoute)"
+        }
+        return "最近通讯：暂无记录"
     }
 
     var miniLastCommAgoText: String {
-        guard let lastAt = monitor.lastCommAt else { return "最后通讯：无通讯" }
+        guard let lastAt = monitor.lastCommAt else { return "最后通讯：暂无" }
         let seconds = max(0, Int(Date().timeIntervalSince(lastAt)))
-        return "最后通讯 \(seconds) 秒前"
+        if seconds < 60 {
+            return "最后通讯 \(seconds) 秒前"
+        }
+        if seconds < 3600 {
+            return "最后通讯 \(seconds / 60) 分钟前"
+        }
+        if seconds < 86400 {
+            return "最后通讯 \(seconds / 3600) 小时前"
+        }
+        return "最后通讯 \(seconds / 86400) 天前"
     }
 
     func miniStripChannelTag(text: String, icon: String, ok: Bool, tint: Color) -> some View {
