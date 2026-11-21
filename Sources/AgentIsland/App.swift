@@ -396,24 +396,24 @@ class AgentMonitor: ObservableObject {
             }()
             return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
         }
-        // 内联链路：总览头部 + 迷你条 + 300pt 展开区（含三层通道原文案）
-        if showTopology { return 360 + extra }
+        // 内联链路：总览头部 + 迷你条 + 展开拓扑区（含三层通道原文案）
+        if showTopology { return 420 + extra }
         if showSettings { return 560 + extra }
 
-        // 头部实际行高比旧估值高 8pt；补足后内容不再溢出玻璃底边
+        // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
-        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 16 }
+        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 24 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
-            h += pendingConfirms.isEmpty ? 49 : 92
+            h += pendingConfirms.isEmpty ? 62 : 104
         }
-        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 40 }
-        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 44 }
-        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 18 }
+        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 50 }
+        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 46 }
+        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 30 }
         let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
             partial + ((enabledSections[key.rawValue] ?? true) ? 1 : 0)
         }
-        let gaps = CGFloat(max(0, enabledSectionCount - 1)) * 16
-        let verticalPadding: CGFloat = 10 + 10
+        let gaps = CGFloat(enabledSectionCount) * 16
+        let verticalPadding: CGFloat = 12 + 14
         return max(120, h + gaps + verticalPadding) + extra
     }
     private var timer: Timer?
@@ -445,14 +445,27 @@ class AgentMonitor: ObservableObject {
 
     init(virtualTest: Bool = false) {
         if virtualTest {
-            // 固定的进程内数据；不读取偏好、生产 handoff 或事件源，也不启动轮询。
+            // 固定的进程内数据；不读取偏好、生产 handoff 或事件源；仅当同时显式传入测试事件源时才轮询脉冲。
             preferences = nil
-            rootPath = ""
-            if let raw = ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_THEME"],
+            let env = ProcessInfo.processInfo.environment
+            let customEventLog = env["AGENT_ISLAND_EVENT_LOG"] ?? ""
+            let customMultiRoot = env["AGENT_ISLAND_MULTI_ROOT"] ?? ""
+            if !customEventLog.isEmpty && !customMultiRoot.isEmpty {
+                rootPath = customMultiRoot.hasSuffix("/handoffs") ? customMultiRoot : customMultiRoot + "/handoffs"
+            } else {
+                rootPath = ""
+            }
+            if let raw = env["AGENT_ISLAND_TEST_THEME"],
                let mode = ThemeMode(rawValue: raw) {
                 themeMode = mode
             }
             checkAppearance()
+            if !customEventLog.isEmpty && !customMultiRoot.isEmpty {
+                refreshCommPulses()
+                commTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                    self?.refreshCommPulses()
+                }
+            }
             return
         }
         preferences = .standard
@@ -1368,9 +1381,8 @@ struct DynamicIslandView: View {
                         : .windowBackground,
                     blendingMode: usesLiveBackdrop ? .behindWindow : .withinWindow,
                     glassTint: glassTintNSColor,
-                    // `.regular` 在当前参数下可同时满足透射与 σ≥10 的模糊门槛。
-                    // 展开态高透：改用系统 `.clear` 变体，仍由系统绘制折射/高光，不做自绘 shader。
-                    glassStyle: (monitor.skin == .glass && monitor.currentMode == .expanded && !forceFallback) ? .clear : .regular,
+                    // 保留 `.regular` 原生磨砂折射，避免 `.clear` 导致浅色高对比桌面文字穿透串行。
+                    glassStyle: .regular,
                     cornerRadius: cornerRadius,
                     forceFallback: forceFallback
                 )
@@ -2277,7 +2289,7 @@ struct DynamicIslandView: View {
 
             GeometryReader { geo in
                 let width = geo.size.width
-                let railY: CGFloat = 34
+                let railY: CGFloat = 48
                 ZStack {
                     // 空闲态不画任何线段：没有通讯就没有连线、脉冲和光点。
                     // 只有 activePulses 非空时才挂载 pulseLayer（实线 + 箭头 + 光点）。
@@ -2294,14 +2306,14 @@ struct DynamicIslandView: View {
                     .background(Capsule().fill(monitor.activePulses.isEmpty
                         ? Color(hex: "9CA3AF").opacity(0.14)
                         : Color(hex: "059669").opacity(0.14)))
-                    .position(x: width / 2, y: railY - 18)
+                    .position(x: width / 2, y: 11)
 
                     ForEach(Array(AgentRoster.all.enumerated()), id: \.element.id) { idx, agent in
                         topologyNode(
                             agent: agent,
                             isActive: monitor.activePulses.contains { $0.source == agent.key || $0.target == agent.key }
                         )
-                        .position(x: width * [0.16, 0.5, 0.84][idx], y: railY + 20)
+                        .position(x: width * [0.16, 0.5, 0.84][idx], y: railY + 21)
                     }
 
                     if !monitor.activePulses.isEmpty {
@@ -2310,7 +2322,7 @@ struct DynamicIslandView: View {
                     }
                 }
             }
-            .frame(height: 108)
+            .frame(height: 128)
 
             // Tailscale：底部基座横条
             HStack(spacing: 7) {
@@ -2507,20 +2519,22 @@ struct DynamicIslandView: View {
                     default: return size.width * 0.5
                     }
                 }
-                for (edgeIndex, pulse) in monitor.activePulses.enumerated() {
+                let edges = monitor.activePulses.map { pulse -> (color: Color, a: CGPoint, b: CGPoint) in
                     let source = AgentRoster.identity(for: pulse.source)
                     let color = activePulseColor(for: source?.key ?? pulse.source)
-                    let a = CGPoint(x: anchorX(pulse.source), y: railY)
-                    let b = CGPoint(x: anchorX(pulse.target), y: railY)
-                    let dir: CGFloat = b.x >= a.x ? 1 : -1
-                    let start = CGPoint(x: a.x + dir * 22, y: railY)
-                    let tip = CGPoint(x: b.x - dir * 24, y: railY)
+                    return (color, CGPoint(x: anchorX(pulse.source), y: railY), CGPoint(x: anchorX(pulse.target), y: railY))
+                }
+                // 第一趟先绘全部连线与方向箭头，避免后绘线段压切先绘光点
+                for edge in edges {
+                    let dir: CGFloat = edge.b.x >= edge.a.x ? 1 : -1
+                    let start = CGPoint(x: edge.a.x + dir * 22, y: railY)
+                    let tip = CGPoint(x: edge.b.x - dir * 24, y: railY)
 
                     // V2：活动线使用高对比专色，不再直接取 agent 原色。
                     var line = Path()
                     line.move(to: start)
                     line.addLine(to: CGPoint(x: tip.x - dir * 6, y: railY))
-                    context.stroke(line, with: .color(color), lineWidth: 2.2)
+                    context.stroke(line, with: .color(edge.color), lineWidth: 2.2)
 
                     // 方向箭头
                     var head = Path()
@@ -2528,22 +2542,22 @@ struct DynamicIslandView: View {
                     head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY - 4.5))
                     head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY + 4.5))
                     head.closeSubpath()
-                    context.fill(head, with: .color(color))
-
-                    // V5：每条边只有 1 个光点，全边共享 2.4s 周期；半径 3、单层 4px 辉光。
-                    // 两条边同时活跃 = 两个点（0.3s 相位差），绝不叠成一串。
+                    context.fill(head, with: .color(edge.color))
+                }
+                // 第二趟统一绘制全部光点（每条边 1 个、共享 2.4s 周期、0.3s 相位差）
+                for (edgeIndex, edge) in edges.enumerated() {
                     let cycle: Double = 2.4
                     let phase = (now / cycle + Double(edgeIndex) * 0.3 / cycle)
                         .truncatingRemainder(dividingBy: 1.0)
-                    let x = a.x + (b.x - a.x) * CGFloat(phase)
+                    let x = edge.a.x + (edge.b.x - edge.a.x) * CGFloat(phase)
                     let glow = CGRect(x: x - 4, y: railY - 4, width: 8, height: 8)
                     let core = CGRect(x: x - 3, y: railY - 3, width: 6, height: 6)
-                    context.fill(Path(ellipseIn: glow), with: .color(color.opacity(0.20)))
-                    context.fill(Path(ellipseIn: core), with: .color(color.opacity(0.92)))
+                    context.fill(Path(ellipseIn: glow), with: .color(edge.color.opacity(0.20)))
+                    context.fill(Path(ellipseIn: core), with: .color(edge.color.opacity(0.92)))
                     context.fill(Path(ellipseIn: core.insetBy(dx: 1.5, dy: 1.5)), with: .color(.white.opacity(0.95)))
                 }
             }
-            .frame(width: width, height: 108)
+            .frame(width: width, height: 128)
         }
     }
 
@@ -3314,8 +3328,8 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "0B1526").opacity(usesHighTransmissionGlass ? 0.30 : 0.78)
-                : Color(hex: "EAF4FF").opacity(usesHighTransmissionGlass ? 0.10 : 0.34)
+                ? Color(hex: "0B1526").opacity(usesHighTransmissionGlass ? 0.46 : 0.78)
+                : Color(hex: "EAF4FF").opacity(usesHighTransmissionGlass ? 0.28 : 0.34)
         case .obsidian:
             return Color(hex: "0A0A0C").opacity(0.66)
         case .ceramic:
@@ -3352,10 +3366,10 @@ struct DynamicIslandView: View {
         // 原生玻璃已在下层折射；这层只保留皮肤色感，不能再盖成不透明实色。
         switch monitor.skin {
         case .glass:
-            // 展开态减薄满幅色罩，资产条和文字继续提供局部对比。
+            // 展开态适度保留雾面托底，避免浅色高对比桌面文字穿透串行。
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(usesHighTransmissionGlass ? 0.00 : 0.10)
-                : Color(hex: "F5F9FF").opacity(usesHighTransmissionGlass ? 0.00 : 0.06)
+                ? Color(hex: "101A2E").opacity(usesHighTransmissionGlass ? 0.08 : 0.10)
+                : Color(hex: "F5F9FF").opacity(usesHighTransmissionGlass ? 0.16 : 0.06)
         case .obsidian:
             return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
         case .ceramic:
@@ -3377,8 +3391,8 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: usesHighTransmissionGlass ? 0.06 : 0.30)
-                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: usesHighTransmissionGlass ? 0.05 : 0.22)
+                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: usesHighTransmissionGlass ? 0.18 : 0.30)
+                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: usesHighTransmissionGlass ? 0.24 : 0.22)
         case .obsidian:
             return NSColor(srgbRed: 0.020, green: 0.020, blue: 0.024, alpha: 0.55)
         case .ceramic:
@@ -3825,7 +3839,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_EXPAND"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                self?.monitor.setMode(.expanded)
+                guard let self else { return }
+                self.monitor.setMode(.expanded)
+                if ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_TOPOLOGY"] == "1" {
+                    self.monitor.showTopology = true
+                    self.updatePanelFrame(for: .expanded)
+                    self.verifyVisibleVirtualPanel(phase: "topology", on: self.virtualScreenOrExit(id: id))
+                }
             }
         }
     }
