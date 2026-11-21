@@ -61,6 +61,12 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 - **2-second polling has a blind spot.** The event feed is sampled every 2s and aggregated over a 15s window. An event that arrives and ages out between two samples, or lands in a missed log line, can be absent from the topology — the view only claims what was actually sampled. The handoff files themselves remain the source of truth.
 - **Pulse shape**: one dot per active edge, shared 2.4s period, radius 3, a single 4px glow; two concurrent edges show as two dots, never a chain.
 
+### High-Transmission Glass & Virtual-Only Test Placement (v1.8.1)
+
+- **System `.clear` glass in the expanded state.** The glass skin switches `NSGlassEffectView.style` from `.regular` to the system `.clear` variant when expanded — still native material and reflection, no hand-written shader or imitation glass. Overlays above the glass are thinned at the same time (dark `panelFill` 0.10→0.00, card tint 0.58→0.30, glass tint 0.30→0.06; light 0.06→0.00 / 0.34→0.10 / 0.22→0.05).
+- **Measured transmission** (virtual display, 32-band backdrop, per-pixel least squares): dark 41.5% → **56.8%**, light 43.7% → **56.6%**; the brightest 1% of the text band keeps the same 1.40 ratio against the median background, so legibility did not drop with transmission.
+- **Virtual-only test placement.** `AGENT_ISLAND_TEST_VIRTUAL_ONLY=1` (plus the `ISLAND_VIRTUAL_TEST_BUILD` compile flag) requires exactly one screen named `AlmaVirtualScreen` that is not main, not mirrored and not intersecting any other screen. The check runs before `NSApplication`, any window or status item exists; otherwise the process exits 1 and never falls back to a physical display. The test panel starts inside that screen, re-verifies `panel.screen`, focus and activation on every mode change, and tears down on any display reconfiguration. Test builds read no user preferences and start no production polling.
+
 ### Quick Start
 
 #### Build from Source
@@ -116,6 +122,13 @@ open /Applications/AgentIsland.app
 - **没有通信，就没有连线、脉冲和点**：`activePulses` 为空时，链路图与迷你条一律不画连接线；脉冲层仅在至少一条边活跃时挂载。节点空闲环仍保持 ≥2.2:1 对比度，弱化但看得见。
 - **2 秒轮询有盲区**：事件日志每 2 秒采样一次，按 15 秒窗口聚合；在两次采样之间到达又过期的单条事件，或未被采到的日志行，可能不在链路图中出现。界面只声明实际采到的通讯，原始 handoff 文件才是事实源。
 - **脉冲形态**：每条活跃边 1 个光点，共享 2.4s 周期，半径 3、单层 4px 辉光；两条边并发时是两个点，不会叠成串。
+
+### 展开态高透原生玻璃与测试显示隔离（v1.8.1）
+
+- **系统 `.clear` 玻璃变体**：玻璃皮肤展开时 `NSGlassEffectView.style` 由 `.regular` 切到系统 `.clear`，仍是系统原生材质与反射，没有自绘 shader，也没有仿玻璃贴图。玻璃上方色罩同步减薄：深色 `panelFill` 0.10→0.00、卡片染色 0.58→0.30、玻璃 tint 0.30→0.06；浅色为 0.06→0.00 / 0.34→0.10 / 0.22→0.05。
+- **实测透射率**（虚拟屏 32 色带背板、逐像素最小二乘）：深色 41.5% → **56.8%**，浅色 43.7% → **56.6%**；文字带最亮 1% 与中位背景比值仍为 1.40，透光提高没有牺牲可读性。
+- **测试期强制隔离**：`AGENT_ISLAND_TEST_VIRTUAL_ONLY=1` 与 `-D ISLAND_VIRTUAL_TEST_BUILD` 只认唯一一块 `AlmaVirtualScreen`，且该屏非主屏、非镜像、不与其它屏相交；判定在创建 `NSApplication`、窗口与状态栏之前，找不到就 `exit 1`，绝不回落物理屏。测试面板从虚拟屏内起 frame，每次模式切换复验 `panel.screen`、焦点与激活状态，显示配置一变立即退出。测试构建不读用户偏好、不启动生产轮询。
+
 
 ### 快速开始
 

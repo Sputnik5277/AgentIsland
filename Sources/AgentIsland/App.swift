@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import SwiftUI
 import Foundation
 import UniformTypeIdentifiers
@@ -438,44 +439,57 @@ class AgentMonitor: ObservableObject {
         }
     }
     
-    // 测试/多根模式下与事件解析使用同一根目录，避免兜底扫描串到生产 handoffs
-    let rootPath: String = {
-        if let root = ProcessInfo.processInfo.environment["AGENT_ISLAND_MULTI_ROOT"], !root.isEmpty {
-            return root.hasSuffix("/handoffs") ? root : root + "/handoffs"
-        }
-        return "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
-    }()
+    private let preferences: UserDefaults?
+    let rootPath: String
     let handoffScript = "/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts/handoff.py"
-    
-    init() {
-        if let savedTheme = UserDefaults.standard.string(forKey: "agent_island_theme_mode"),
+
+    init(virtualTest: Bool = false) {
+        if virtualTest {
+            // 固定的进程内数据；不读取偏好、生产 handoff 或事件源，也不启动轮询。
+            preferences = nil
+            rootPath = ""
+            if let raw = ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_THEME"],
+               let mode = ThemeMode(rawValue: raw) {
+                themeMode = mode
+            }
+            checkAppearance()
+            return
+        }
+        preferences = .standard
+        // 多根模式下与事件解析使用同一根目录，避免兜底扫描串到生产 handoffs。
+        if let root = ProcessInfo.processInfo.environment["AGENT_ISLAND_MULTI_ROOT"], !root.isEmpty {
+            rootPath = root.hasSuffix("/handoffs") ? root : root + "/handoffs"
+        } else {
+            rootPath = "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs"
+        }
+        if let savedTheme = preferences?.string(forKey: "agent_island_theme_mode"),
            let tm = ThemeMode(rawValue: savedTheme) {
             self.themeMode = tm
         }
-        if let savedAccent = UserDefaults.standard.string(forKey: "agent_island_accent_hex") {
+        if let savedAccent = preferences?.string(forKey: "agent_island_accent_hex") {
             self.accentHex = savedAccent
         }
-        if let savedScale = UserDefaults.standard.object(forKey: "agent_island_ui_scale") as? Double {
+        if let savedScale = preferences?.object(forKey: "agent_island_ui_scale") as? Double {
             self.uiScale = min(1.4, max(0.8, savedScale))
         }
-        if let savedDock = UserDefaults.standard.string(forKey: "agent_island_dock_edge"),
+        if let savedDock = preferences?.string(forKey: "agent_island_dock_edge"),
            let edge = DockEdge(rawValue: savedDock) {
             self.dockEdge = edge
         }
-        if let savedSkin = UserDefaults.standard.string(forKey: "agent_island_skin"),
+        if let savedSkin = preferences?.string(forKey: "agent_island_skin"),
            let sk = IslandSkin(rawValue: savedSkin) {
             self.skin = sk
         }
-        if let savedForm = UserDefaults.standard.string(forKey: "agent_island_form"),
+        if let savedForm = preferences?.string(forKey: "agent_island_form"),
            let fm = IslandForm(rawValue: savedForm) {
             self.islandForm = fm
         }
-        if let savedOrder = UserDefaults.standard.stringArray(forKey: "agent_island_section_order") {
+        if let savedOrder = preferences?.stringArray(forKey: "agent_island_section_order") {
             let valid = savedOrder.filter { PanelSectionKey(rawValue: $0) != nil }
             let missing = PanelSectionKey.defaultOrder.filter { !valid.contains($0) }
             self.sectionOrder = valid + missing
         }
-        if let savedSections = UserDefaults.standard.dictionary(forKey: "agent_island_sections") as? [String: Bool] {
+        if let savedSections = preferences?.dictionary(forKey: "agent_island_sections") as? [String: Bool] {
             var merged = PanelSectionKey.defaults
             for (k, v) in savedSections where merged[k] != nil { merged[k] = v }
             self.enabledSections = merged
@@ -507,7 +521,7 @@ class AgentMonitor: ObservableObject {
     func setThemeMode(_ mode: ThemeMode) {
         DispatchQueue.main.async {
             self.themeMode = mode
-            UserDefaults.standard.set(mode.rawValue, forKey: "agent_island_theme_mode")
+            self.preferences?.set(mode.rawValue, forKey: "agent_island_theme_mode")
             let isDark: Bool
             switch mode {
             case .auto:
@@ -527,7 +541,7 @@ class AgentMonitor: ObservableObject {
     func setAccentHex(_ hex: String) {
         DispatchQueue.main.async {
             self.accentHex = hex
-            UserDefaults.standard.set(hex, forKey: "agent_island_accent_hex")
+            self.preferences?.set(hex, forKey: "agent_island_accent_hex")
             self.objectWillChange.send()
         }
     }
@@ -545,7 +559,7 @@ class AgentMonitor: ObservableObject {
         let clamped = min(1.4, max(0.8, (value * 20).rounded() / 20))
         DispatchQueue.main.async {
             self.uiScale = clamped
-            UserDefaults.standard.set(clamped, forKey: "agent_island_ui_scale")
+            self.preferences?.set(clamped, forKey: "agent_island_ui_scale")
             self.onLayoutChange?()
         }
     }
@@ -553,7 +567,7 @@ class AgentMonitor: ObservableObject {
     func setDockEdge(_ edge: DockEdge) {
         DispatchQueue.main.async {
             self.dockEdge = edge
-            UserDefaults.standard.set(edge.rawValue, forKey: "agent_island_dock_edge")
+            self.preferences?.set(edge.rawValue, forKey: "agent_island_dock_edge")
             self.onLayoutChange?()
         }
     }
@@ -561,14 +575,14 @@ class AgentMonitor: ObservableObject {
     func setSkin(_ value: IslandSkin) {
         DispatchQueue.main.async {
             self.skin = value
-            UserDefaults.standard.set(value.rawValue, forKey: "agent_island_skin")
+            self.preferences?.set(value.rawValue, forKey: "agent_island_skin")
         }
     }
 
     func setIslandForm(_ value: IslandForm) {
         DispatchQueue.main.async {
             self.islandForm = value
-            UserDefaults.standard.set(value.rawValue, forKey: "agent_island_form")
+            self.preferences?.set(value.rawValue, forKey: "agent_island_form")
         }
     }
 
@@ -581,7 +595,7 @@ class AgentMonitor: ObservableObject {
         DispatchQueue.main.async {
             guard PanelSectionKey(rawValue: key) != nil else { return }
             self.enabledSections[key] = !(self.enabledSections[key] ?? true)
-            UserDefaults.standard.set(self.enabledSections, forKey: "agent_island_sections")
+            self.preferences?.set(self.enabledSections, forKey: "agent_island_sections")
             self.onLayoutChange?()
         }
     }
@@ -595,7 +609,7 @@ class AgentMonitor: ObservableObject {
         let insertIndex = to > from ? to - 1 : to
         order.insert(key, at: insertIndex)
         sectionOrder = order
-        UserDefaults.standard.set(order, forKey: "agent_island_section_order")
+        preferences?.set(order, forKey: "agent_island_section_order")
     }
 
     func moveSection(_ key: String, by delta: Int) {
@@ -605,10 +619,11 @@ class AgentMonitor: ObservableObject {
         var order = sectionOrder
         order.swapAt(idx, dest)
         sectionOrder = order
-        UserDefaults.standard.set(order, forKey: "agent_island_section_order")
+        preferences?.set(order, forKey: "agent_island_section_order")
     }
     
     func startTimers() {
+        guard preferences != nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.checkAppearance()
             self?.refreshAll()
@@ -736,6 +751,7 @@ class AgentMonitor: ObservableObject {
     }
     
     func refreshAll() {
+        guard preferences != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
@@ -829,6 +845,7 @@ class AgentMonitor: ObservableObject {
     }
     
     func confirmTask(file: String, dispatcher: String) {
+        guard preferences != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let p = Process()
@@ -847,6 +864,7 @@ class AgentMonitor: ObservableObject {
     }
     
     func triggerVerifyAndReconcile() {
+        guard preferences != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
@@ -945,6 +963,7 @@ print(f"RECONCILE_DONE:{reconciled}:{archived}")
     }
     
     func resolveFusedByLulu() {
+        guard preferences != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let p = Process()
@@ -1350,7 +1369,8 @@ struct DynamicIslandView: View {
                     blendingMode: usesLiveBackdrop ? .behindWindow : .withinWindow,
                     glassTint: glassTintNSColor,
                     // `.regular` 在当前参数下可同时满足透射与 σ≥10 的模糊门槛。
-                    glassStyle: .regular,
+                    // 展开态高透：改用系统 `.clear` 变体，仍由系统绘制折射/高光，不做自绘 shader。
+                    glassStyle: (monitor.skin == .glass && monitor.currentMode == .expanded && !forceFallback) ? .clear : .regular,
                     cornerRadius: cornerRadius,
                     forceFallback: forceFallback
                 )
@@ -3294,8 +3314,8 @@ struct DynamicIslandView: View {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "0B1526").opacity(0.78)
-                : Color(hex: "EAF4FF").opacity(0.34)
+                ? Color(hex: "0B1526").opacity(usesHighTransmissionGlass ? 0.30 : 0.78)
+                : Color(hex: "EAF4FF").opacity(usesHighTransmissionGlass ? 0.10 : 0.34)
         case .obsidian:
             return Color(hex: "0A0A0C").opacity(0.66)
         case .ceramic:
@@ -3332,11 +3352,10 @@ struct DynamicIslandView: View {
         // 原生玻璃已在下层折射；这层只保留皮肤色感，不能再盖成不透明实色。
         switch monitor.skin {
         case .glass:
-            // 通透玻璃：这层只留极薄冷色感，折射和模糊交给原生玻璃本体。
-            // 0.26 白层实测把展开面板壁纸透射压到 1–3%，现压到 ≤0.06。
+            // 展开态减薄满幅色罩，资产条和文字继续提供局部对比。
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(0.10)
-                : Color(hex: "F5F9FF").opacity(0.06)
+                ? Color(hex: "101A2E").opacity(usesHighTransmissionGlass ? 0.00 : 0.10)
+                : Color(hex: "F5F9FF").opacity(usesHighTransmissionGlass ? 0.00 : 0.06)
         case .obsidian:
             return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
         case .ceramic:
@@ -3346,13 +3365,20 @@ struct DynamicIslandView: View {
         }
     }
 
-    /// 传给 NSGlassEffectView.tintColor：只染色、不遮折射
+    private var usesHighTransmissionGlass: Bool {
+        if #available(macOS 26.0, *) {
+            return monitor.skin == .glass && monitor.currentMode == .expanded && !Self.forceGlassFallback
+        }
+        return false
+    }
+
+    /// 传给 NSGlassEffectView.tintColor，保留原生材质与折射。
     var glassTintNSColor: NSColor {
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: 0.30)
-                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: 0.22)
+                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: usesHighTransmissionGlass ? 0.06 : 0.30)
+                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: usesHighTransmissionGlass ? 0.05 : 0.22)
         case .obsidian:
             return NSColor(srgbRed: 0.020, green: 0.020, blue: 0.024, alpha: 0.55)
         case .ceramic:
@@ -3522,14 +3548,66 @@ struct DynamicIslandView: View {
 }
 
 // MARK: - AppKit Window Controller with Auto-Dismiss & Screen Tracking
+// MARK: - Virtual-only test placement
+private enum VirtualIslandDisplay {
+    static let name = "AlmaVirtualScreen"
+
+    static func id(of screen: NSScreen?) -> CGDirectDisplayID? {
+        (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    static func find(id expectedID: CGDirectDisplayID? = nil) -> NSScreen? {
+        let screens = NSScreen.screens
+        let matches = screens.filter { $0.localizedName == name }
+        guard matches.count == 1, let screen = matches.first, let id = id(of: screen),
+              expectedID == nil || id == expectedID,
+              CGDisplayIsActive(id) != 0, CGDisplayIsMain(id) == 0,
+              CGDisplayIsInMirrorSet(id) == 0, !screen.frame.isEmpty,
+              !screens.contains(where: { $0 !== screen && $0.frame.intersects(screen.frame) }) else {
+            return nil
+        }
+        return screen
+    }
+
+    static func clamp(_ rect: NSRect, to bounds: NSRect) -> NSRect {
+        let width = min(rect.width, bounds.width)
+        let height = min(rect.height, bounds.height)
+        return NSRect(x: min(max(rect.minX, bounds.minX), bounds.maxX - width),
+                      y: min(max(rect.minY, bounds.minY), bounds.maxY - height),
+                      width: width, height: height)
+    }
+
+    static func stop(_ reason: String) -> Never {
+        fputs("ISLAND_VIRTUAL_ONLY: \(reason)\n", stderr)
+        exit(1)
+    }
+
+    static func watchConfiguration() {
+        // Quit at Quartz's pre-change callback, rather than let WindowServer
+        // migrate a visible test panel and react only after the change.
+        guard CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
+            if !flags.isEmpty {
+                fputs("ISLAND_VIRTUAL_ONLY: display configuration changed; exiting\n", stderr)
+                _exit(1)
+            }
+        }, nil) == .success else {
+            stop("cannot watch display reconfiguration")
+        }
+    }
+}
+
 class DynamicIslandPanel: NSPanel {
-    init(contentRect: NSRect) {
+    private let virtualBounds: NSRect?
+
+    init(contentRect: NSRect, virtualBounds: NSRect? = nil) {
+        self.virtualBounds = virtualBounds
         super.init(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
-            defer: false
+            defer: virtualBounds != nil
         )
+        self.ignoresMouseEvents = virtualBounds != nil
         self.level = .statusBar
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         self.isOpaque = false
@@ -3541,7 +3619,12 @@ class DynamicIslandPanel: NSPanel {
         self.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
     }
     
-    override var canBecomeKey: Bool { return true }
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        guard let virtualBounds else { return super.constrainFrameRect(frameRect, to: screen) }
+        return VirtualIslandDisplay.clamp(frameRect, to: virtualBounds)
+    }
+
+    override var canBecomeKey: Bool { return virtualBounds == nil }
     override var canBecomeMain: Bool { return false }
     
     override func cancelOperation(_ sender: Any?) {
@@ -3560,7 +3643,14 @@ class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var islandPanel: DynamicIslandPanel!
-    var monitor = AgentMonitor()
+    let monitor: AgentMonitor
+    private let virtualDisplayID: CGDirectDisplayID?
+
+    init(virtualDisplayID: CGDirectDisplayID?) {
+        self.virtualDisplayID = virtualDisplayID
+        monitor = AgentMonitor(virtualTest: virtualDisplayID != nil)
+        super.init()
+    }
 
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
@@ -3583,6 +3673,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var edgeMenuItems: [String: NSMenuItem] = [:]
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let virtualDisplayID {
+            launchVirtualTest(on: virtualDisplayID)
+            return
+        }
         NSApp.setActivationPolicy(.accessory)
         // 仅截图取证：临时以普通 App 身份运行，让 Dock 显示真实 AppIcon（不改变常驻形态）
         if ProcessInfo.processInfo.environment["AGENT_ISLAND_SHOW_DOCK"] == "1" {
@@ -3695,6 +3789,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 )
             }
         }
+    }
+
+    private func virtualScreenOrExit(id: CGDirectDisplayID) -> NSScreen {
+        guard let screen = VirtualIslandDisplay.find(id: id) else {
+            islandPanel?.orderOut(nil)
+            VirtualIslandDisplay.stop("test display missing or no longer isolated")
+        }
+        return screen
+    }
+
+    private func launchVirtualTest(on id: CGDirectDisplayID) {
+        let screen = virtualScreenOrExit(id: id)
+        guard NSApp.setActivationPolicy(.accessory), !NSApp.isActive else {
+            VirtualIslandDisplay.stop("cannot run as a background accessory")
+        }
+
+        let initialFrame = VirtualIslandDisplay.clamp(panelFrame(for: .compact, in: screen.frame), to: screen.frame)
+        islandPanel = DynamicIslandPanel(contentRect: initialFrame, virtualBounds: screen.frame)
+        // Check the frame returned by AppKit, not just the requested frame.
+        let currentScreen = virtualScreenOrExit(id: id)
+        guard currentScreen.frame.contains(islandPanel.frame), !islandPanel.frame.isEmpty else {
+            VirtualIslandDisplay.stop("initial panel frame is outside test display")
+        }
+        logVirtualPanel(phase: "initial", on: currentScreen)
+        installPanelContent()
+        updatePanelFrame(for: .compact)
+        islandPanel.orderFrontRegardless()
+        verifyVisibleVirtualPanel(phase: "compact", on: virtualScreenOrExit(id: id))
+
+        monitor.onModeChange = { [weak self] mode in
+            guard let self else { return }
+            self.updatePanelFrame(for: mode)
+            self.verifyVisibleVirtualPanel(phase: "\(mode)", on: self.virtualScreenOrExit(id: id))
+        }
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_EXPAND"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.monitor.setMode(.expanded)
+            }
+        }
+    }
+
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        // Secondary guard if AppKit delivers a change without the Quartz callback.
+        guard virtualDisplayID != nil else { return }
+        islandPanel?.orderOut(nil)
+        VirtualIslandDisplay.stop("AppKit screen parameters changed")
+    }
+
+    private func verifyVisibleVirtualPanel(phase: String, on screen: NSScreen) {
+        guard islandPanel.isVisible, !islandPanel.isKeyWindow, !NSApp.isActive,
+              VirtualIslandDisplay.id(of: islandPanel.screen) == virtualDisplayID,
+              screen.frame.contains(islandPanel.frame), !islandPanel.frame.isEmpty else {
+            islandPanel.orderOut(nil)
+            VirtualIslandDisplay.stop("panel not confined to test display or acquired focus")
+        }
+        logVirtualPanel(phase: phase, on: screen)
+    }
+
+    private func logVirtualPanel(phase: String, on screen: NSScreen) {
+        print("ISLAND_VIRTUAL_ONLY: phase=\(phase) target=\(screen.localizedName) id=\(virtualDisplayID ?? 0) screenFrame=\(screen.frame) panelScreen=\(islandPanel.screen?.localizedName ?? "none") panelFrame=\(islandPanel.frame) window=\(islandPanel.windowNumber) visible=\(islandPanel.isVisible) key=\(islandPanel.isKeyWindow) active=\(NSApp.isActive)")
+        fflush(stdout)
     }
 
     func appendSnapshotLog(dir: String, line: String) {
@@ -3977,14 +4132,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func setupIslandPanel() {
         let initialRect = NSRect(x: 0, y: 0, width: 200, height: 48)
         islandPanel = DynamicIslandPanel(contentRect: initialRect)
-        
+        installPanelContent()
+        updatePanelFrame(for: .compact)
+        islandPanel.orderFrontRegardless()
+    }
+
+    private func installPanelContent() {
         let hostingView = FirstMouseHostingView(rootView: DynamicIslandView(monitor: monitor))
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         islandPanel.contentView = hostingView
-        
-        updatePanelFrame(for: .compact)
-        islandPanel.orderFrontRegardless()
     }
     
     func getActiveScreen() -> NSScreen {
@@ -3997,10 +4154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSScreen.screens.first ?? NSScreen()
     }
     
-    func updatePanelFrame(for mode: IslandMode) {
-        let screen = getActiveScreen()
-        let screenFrame = screen.frame
-        
+    private func panelFrame(for mode: IslandMode, in screenFrame: NSRect) -> NSRect {
         let windowWidth: CGFloat
         let windowHeight: CGFloat
         
@@ -4032,12 +4186,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         
         // 半像素/非整数坐标会让 Retina 文字发虚：窗口与原点一律取整点
-        let targetRect = NSRect(
+        return NSRect(
             x: x.rounded(),
             y: y.rounded(),
             width: windowWidth.rounded(),
             height: windowHeight.rounded()
         )
+    }
+
+    func updatePanelFrame(for mode: IslandMode) {
+        if let virtualDisplayID {
+            let screen = virtualScreenOrExit(id: virtualDisplayID)
+            let rect = VirtualIslandDisplay.clamp(panelFrame(for: mode, in: screen.frame), to: screen.frame)
+            islandPanel.setFrame(rect, display: true, animate: false)
+            guard screen.frame.contains(islandPanel.frame), !islandPanel.frame.isEmpty else {
+                islandPanel.orderOut(nil)
+                VirtualIslandDisplay.stop("panel frame escaped test display")
+            }
+            return
+        }
+        let targetRect = panelFrame(for: mode, in: getActiveScreen().frame)
         islandPanel.setFrame(targetRect, display: true, animate: false)
         print("[AgentIsland] frame -> \(targetRect) contentH=\(monitor.expandedContentHeight)")
         
@@ -4163,7 +4331,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 // MARK: - Main Entry Point
+let testDisplayID: CGDirectDisplayID? = {
+    // A/B test builds cannot fall back to normal launch even if the env flag is omitted.
+    #if !ISLAND_VIRTUAL_TEST_BUILD
+    guard ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_VIRTUAL_ONLY"] == "1" else { return nil }
+    #endif
+    guard let screen = VirtualIslandDisplay.find(), let id = VirtualIslandDisplay.id(of: screen) else {
+        VirtualIslandDisplay.stop("no isolated AlmaVirtualScreen; no UI started")
+    }
+    VirtualIslandDisplay.watchConfiguration()
+    return id
+}()
 let app = NSApplication.shared
-let delegate = AppDelegate()
+let delegate = AppDelegate(virtualDisplayID: testDisplayID)
 app.delegate = delegate
 app.run()

@@ -5,6 +5,24 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.8.1] - 2026-11-21
+
+### 💎 展开态高透原生玻璃 & 测试显示隔离 / High-Transmission Native Glass & Isolated Test Display
+
+- **💎 展开态改用系统 `.clear` 玻璃变体**
+  - 玻璃皮肤展开时 `NSGlassEffectView.style` 由 `.regular` 切到系统 `.clear`，仍是系统原生材质与反射，未引入任何自绘 shader 或仿玻璃贴图。
+  - 同时减薄玻璃上方色罩：深色 `panelFill` 0.10→0.00、卡片染色 0.58→0.30、玻璃 tint 0.30→0.06；浅色对应 0.06→0.00 / 0.34→0.10 / 0.22→0.05。
+  - 只影响玻璃皮肤展开态；陶瓷、曜石、紧凑态、文字配色、资产条、脉冲均未改动。
+- **📐 实测透射率（虚拟屏 32 色带背板，逐像素最小二乘）**
+  - 深色：41.5% → **56.8%**；浅色：43.7% → **56.6%**。
+  - 文字亮度未随透光下降：深色文字带最亮 1% 与中位背景比值 1.40，与旧版同值。
+- **🖥️ 测试期强制隔离到命名虚拟屏**
+  - 新增 `AGENT_ISLAND_TEST_VIRTUAL_ONLY=1` 与 `-D ISLAND_VIRTUAL_TEST_BUILD`：只认 `NSScreen.localizedName == "AlmaVirtualScreen"`，且该屏非主屏、非镜像、不与其它屏相交。
+  - 判定发生在创建 `NSApplication` / 窗口 / 状态栏之前；找不到就 `exit 1`，绝不回落物理屏。面板初始 frame 由虚拟屏算起，每次模式切换都校验 `panel.screen`、未获焦点、未激活；显示配置一变立即 `orderOut` 并退出。
+  - 测试构建不读用户偏好、不启动生产 handoff 轮询、不读全局鼠标位置。
+
+---
+
 ## [v1.8.0] - 2026-11-21
 
 ### 💎 Native Liquid Glass, Converged Pulses & Measured Contrast / 原生液态玻璃、脉冲收敛与对比度实测
