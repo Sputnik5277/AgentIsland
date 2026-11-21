@@ -309,6 +309,14 @@ struct PingloopDeltaState: Equatable {
     }
 }
 
+struct FusedDecisionCard: Identifiable, Equatable {
+    var id: String { path }
+    let traceId: String
+    let title: String
+    let summary: String
+    let path: String
+}
+
 struct WakeWorkerState: Equatable {
     var status: String = "idle"
     var dailyRuns: Int = 0
@@ -388,6 +396,12 @@ class AgentMonitor: ObservableObject {
     /// AGY 后台无头唤醒实时态（监听父目录 ~/.config/alma/state/，抗 os.replace inode 替换）
     @Published var wakeState: WakeWorkerState = WakeWorkerState()
     @Published var deltaState: PingloopDeltaState = PingloopDeltaState()
+    @Published var fusedCards: [FusedDecisionCard] = []
+    @Published var observeResults: [String: String] = [:]
+    @Published var drawerSearchText: String = ""
+    @Published var drawerTodayOnly: Bool = false
+    @Published var rejectTargetFile: String? = nil
+    @Published var rejectReasonText: String = ""
     private var wakeDirFD: CInt = -1
     private var wakeDirSource: DispatchSourceFileSystemObject?
     private var wakeLastStatKey: String = ""
@@ -544,7 +558,7 @@ class AgentMonitor: ObservableObject {
                 default: return 0
                 }
             }()
-            return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
+            return CGFloat(((tCount + dCount <= 4) ? 380 : 450) + extra)
         }
         // 内联链路：总览头部 + 迷你条 + 展开拓扑区（含三层通道原文案）
         if showTopology { return 424 + extra }
@@ -552,10 +566,12 @@ class AgentMonitor: ObservableObject {
 
         // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
+        if fusedCount > 0 || !fusedCards.isEmpty { h += 108 }
         if enabledSections[PanelSectionKey.overview.rawValue] ?? (PanelSectionKey.defaults[PanelSectionKey.overview.rawValue] ?? false) { h += 28 }
         if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 36 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
-            h += pendingConfirms.isEmpty ? 68 : 108
+            let rejectExtra: CGFloat = (!pendingConfirms.isEmpty && rejectTargetFile != nil) ? 44 : 0
+            h += (pendingConfirms.isEmpty ? 68 : 142) + rejectExtra
         }
         if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 52 }
         if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 50 }
@@ -585,10 +601,25 @@ class AgentMonitor: ObservableObject {
     
     func setDrawerAgent(_ agent: String?) {
         DispatchQueue.main.async {
+            self.drawerSearchText = ""
+            self.drawerTodayOnly = false
             withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
                 self.selectedDrawerAgent = agent
             }
             self.onDrawerChange?()
+        }
+    }
+
+    func toggleRejectTarget(_ file: String?) {
+        DispatchQueue.main.async {
+            if self.rejectTargetFile == file {
+                self.rejectTargetFile = nil
+                self.rejectReasonText = ""
+            } else {
+                self.rejectTargetFile = file
+                self.rejectReasonText = ""
+            }
+            self.onLayoutChange?()
         }
     }
     
@@ -726,6 +757,8 @@ class AgentMonitor: ObservableObject {
         let convURL = env["AGENT_ISLAND_CONVERGENCE_LOG"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             ?? wakeStateDirURL.appendingPathComponent("pingloop-convergence.jsonl")
         let almaURL = wakeStateDirURL.appendingPathComponent("alma-turn.json")
+        let decisionsDirURL = env["AGENT_ISLAND_DECISIONS_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? wakeStateDirURL.appendingPathComponent("a-verifier-decisions", isDirectory: true)
 
         let fm = FileManager.default
         func fileStat(_ url: URL) -> String {
@@ -735,7 +768,11 @@ class AgentMonitor: ObservableObject {
             return "\(mt):\(sz)"
         }
         let pauseExists = fm.fileExists(atPath: pauseURL.path)
-        let statKey = "\(fileStat(snapURL))|\(pauseExists)|\(fileStat(healthURL))|\(fileStat(convURL))|\(fileStat(almaURL))"
+        let decFiles = (try? fm.contentsOfDirectory(at: decisionsDirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]))?
+            .filter { $0.lastPathComponent.hasSuffix("-fused.md") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent } ?? []
+        let decStat = decFiles.map { "\($0.lastPathComponent)=\(fileStat($0))" }.joined(separator: ",")
+        let statKey = "\(fileStat(snapURL))|\(pauseExists)|\(fileStat(healthURL))|\(fileStat(convURL))|\(fileStat(almaURL))|\(decStat)"
         if !force && statKey == wakeLastStatKey { return }
         wakeLastStatKey = statKey
 
@@ -849,12 +886,39 @@ class AgentMonitor: ObservableObject {
             }
         }
 
+        var nextCards: [FusedDecisionCard] = []
+        for url in decFiles {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            var title = url.deletingPathExtension().lastPathComponent
+            var summary = "连续 3 轮 A 级机检未收敛，已升级 B 级决策卡"
+            for rawLn in text.split(separator: "\n") {
+                let ln = String(rawLn).trimmingCharacters(in: .whitespacesAndNewlines)
+                if ln.hasPrefix("# ") {
+                    title = String(ln.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                } else if ln.contains("一句话定什么") {
+                    if let idx = ln.range(of: "**：") {
+                        summary = String(ln[idx.upperBound...]).trimmingCharacters(in: .whitespaces)
+                    } else {
+                        summary = ln.replacingOccurrences(of: "- ", with: "")
+                    }
+                    summary = summary.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
+                    break
+                }
+            }
+            let tid = url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "-fused", with: "")
+            nextCards.append(FusedDecisionCard(traceId: tid, title: title, summary: summary, path: url.path))
+        }
+
         DispatchQueue.main.async {
             if self.wakeState != next {
                 self.wakeState = next
             }
             if self.deltaState != nextDelta {
                 self.deltaState = nextDelta
+            }
+            if self.fusedCards != nextCards {
+                self.fusedCards = nextCards
+                self.onLayoutChange?()
             }
         }
     }
@@ -1178,7 +1242,7 @@ class AgentMonitor: ObservableObject {
         }
     }
     
-    func refreshAll() {
+    func refreshAll(showFeedback: Bool = false) {
         guard preferences != nil else { return }
         refreshLock.lock()
         if isRefreshingInFlight {
@@ -1213,6 +1277,9 @@ class AgentMonitor: ObservableObject {
                 self.funnelOnline = fOnline
                 self.nutstoreOnline = nOnline
                 self.tailscaleOnline = tOnline
+                if showFeedback {
+                    self.showToast(dataOK ? "🔄 已刷新最新状态" : "⚠️ 刷新失败（数据未知）")
+                }
 
                 guard dataOK else {
                     // 读取失败：保留上一份真数据，但明确标记「未知」，不假装有数据
@@ -1285,6 +1352,28 @@ class AgentMonitor: ObservableObject {
         }
     }
     
+    func showToast(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            withAnimation(.spring()) {
+                self.reconcileFeedback = message
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
+                guard let self = self else { return }
+                if self.reconcileFeedback == message {
+                    withAnimation { self.reconcileFeedback = nil }
+                }
+            }
+        }
+    }
+
+    func copyToClipboard(_ text: String, label: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        showToast("📋 已复制 \(label)")
+    }
+
     func confirmTask(file: String, dispatcher: String) {
         guard preferences != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1298,9 +1387,123 @@ class AgentMonitor: ObservableObject {
                 "--to-file", file,
                 "--verdict", "灵动岛一键验收结案"
             ]
-            try? p.run()
-            p.waitUntilExit()
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            var ok = false
+            do {
+                try p.run()
+                _ = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                ok = (p.terminationStatus == 0)
+            } catch {}
             self.refreshAll()
+            self.showToast(ok ? "✅ 已验收结案" : "⚠️ 验收权限或状态受阻")
+        }
+    }
+
+    func rejectTask(file: String, dispatcher: String, reason: String) {
+        guard preferences != nil else { return }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalReason = trimmed.isEmpty ? "灵动岛退回整改，请核对后重交" : trimmed
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = [
+                self.handoffScript,
+                "reject",
+                "--from", dispatcher,
+                "--to-file", file,
+                "--reason", finalReason
+            ]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            var ok = false
+            do {
+                try p.run()
+                _ = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                ok = (p.terminationStatus == 0)
+            } catch {}
+            DispatchQueue.main.async {
+                if ok {
+                    self.rejectTargetFile = nil
+                    self.rejectReasonText = ""
+                    self.onLayoutChange?()
+                }
+            }
+            self.refreshAll()
+            self.showToast(ok ? "↩️ 已打回整改" : "⚠️ 打回失败，请检查权限")
+        }
+    }
+
+    func runObserveVerify(file: String) {
+        guard preferences != nil, !rootPath.isEmpty else { return }
+        showToast("🔍 正在独立机检...")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let fullPath = file.hasPrefix("/") ? file : "\(self.rootPath)/\(file)"
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = [
+                "/Users/l/.config/alma/scripts/pingloop-a-verifier.py",
+                "--file", fullPath,
+                "--mode", "observe",
+                "--json"
+            ]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            var summary = "机检异常"
+            do {
+                try p.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let dec = (obj["decision"] as? String) ?? ""
+                    switch dec {
+                    case "observe_pass":
+                        let passed = (obj["assertions_passed"] as? Int) ?? 0
+                        let total = (obj["assertions_total"] as? Int) ?? 0
+                        summary = "A级 PASS(\(passed)/\(total))"
+                    case "route_b":
+                        let reason = (obj["reason"] as? String) ?? "人工"
+                        summary = reason == "no_submit_assertions" ? "B级(无断言)" : "B级人工"
+                    case "fused", "fused_already":
+                        summary = "M1熔断"
+                    default:
+                        summary = "A级 FAIL"
+                    }
+                }
+            } catch {}
+            DispatchQueue.main.async {
+                self.observeResults[file] = summary
+            }
+            self.showToast("🧪 机检结果：\(summary)")
+        }
+    }
+
+    func markTaskRead(box: String, file: String) {
+        guard preferences != nil, !rootPath.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let ackDir = URL(fileURLWithPath: self.rootPath).appendingPathComponent(".ack", isDirectory: true)
+            let ackURL = ackDir.appendingPathComponent("\(box).json")
+            try? FileManager.default.createDirectory(at: ackDir, withIntermediateDirectories: true)
+            var dict: [String: String] = [:]
+            if let data = try? Data(contentsOf: ackURL),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                dict = obj
+            }
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            dict[file] = "read_on_island: \(stamp)"
+            if let outData = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
+                try? outData.write(to: ackURL, options: .atomic)
+            }
+            self.refreshAll()
+            self.showToast("✅ 已标已读")
         }
     }
     
@@ -2169,7 +2372,7 @@ struct DynamicIslandView: View {
             .padding(.horizontal, 16)
 
             // Layer 2: 黄金展示区 (工单流 vs 架构链路图)
-            if monitor.fusedCount > 0 {
+            if monitor.fusedCount > 0 || !monitor.fusedCards.isEmpty {
                 fusedDecisionBannerView
                     .padding(.horizontal, 14)
             }
@@ -2644,7 +2847,7 @@ struct DynamicIslandView: View {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/交流.md"))
             }
             Spacer(minLength: 0)
-            Button(action: { monitor.refreshAll() }) {
+            Button(action: { monitor.refreshAll(showFeedback: true) }) {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(secondaryTextColor)
@@ -2833,40 +3036,70 @@ struct DynamicIslandView: View {
         .buttonStyle(PlainButtonStyle())
     }
     
-    // MARK: - M1 熔断露露专属决策卡（批奏折专区：有熔断时最高优先级置顶）
+    // MARK: - M1 熔断露露专属决策卡（批奏折专区：直读 a-verifier-decisions/*-fused.md）
     var fusedDecisionBannerView: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
+        let topCard = monitor.fusedCards.first
+        let cardTitle = topCard?.title ?? "M1 轮次硬熔断停机保护（连续超 3 轮未收敛）"
+        let cardSummary = topCard?.summary ?? "任务触发 exit 3 停机保护，已自动拦截下一轮派单，杜绝空烧 Token。"
+        return VStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "flame.fill")
                     .foregroundColor(textRed)
                     .font(.system(size: fs(13), weight: .bold))
-                Text("M1 轮次硬熔断停机保护（连续超 3 轮未收敛）")
+                Text(cardTitle)
                     .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(textRed)
-                Spacer()
+                    .lineLimit(1)
+                Spacer(minLength: 4)
                 Text("待露露终裁")
-                    .font(.system(size: fs(13), weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(textAmber)
             }
-            
-            HStack(spacing: 10) {
-                Text("任务触发 exit 3 停机保护，已自动拦截下一轮派单，杜绝空烧 Token。")
-                    .font(.system(size: fs(13)))
+
+            HStack(spacing: 8) {
+                Text(cardSummary)
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
                     .lineLimit(2)
-                Spacer()
-                
+                Spacer(minLength: 4)
+
+                if let card = topCard {
+                    Button(action: {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: card.path))
+                    }) {
+                        Text("打开决策卡")
+                            .font(.system(size: fs(12), weight: .bold))
+                            .foregroundColor(primaryTextColor)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.14) : Color.black.opacity(0.08)))
+                    }
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: {
+                        monitor.copyToClipboard("\(card.title)\n\(card.summary)\n路径：\(card.path)", label: "决策卡摘要")
+                    }) {
+                        Text("复制")
+                            .font(.system(size: fs(12), weight: .bold))
+                            .foregroundColor(secondaryTextColor)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)))
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+
                 Button(action: {
                     monitor.resolveFusedByLulu()
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.seal.fill")
-                        Text("露露终裁 · 一键结案")
+                        Text("A·终裁结案")
                     }
-                    .font(.system(size: fs(13), weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
                     .background(
                         Capsule().fill(Color(hex: "EF4444"))
                     )
@@ -2877,12 +3110,15 @@ struct DynamicIslandView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(hex: "EF4444").opacity(monitor.panelIsDark ? 0.16 : 0.08))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color(hex: "EF4444").opacity(0.35), lineWidth: 1.0)
-                )
+            ZStack {
+                squircleCardBackground
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(hex: "EF4444").opacity(monitor.panelIsDark ? 0.16 : 0.10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color(hex: "EF4444").opacity(0.42), lineWidth: 1.0)
+                    )
+            }
         )
     }
     
@@ -3311,7 +3547,7 @@ struct DynamicIslandView: View {
                             }
                             .foregroundColor(monitor.expandedTaskId == item.id ? accentOnColor : accentTextColor)
                             .padding(.horizontal, 7)
-                            .padding(.vertical, 1.5)
+                            .padding(.vertical, 2)
                             .background(
                                 Capsule().fill(monitor.expandedTaskId == item.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                             )
@@ -3326,12 +3562,103 @@ struct DynamicIslandView: View {
                                 .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                                 .padding(.horizontal, 6)
-                                .padding(.vertical, 1.5)
+                                .padding(.vertical, 2)
                                 .background(
                                     Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                 )
                         }
                         .buttonStyle(PlainButtonStyle())
+                    }
+
+                    // 批奏折动作栏：A/B 机检 + 通过(confirm) + 打回(reject)
+                    HStack(spacing: 6) {
+                        let obsTag = monitor.observeResults[item.file] ?? "待机检 / B级"
+                        Text(obsTag)
+                            .font(.system(size: fs(11), weight: .bold))
+                            .foregroundColor(obsTag.contains("PASS") ? textGreen : (obsTag.contains("FAIL") || obsTag.contains("熔断") ? textRed : textPurple))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill((obsTag.contains("PASS") ? Color(hex: "10B981") : Color(hex: "8B5CF6")).opacity(0.14)))
+                            .lineLimit(1)
+
+                        Spacer(minLength: 4)
+
+                        Button(action: {
+                            monitor.runObserveVerify(file: item.file)
+                        }) {
+                            Text("机检")
+                                .font(.system(size: fs(12), weight: .bold))
+                                .foregroundColor(accentTextColor)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.12)))
+                        }
+                        .buttonStyle(PlainButtonStyle())
+
+                        Button(action: {
+                            monitor.confirmTask(file: item.file, dispatcher: item.to)
+                        }) {
+                            Text("通过")
+                                .font(.system(size: fs(12), weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color(hex: "059669")))
+                        }
+                        .buttonStyle(PlainButtonStyle())
+
+                        Button(action: {
+                            monitor.toggleRejectTarget(item.file)
+                        }) {
+                            Text("打回")
+                                .font(.system(size: fs(12), weight: .bold))
+                                .foregroundColor(textRed)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color(hex: "EF4444").opacity(monitor.panelIsDark ? 0.22 : 0.12)))
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+
+                    if monitor.rejectTargetFile == item.file {
+                        HStack(spacing: 6) {
+                            TextField("输入一句话打回原因（回车提交）", text: $monitor.rejectReasonText)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: fs(12), weight: .semibold))
+                                .foregroundColor(primaryTextColor)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.white.opacity(0.9))
+                                )
+                                .onSubmit {
+                                    monitor.rejectTask(file: item.file, dispatcher: item.to, reason: monitor.rejectReasonText)
+                                }
+
+                            Button(action: {
+                                monitor.rejectTask(file: item.file, dispatcher: item.to, reason: monitor.rejectReasonText)
+                            }) {
+                                Text("确认打回")
+                                    .font(.system(size: fs(12), weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Capsule().fill(Color(hex: "EF4444")))
+                            }
+                            .buttonStyle(PlainButtonStyle())
+
+                            Button(action: {
+                                monitor.toggleRejectTarget(nil)
+                            }) {
+                                Text("取消")
+                                    .font(.system(size: fs(12), weight: .semibold))
+                                    .foregroundColor(secondaryTextColor)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 4)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
                     }
                     
                     // 点开卡片展开核心提炼重点
@@ -3554,10 +3881,21 @@ struct DynamicIslandView: View {
     }
 
     func agentTaskDrawerView(agent: String) -> some View {
-        let tasks = agentTasks(agent)
+        let allTasks = agentTasks(agent)
+        let todayPrefix = monitor.todayDatePrefix
+        let todayTasksCount = allTasks.filter { $0.date.hasPrefix(todayPrefix) }.count
+        let q = monitor.drawerSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let tasks = allTasks.filter { t in
+            if monitor.drawerTodayOnly && !t.date.hasPrefix(todayPrefix) { return false }
+            if q.isEmpty { return true }
+            return t.title.lowercased().contains(q)
+                || t.file.lowercased().contains(q)
+                || t.from.lowercased().contains(q)
+                || t.to.lowercased().contains(q)
+        }
         let dones = agentDoneTasks(agent)
-        return VStack(spacing: 10) {
-            // Header Row (14pt 大标题 + 粗体返回)
+        return VStack(spacing: 8) {
+            // Header Row（高对比底座，抗深色壁纸透底）
             HStack {
                 Button(action: {
                     monitor.setDrawerAgent(nil)
@@ -3570,9 +3908,9 @@ struct DynamicIslandView: View {
                     }
                     .foregroundColor(accentTextColor)
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .padding(.vertical, 4)
                     .background(
-                        Capsule().fill(accentColor.opacity(monitor.panelIsDark ? 0.22 : 0.12))
+                        Capsule().fill(monitor.panelIsDark ? accentColor.opacity(0.24) : Color.white.opacity(0.84))
                     )
                 }
                 .buttonStyle(PressableScaleButtonStyle())
@@ -3582,10 +3920,15 @@ struct DynamicIslandView: View {
                 HStack(spacing: 6) {
                     Circle().fill(AgentRoster.identity(for: agent)?.color ?? accentColor)
                         .frame(width: 8, height: 8)
-                    Text("\(agentDisplayName(agent)) 收件箱 · \(tasks.count) 件未读")
+                    Text("\(agentDisplayName(agent)) 收件箱 · \(tasks.count)/\(allTasks.count)")
                         .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.10) : Color.white.opacity(0.78))
+                )
                 
                 Spacer()
                 
@@ -3602,13 +3945,51 @@ struct DynamicIslandView: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
-                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.12) : Color.white.opacity(0.84))
                     )
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-            .padding(.top, 4)
-            .padding(.horizontal, 16)
+            .padding(.top, 6)
+            .padding(.horizontal, 14)
+
+            // Search + Today filter bar (30pt)
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                    TextField("搜索标题 / 文件名 / 发件人…", text: $monitor.drawerSearchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(primaryTextColor)
+                    if !monitor.drawerSearchText.isEmpty {
+                        Button(action: { monitor.drawerSearchText = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: fs(12)))
+                                .foregroundColor(secondaryTextColor)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                }
+                .padding(.horizontal, 8)
+                .frame(height: 30)
+                .background(squircleCardBackground)
+
+                Button(action: { monitor.drawerTodayOnly.toggle() }) {
+                    Text("仅看今日 (\(todayTasksCount))")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(monitor.drawerTodayOnly ? accentOnColor : secondaryTextColor)
+                        .padding(.horizontal, 9)
+                        .frame(height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(monitor.drawerTodayOnly ? accentColor : (monitor.panelIsDark ? Color.white.opacity(0.10) : Color.white.opacity(0.78)))
+                        )
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(.horizontal, 14)
             
             // Task List + Done Feed Section (自适应展开 · 杜绝巨幅空白)
             ScrollView(.vertical, showsIndicators: false) {
@@ -3650,23 +4031,49 @@ struct DynamicIslandView: View {
                                         
                                         Spacer()
                                         
-                                        // Action buttons (点开卡片查看重点)
-                                        HStack(spacing: 6) {
+                                        // Action buttons (重点 / 复制 / 已读 / 原文)
+                                        HStack(spacing: 4) {
                                             Button(action: {
                                                 monitor.toggleTaskExpanded(task.id)
                                             }) {
-                                                HStack(spacing: 2) {
-                                                    Image(systemName: "sparkles")
-                                                        .font(.system(size: fs(12), weight: .semibold))
-                                                    Text(monitor.expandedTaskId == task.id ? "收起" : "重点")
-                                                        .font(.system(size: fs(12), weight: .bold))
-                                                }
-                                                .foregroundColor(monitor.expandedTaskId == task.id ? accentOnColor : accentTextColor)
-                                                .padding(.horizontal, 7)
-                                                .padding(.vertical, 4)
-                                                .background(
-                                                    Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
-                                                )
+                                                Text(monitor.expandedTaskId == task.id ? "收起" : "重点")
+                                                    .font(.system(size: fs(12), weight: .bold))
+                                                    .foregroundColor(monitor.expandedTaskId == task.id ? accentOnColor : accentTextColor)
+                                                    .padding(.horizontal, 7)
+                                                    .padding(.vertical, 4)
+                                                    .background(
+                                                        Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
+                                                    )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
+
+                                            Button(action: {
+                                                let path = "\(monitor.rootPath)/\(agent)/\(task.file)"
+                                                let txt = "\(task.title)\n路径：\(path)\n摘要：\(task.highlights.isEmpty ? "（无）" : task.highlights)"
+                                                monitor.copyToClipboard(txt, label: "任务摘要")
+                                            }) {
+                                                Text("复制")
+                                                    .font(.system(size: fs(12), weight: .semibold))
+                                                    .foregroundColor(secondaryTextColor)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 4)
+                                                    .background(
+                                                        Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
+                                                    )
+                                            }
+                                            .buttonStyle(PlainButtonStyle())
+
+                                            Button(action: {
+                                                monitor.markTaskRead(box: agent, file: task.file)
+                                            }) {
+                                                Text("已读")
+                                                    .font(.system(size: fs(12), weight: .bold))
+                                                    .foregroundColor(textGreen)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 4)
+                                                    .background(
+                                                        Capsule().fill(Color(hex: "10B981").opacity(monitor.panelIsDark ? 0.18 : 0.12))
+                                                    )
                                             }
                                             .buttonStyle(PlainButtonStyle())
                                             
@@ -3722,6 +4129,25 @@ struct DynamicIslandView: View {
                             }
                         }
                         .padding(.horizontal, 14)
+                    } else if !allTasks.isEmpty {
+                        HStack(spacing: 8) {
+                            Text("没有匹配当前筛选条件的未读任务")
+                                .font(.system(size: fs(13), weight: .semibold))
+                                .foregroundColor(secondaryTextColor)
+                            Button(action: {
+                                monitor.drawerSearchText = ""
+                                monitor.drawerTodayOnly = false
+                            }) {
+                                Text("清除筛选")
+                                    .font(.system(size: fs(12), weight: .bold))
+                                    .foregroundColor(accentTextColor)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Capsule().fill(accentColor.opacity(0.12)))
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                        .padding(.vertical, 10)
                     } else {
                         HStack(spacing: 6) {
                             Image(systemName: "checkmark.circle.fill")
@@ -4506,6 +4932,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.monitor.showSettings = true
                     self.updatePanelFrame(for: .expanded)
                     self.verifyVisibleVirtualPanel(phase: "settings", on: self.virtualScreenOrExit(id: id))
+                } else if let drawer = ProcessInfo.processInfo.environment["AGENT_ISLAND_TEST_DRAWER"], !drawer.isEmpty {
+                    self.monitor.selectedDrawerAgent = drawer
+                    self.updatePanelFrame(for: .expanded)
+                    self.verifyVisibleVirtualPanel(phase: "drawer", on: self.virtualScreenOrExit(id: id))
                 }
             }
         }

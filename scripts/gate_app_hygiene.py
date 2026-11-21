@@ -50,6 +50,7 @@ def check_app_swift(path: Path) -> dict:
         "SCALE_EFFECT_ON_PANEL": 0,
         "FONT_SUB_HIG_OR_ROUNDED": 0,
         "V4_DELTA_SNAPSHOT_CONTRACT": 0,
+        "V4_BATCH_C2_CONTRACT": 0,
     }
 
     def add_finding(rule: str, line_no: int, snippet: str) -> None:
@@ -106,6 +107,17 @@ def check_app_swift(path: Path) -> dict:
     for token, desc in required_anchors:
         if token not in joined_code:
             add_finding("V4_DELTA_SNAPSHOT_CONTRACT", 1, desc)
+
+    # Rule 6: V4_BATCH_C2_CONTRACT (M1/M2/M3 decision card, reject, ack, clipboard)
+    c2_anchors = [
+        ("func rejectTask(", "missing C2 rejectTask action"),
+        ("NSPasteboard", "missing C2 NSPasteboard copy support"),
+        ("func markTaskRead(", "missing C2 markTaskRead .ack action"),
+        ('"a-verifier-decisions"', "missing C2 a-verifier-decisions reader"),
+    ]
+    for token, desc in c2_anchors:
+        if token not in joined_code:
+            add_finding("V4_BATCH_C2_CONTRACT", 1, desc)
 
     verdict = "PASS" if not findings else "FAIL"
     return {
