@@ -280,7 +280,19 @@ struct WakeWorkerState: Equatable {
     }
 }
 
+private func evenCeil(_ v: CGFloat) -> CGFloat {
+    let r = v.rounded(.up)
+    return r.truncatingRemainder(dividingBy: 2) == 0 ? r : r + 1
+}
+
 class AgentMonitor: ObservableObject {
+    static let allowedScales: [Double] = [1.0, 1.1, 1.2]
+    static func snapScale(_ v: Double) -> Double {
+        if v >= 1.15 { return 1.2 }
+        if v >= 1.08 { return 1.1 }
+        return 1.0
+    }
+
     @Published var themeMode: ThemeMode = .auto
     @Published var accentHex: String = "007AFF"
     @Published var agyPending: Int = 0
@@ -419,8 +431,9 @@ class AgentMonitor: ObservableObject {
     }
 
     var preferredCompactWidth: CGFloat {
-        let len = CGFloat(compactHeadText.count) * 15.5 + CGFloat(compactTailText.count) * 11.5
-        return max(272, min(520, 68 + len))
+        let s = CGFloat(uiScale)
+        let len = CGFloat(compactHeadText.count) * (15.5 * s) + CGFloat(compactTailText.count) * (12.0 * s)
+        return evenCeil(max(280 * s, min(560 * s, 72 * s + len)))
     }
 
     /// 展开态内容高度（视图与窗口共用同一套数值，避免裁切）
@@ -439,19 +452,19 @@ class AgentMonitor: ObservableObject {
             return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
         }
         // 内联链路：总览头部 + 迷你条 + 展开拓扑区（含三层通道原文案）
-        if showTopology { return 420 + extra }
+        if showTopology { return 424 + extra }
         if showSettings { return 560 + extra }
 
         // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
         var h: CGFloat = 34
-        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 24 }
-        if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 34 }
+        if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 28 }
+        if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 36 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
-            h += pendingConfirms.isEmpty ? 62 : 104
+            h += pendingConfirms.isEmpty ? 64 : 108
         }
-        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 50 }
-        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 46 }
-        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 30 }
+        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 52 }
+        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 50 }
+        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 32 }
         let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
             partial + ((enabledSections[key.rawValue] ?? true) ? 1 : 0)
         }
@@ -529,7 +542,11 @@ class AgentMonitor: ObservableObject {
             self.accentHex = savedAccent
         }
         if let savedScale = preferences?.object(forKey: "agent_island_ui_scale") as? Double {
-            self.uiScale = min(1.4, max(0.8, savedScale))
+            let snapped = Self.snapScale(savedScale)
+            self.uiScale = snapped
+            if abs(snapped - savedScale) > 0.001 {
+                preferences?.set(snapped, forKey: "agent_island_ui_scale")
+            }
         }
         if let savedDock = preferences?.string(forKey: "agent_island_dock_edge"),
            let edge = DockEdge(rawValue: savedDock) {
@@ -695,10 +712,10 @@ class AgentMonitor: ObservableObject {
     }
 
     func setUIScale(_ value: Double) {
-        let clamped = min(1.4, max(0.8, (value * 20).rounded() / 20))
+        let snapped = Self.snapScale(value)
         DispatchQueue.main.async {
-            self.uiScale = clamped
-            self.preferences?.set(clamped, forKey: "agent_island_ui_scale")
+            self.uiScale = snapped
+            self.preferences?.set(snapped, forKey: "agent_island_ui_scale")
             self.onLayoutChange?()
         }
     }
@@ -1599,6 +1616,11 @@ struct PressableScaleButtonStyle: ButtonStyle {
 // MARK: - Dynamic Island View (Apple Control Center 1:1 Layout)
 struct DynamicIslandView: View {
     @ObservedObject var monitor: AgentMonitor
+
+    private var uiScale: CGFloat { CGFloat(monitor.uiScale) }
+    private func fs(_ base: CGFloat) -> CGFloat { (base * uiScale).rounded() }
+    private var is1xDisplay: Bool { (NSScreen.main?.backingScaleFactor ?? 1.0) <= 1.1 }
+    private var crispHairline: CGFloat { is1xDisplay ? 1.0 : 0.5 }
     
     var accentColor: Color {
         Color(hex: monitor.accentHex)
@@ -1608,81 +1630,85 @@ struct DynamicIslandView: View {
         ZStack {
             Color.clear
             
-            // The Frosted Capsule or Control Center Panel
-            ZStack {
-                // Layer 1: Apple Native Visual Effect Blur (Auto Light / Dark)
-                // 仅玻璃皮肤承接实时壁纸折射；陶瓷/曜石走窗口内材质以压低透射。
-                let usesLiveBackdrop = monitor.skin == .glass
-                let forceFallback = !usesLiveBackdrop || ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
-                AppleGlassBackground(
-                    material: usesLiveBackdrop
-                        ? (monitor.panelIsDark ? .hudWindow : .popover)
-                        : .windowBackground,
-                    blendingMode: usesLiveBackdrop ? .behindWindow : .withinWindow,
-                    glassTint: glassTintNSColor,
-                    // 保留 `.regular` 原生磨砂折射，避免 `.clear` 导致浅色高对比桌面文字穿透串行。
-                    glassStyle: .regular,
-                    cornerRadius: cornerRadius,
-                    forceFallback: forceFallback
-                )
+            // The Frosted Capsule or Control Center Panel（阴影仅作用在底层背景，不包裹文字树）
+            ZStack(alignment: .top) {
+                ZStack {
+                    // Layer 1: Apple Native Visual Effect Blur (Auto Light / Dark)
+                    // 仅玻璃皮肤承接实时壁纸折射；陶瓷/曜石走窗口内材质以压低透射。
+                    let usesLiveBackdrop = monitor.skin == .glass
+                    let forceFallback = !usesLiveBackdrop || ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
+                    AppleGlassBackground(
+                        material: usesLiveBackdrop
+                            ? (monitor.panelIsDark ? .hudWindow : .popover)
+                            : .windowBackground,
+                        blendingMode: usesLiveBackdrop ? .behindWindow : .withinWindow,
+                        glassTint: glassTintNSColor,
+                        // 保留 `.regular` 原生磨砂折射，避免 `.clear` 导致浅色高对比桌面文字穿透串行。
+                        glassStyle: .regular,
+                        cornerRadius: cornerRadius,
+                        forceFallback: forceFallback
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+
+                    // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(panelFill)
+
+                    // Layer 2.5: 1.0px(1x) / 0.5px(2x) inset stroke，做出玻璃砖内壁切面
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(
+                            Color.white.opacity(monitor.panelIsDark ? 0.14 : 0.30),
+                            lineWidth: crispHairline
+                        )
+
+                    // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: monitor.panelIsDark ? Color.white.opacity(0.65) : Color.white.opacity(0.98), location: 0.0),
+                                    .init(color: monitor.panelIsDark ? Color.white.opacity(0.20) : Color.black.opacity(0.08), location: 0.45),
+                                    .init(color: monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.14), location: 1.0)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 1.0
+                        )
+                }
+                .frame(width: contentWidth, height: contentHeight, alignment: .top)
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay {
+                    glassMirrorEdge
+                }
+                .shadow(
+                    color: Color.black.opacity(monitor.panelIsDark ? 0.45 : 0.16),
+                    radius: monitor.panelIsDark ? 18 : 12,
+                    x: 0,
+                    y: monitor.panelIsDark ? 6 : 4
+                )
+                .shadow(
+                    color: Color.black.opacity(monitor.panelIsDark ? 0.20 : 0.05),
+                    radius: 2,
+                    x: 0,
+                    y: 1
+                )
 
-                // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(panelFill)
-
-                // Layer 2.5: 0.5px inset stroke，做出玻璃砖内壁切面
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(
-                        Color.white.opacity(monitor.panelIsDark ? 0.14 : 0.30),
-                        lineWidth: 0.5
-                    )
-
-                // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        LinearGradient(
-                            stops: [
-                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.65) : Color.white.opacity(0.98), location: 0.0),
-                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.20) : Color.black.opacity(0.08), location: 0.45),
-                                .init(color: monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.14), location: 1.0)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 0.9
-                    )
-                
-                // Content View（GLASS_PROBE 仅用于像素验收：留空面板，只量玻璃本身）
+                // Content View（纯净矢量层，零 scaleEffect 拉伸、零外层 shadow 光栅化）
                 if ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS_PROBE"] != "1" {
                     contentForCurrentMode
+                        .frame(
+                            width: contentWidth,
+                            height: contentHeight,
+                            alignment: monitor.currentMode == .expanded ? .top : .center
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 }
             }
             .frame(width: contentWidth, height: contentHeight, alignment: .top)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            // 玻璃边缘压在裁剪之后：顶部 1px 镜面高光 + 底部 1px 深色压边，不被内容盖住
-            .overlay {
-                glassMirrorEdge
-            }
-            .scaleEffect(monitor.uiScale, anchor: .top)
-            .frame(width: contentWidth * monitor.uiScale, height: contentHeight * monitor.uiScale, alignment: .top)
             .animation(.spring(response: 0.32, dampingFraction: 0.76), value: monitor.currentMode)
             .animation(.easeInOut(duration: 0.25), value: monitor.panelIsDark)
             .animation(.easeInOut(duration: 0.22), value: monitor.skin)
-            .animation(.easeInOut(duration: 0.22), value: monitor.uiScale)
-            // Outer two-level shadow：大范围柔光 + 1.5px 贴边
-            .shadow(
-                color: Color.black.opacity(monitor.panelIsDark ? 0.45 : 0.16),
-                radius: monitor.panelIsDark ? 18 : 12,
-                x: 0,
-                y: monitor.panelIsDark ? 6 : 4
-            )
-            .shadow(
-                color: Color.black.opacity(monitor.panelIsDark ? 0.20 : 0.05),
-                radius: 1.5,
-                x: 0,
-                y: 1
-            )
             .contentShape(Rectangle())
             .onTapGesture {
                 if monitor.currentMode == .compact {
@@ -1755,18 +1781,18 @@ struct DynamicIslandView: View {
                     .animation(.easeInOut(duration: 1.1), value: monitor.pulse)
 
                 Image(systemName: compactGlyphName)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(.white)
             }
 
             Text(compactHead)
-                .font(.system(size: 15, weight: .heavy, design: .rounded))
+                .font(.system(size: fs(15), weight: .heavy))
                 .foregroundColor(primaryTextColor)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
 
             Text(compactTail)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .font(.system(size: fs(13), weight: .bold))
                 .foregroundColor(secondaryTextColor)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
@@ -1774,7 +1800,7 @@ struct DynamicIslandView: View {
             Spacer(minLength: 0)
 
             Image(systemName: "chevron.down")
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: fs(12), weight: .bold))
                 .foregroundColor(accentColor)
         }
         .padding(.horizontal, 12)
@@ -1814,16 +1840,16 @@ struct DynamicIslandView: View {
                     .frame(width: 18, height: 18)
                 Image(systemName: "bell.fill")
                     .foregroundColor(.white)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
             }
             
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(primaryTextColor)
                     .lineLimit(1)
                 Text(subtitle)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
                     .lineLimit(1)
             }
@@ -1843,15 +1869,15 @@ struct DynamicIslandView: View {
                         .frame(width: 22, height: 22)
                     Image(systemName: "slider.horizontal.3")
                         .foregroundColor(.white)
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.system(size: fs(13), weight: .bold))
                 }
                 Text("总览")
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(15), weight: .bold))
                     .foregroundColor(primaryTextColor)
 
                 if monitor.dataUnknown {
                     Text("数据未知")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(12), weight: .bold))
                         .foregroundColor(textAmber)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 2)
@@ -1866,7 +1892,7 @@ struct DynamicIslandView: View {
                         }
                     }) {
                         Text("待办总览")
-                            .font(.system(size: 13, weight: !monitor.showTopology ? .bold : .semibold, design: .rounded))
+                            .font(.system(size: fs(13), weight: !monitor.showTopology ? .bold : .semibold))
                             .foregroundColor(!monitor.showTopology ? accentOnColor : secondaryTextColor)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
@@ -1887,12 +1913,12 @@ struct DynamicIslandView: View {
                 // Status hint / reconcile feedback
                 if let fb = monitor.reconcileFeedback {
                     Text(fb)
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
                         .transition(.scale)
                 } else {
                     Text("Esc 收起")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: fs(13), weight: .semibold))
                         .foregroundColor(secondaryTextColor)
                 }
                 
@@ -1903,7 +1929,7 @@ struct DynamicIslandView: View {
                 }) {
                     Image(systemName: monitor.showSettings ? "gearshape.fill" : "gearshape")
                         .foregroundColor(monitor.showSettings ? accentColor : secondaryTextColor)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: fs(13), weight: .semibold))
                 }
                 .buttonStyle(PlainButtonStyle())
                 .help("外观、尺寸、停靠边与模块开关")
@@ -1913,7 +1939,7 @@ struct DynamicIslandView: View {
                 }) {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundColor(secondaryTextColor)
-                        .font(.system(size: 16))
+                        .font(.system(size: fs(16)))
                 }
                 .buttonStyle(PlainButtonStyle())
             }
@@ -1988,7 +2014,7 @@ struct DynamicIslandView: View {
         HStack(spacing: 6) {
             if monitor.dataUnknown {
                 Text("⚪️ 未知")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(textAmber)
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.14)))
@@ -1998,10 +2024,10 @@ struct DynamicIslandView: View {
                     HStack(spacing: 4) {
                         Circle().fill(agent.color).frame(width: 6, height: 6)
                         Text(agent.short)
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(12), weight: .bold))
                             .foregroundColor(primaryTextColor)
                         Text(count == 0 ? "已读" : "\(count) 未读")
-                            .font(.system(size: 11, weight: count == 0 ? .semibold : .bold, design: .rounded))
+                            .font(.system(size: fs(12), weight: count == 0 ? .semibold : .bold))
                             .foregroundColor(count == 0 ? secondaryTextColor : agent.color)
                     }
                     .padding(.horizontal, 6).padding(.vertical, 1)
@@ -2013,17 +2039,18 @@ struct DynamicIslandView: View {
 
             HStack(spacing: 4) {
                 Image(systemName: "tray.and.arrow.down.fill")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(textPurple)
                 Text(monitor.totalSubmitted == 0 ? "无待验收" : "\(monitor.totalSubmitted) 待验收")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(monitor.totalSubmitted == 0 ? secondaryTextColor : Color(hex: "8B5CF6"))
             }
             .padding(.horizontal, 7).padding(.vertical, 3)
             .background(Capsule().fill(Color(hex: "8B5CF6").opacity(monitor.totalSubmitted == 0 ? 0.05 : 0.13)))
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 0)
+        .padding(.vertical, 2)
+        .frame(minHeight: 28)
         .background(squircleCardBackground)
     }
 
@@ -2059,10 +2086,10 @@ struct DynamicIslandView: View {
                     .frame(width: 7, height: 7)
                     .opacity(pulseActive ? (monitor.pulse ? 1.0 : 0.45) : 1.0)
                 Text("AGY后台")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(primaryTextColor)
                 Text(statusLabel)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(statusColor)
             }
             .padding(.horizontal, 7).padding(.vertical, 3)
@@ -2073,18 +2100,18 @@ struct DynamicIslandView: View {
             // ② 中段：今日次数 + 44×5pt 预算条 + 百分比（详情放 hover tooltip，保持一瞥性）
             HStack(spacing: 6) {
                 Text("\(ws.dailyRuns)/\(ws.dailyRunsLimit)次")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .font(.system(size: fs(12), weight: .semibold, design: .monospaced))
                     .foregroundColor(primaryTextColor)
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(monitor.panelIsDark ? Color.white.opacity(0.18) : Color.black.opacity(0.14))
-                        .frame(width: 48, height: 5.5)
+                        .frame(width: 48, height: 6)
                     Capsule()
                         .fill(barColor)
-                        .frame(width: max(4, 48 * ws.tokenRatio), height: 5.5)
+                        .frame(width: max(4, (48 * ws.tokenRatio).rounded()), height: 6)
                 }
                 Text("\(ws.tokenPct)%")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .font(.system(size: fs(12), weight: .bold, design: .monospaced))
                     .foregroundColor(ws.tokenRatio >= 0.8 ? Color(hex: "D97706") : secondaryTextColor)
             }
             .help(ws.tooltipText)
@@ -2095,12 +2122,12 @@ struct DynamicIslandView: View {
             Button(action: { monitor.toggleAgyWakePaused() }) {
                 HStack(spacing: 3) {
                     Image(systemName: ws.paused ? "play.fill" : "pause.fill")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: fs(11), weight: .bold))
                     Text(ws.paused ? "恢复" : "暂停")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(12), weight: .bold))
                 }
                 .foregroundColor(ws.paused ? (monitor.panelIsDark ? Color(hex: "34D399") : Color(hex: "047857")) : primaryTextColor)
-                .padding(.horizontal, 9).padding(.vertical, 3.5)
+                .padding(.horizontal, 9).padding(.vertical, 4)
                 .background(
                     Capsule()
                         .fill(ws.paused
@@ -2111,7 +2138,7 @@ struct DynamicIslandView: View {
                                 ws.paused
                                     ? Color(hex: "10B981").opacity(0.45)
                                     : (monitor.panelIsDark ? Color.white.opacity(0.24) : Color.black.opacity(0.18)),
-                                lineWidth: 0.8
+                                lineWidth: 1.0
                             )
                         )
                 )
@@ -2119,7 +2146,7 @@ struct DynamicIslandView: View {
             .buttonStyle(PlainButtonStyle())
             .help(ws.paused ? "恢复 AGY 后台自动唤醒" : "暂停 AGY 后台自动唤醒（不影响前台窗口）")
         }
-        .frame(height: 34)
+        .frame(height: 36)
         .padding(.horizontal, 10)
         .background(squircleCardBackground)
     }
@@ -2183,7 +2210,7 @@ struct DynamicIslandView: View {
                         HStack {
                             Spacer()
                             Image(systemName: monitor.showTopology ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 9, weight: .bold))
+                                .font(.system(size: fs(11), weight: .bold))
                                 .foregroundColor(monitor.panelIsDark ? Color(hex: "D7E6F9") : Color(hex: "1F3A5F"))
                         }
                     }
@@ -2207,7 +2234,7 @@ struct DynamicIslandView: View {
                     }
                 }
                 .padding(.horizontal, 10)
-                .frame(height: 27)
+                .frame(height: 28)
 
                 // V5 + ⑨：保留最近通讯行与单光点，并补「最后通讯 N 秒前」。
                 HStack(spacing: 5) {
@@ -2215,16 +2242,15 @@ struct DynamicIslandView: View {
                         .fill(monitor.activePulses.isEmpty ? textGray : textGreen)
                         .frame(width: 5, height: 5)
                     Text("\(miniRecentCommText) · \(miniLastCommAgoText)")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .font(.system(size: fs(12), weight: .semibold))
                         .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.82)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10)
-                .frame(height: 15)
+                .frame(height: 18)
             }
-            .frame(height: 44)
+            .frame(height: 48)
             .background(squircleCardBackground)
             .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
@@ -2263,9 +2289,9 @@ struct DynamicIslandView: View {
     func miniStripChannelTag(text: String, icon: String, ok: Bool, tint: Color) -> some View {
         HStack(spacing: 3) {
             Image(systemName: icon)
-                .font(.system(size: 9.5, weight: .bold))
+                .font(.system(size: fs(11), weight: .bold))
             Text(text)
-                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .font(.system(size: fs(11), weight: .bold))
             Circle()
                 .fill(ok ? Color(hex: "10B981") : Color(hex: "EF4444"))
                 .frame(width: 4, height: 4)
@@ -2282,7 +2308,7 @@ struct DynamicIslandView: View {
             )
             .overlay(
                 Circle().fill(Color.white.opacity(monitor.panelIsDark ? 0.88 : 0.72))
-                    .frame(width: 3.5, height: 3.5)
+                    .frame(width: 4, height: 4)
             )
             .shadow(color: agent.color.opacity(0.30), radius: 1.5)
             .help(agent.short)
@@ -2333,25 +2359,25 @@ struct DynamicIslandView: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Text(tier)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(muted ? secondaryTextColor : tint)
                     .frame(width: 40, alignment: .leading)
                 Image(systemName: icon)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(muted ? secondaryTextColor : tint)
                     .frame(width: 14)
                 Text(name)
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(muted ? secondaryTextColor : primaryTextColor)
                 Text(detail)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
                     .lineLimit(1)
                 Spacer(minLength: 0)
                 HStack(spacing: 3) {
                     Circle().fill(ok ? Color(hex: "10B981") : Color(hex: "EF4444")).frame(width: 5, height: 5)
                     Text(ok ? "在线" : "离线")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: fs(12), weight: .semibold))
                         .foregroundColor(ok ? Color(hex: "059669") : Color(hex: "DC2626"))
                 }
             }
@@ -2376,13 +2402,13 @@ struct DynamicIslandView: View {
             Spacer(minLength: 0)
             Button(action: { monitor.refreshAll() }) {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(secondaryTextColor)
             }
             .buttonStyle(PlainButtonStyle())
             Button(action: { monitor.setMode(.compact) }) {
                 Text("收起")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
             }
             .buttonStyle(PlainButtonStyle())
@@ -2397,18 +2423,18 @@ struct DynamicIslandView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "gearshape.fill")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(accentTextColor)
                 Text("外观与面板")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(primaryTextColor)
                 Spacer()
                 Text(monitor.dataUnknown ? "数据未知" : "数据正常")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(monitor.dataUnknown ? Color(hex: "B45309") : Color(hex: "059669"))
                 Button(action: { withAnimation { monitor.showSettings = false } }) {
                     Text("完成")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(accentTextColor)
                         .padding(.horizontal, 9).padding(.vertical, 3)
                         .background(Capsule().fill(accentColor.opacity(0.12)))
@@ -2434,16 +2460,13 @@ struct DynamicIslandView: View {
                         }
                     }
                     settingsRow(title: "尺寸") {
-                        HStack(spacing: 8) {
-                            Slider(value: Binding(
-                                get: { monitor.uiScale },
-                                set: { monitor.setUIScale($0) }
-                            ), in: 0.8...1.4, step: 0.05)
-                            .frame(width: 150)
-                            Text("\(Int(monitor.uiScale * 100))%")
-                                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .frame(width: 38, alignment: .trailing)
+                        HStack(spacing: 4) {
+                            ForEach(AgentMonitor.allowedScales, id: \.self) { sc in
+                                let label = sc == 1.0 ? "标准 100%" : (sc == 1.1 ? "舒适 110%" : "大字 120%")
+                                settingsChip(label, selected: abs(monitor.uiScale - sc) < 0.01) {
+                                    monitor.setUIScale(sc)
+                                }
+                            }
                         }
                     }
                     settingsRow(title: "停靠边") {
@@ -2466,7 +2489,7 @@ struct DynamicIslandView: View {
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("模块 · 开关与排序（拖动行可换序）")
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(12), weight: .bold))
                             .foregroundColor(secondaryTextColor)
                         ForEach(monitor.sectionOrder, id: \.self) { key in
                             sectionSettingsRow(key)
@@ -2496,7 +2519,7 @@ struct DynamicIslandView: View {
     func settingsRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         HStack(spacing: 8) {
             Text(title)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .font(.system(size: fs(13), weight: .bold))
                 .foregroundColor(secondaryTextColor)
                 .frame(width: 44, alignment: .leading)
             content()
@@ -2510,10 +2533,10 @@ struct DynamicIslandView: View {
     func settingsChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 11, weight: selected ? .bold : .semibold, design: .rounded))
+                .font(.system(size: fs(12), weight: selected ? .bold : .semibold))
                 .foregroundColor(selected ? accentOnColor : secondaryTextColor)
                 .padding(.horizontal, 8)
-                .padding(.vertical, 3.5)
+                .padding(.vertical, 4)
                 .background(
                     Capsule().fill(selected ? accentColor : (monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05)))
                 )
@@ -2526,31 +2549,31 @@ struct DynamicIslandView: View {
         let enabled = monitor.enabledSections[key] ?? true
         return HStack(spacing: 7) {
             Image(systemName: "line.3.horizontal")
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: fs(12), weight: .bold))
                 .foregroundColor(secondaryTextColor)
             Button(action: { monitor.toggleSection(key) }) {
                 Image(systemName: enabled ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(enabled ? accentColor : secondaryTextColor)
             }
             .buttonStyle(PlainButtonStyle())
             Text(section?.name ?? key)
-                .font(.system(size: 13, weight: enabled ? .bold : .semibold, design: .rounded))
+                .font(.system(size: fs(13), weight: enabled ? .bold : .semibold))
                 .foregroundColor(enabled ? primaryTextColor : secondaryTextColor)
             Spacer(minLength: 0)
             Button(action: { monitor.moveSection(key, by: -1) }) {
-                Image(systemName: "chevron.up").font(.system(size: 11, weight: .bold))
+                Image(systemName: "chevron.up").font(.system(size: fs(12), weight: .bold))
             }
             .buttonStyle(PlainButtonStyle())
             .foregroundColor(secondaryTextColor)
             Button(action: { monitor.moveSection(key, by: 1) }) {
-                Image(systemName: "chevron.down").font(.system(size: 11, weight: .bold))
+                Image(systemName: "chevron.down").font(.system(size: fs(12), weight: .bold))
             }
             .buttonStyle(PlainButtonStyle())
             .foregroundColor(secondaryTextColor)
         }
         .padding(.horizontal, 6)
-        .padding(.vertical, 3.5)
+        .padding(.vertical, 4)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
             .fill(monitor.panelIsDark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)))
     }
@@ -2558,8 +2581,8 @@ struct DynamicIslandView: View {
     func assetButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 3) {
-                Image(systemName: icon).font(.system(size: 13))
-                Text(label).font(.system(size: 13, weight: .semibold))
+                Image(systemName: icon).font(.system(size: fs(13)))
+                Text(label).font(.system(size: fs(13), weight: .semibold))
             }
             .foregroundColor(secondaryTextColor)
         }
@@ -2572,19 +2595,19 @@ struct DynamicIslandView: View {
             HStack(spacing: 8) {
                 Image(systemName: "flame.fill")
                     .foregroundColor(textRed)
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: fs(13), weight: .bold))
                 Text("M1 轮次硬熔断停机保护（连续超 3 轮未收敛）")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(textRed)
                 Spacer()
                 Text("待露露终裁")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(textAmber)
             }
             
             HStack(spacing: 10) {
                 Text("任务触发 exit 3 停机保护，已自动拦截下一轮派单，杜绝空烧 Token。")
-                    .font(.system(size: 13))
+                    .font(.system(size: fs(13)))
                     .foregroundColor(secondaryTextColor)
                     .lineLimit(2)
                 Spacer()
@@ -2596,7 +2619,7 @@ struct DynamicIslandView: View {
                         Image(systemName: "checkmark.seal.fill")
                         Text("露露终裁 · 一键结案")
                     }
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .bold))
                     .foregroundColor(.white)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
@@ -2614,7 +2637,7 @@ struct DynamicIslandView: View {
                 .fill(Color(hex: "EF4444").opacity(monitor.panelIsDark ? 0.16 : 0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color(hex: "EF4444").opacity(0.35), lineWidth: 0.9)
+                        .stroke(Color(hex: "EF4444").opacity(0.35), lineWidth: 1.0)
                 )
         )
     }
@@ -2626,19 +2649,19 @@ struct DynamicIslandView: View {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("横向链路 · 事件驱动脉冲")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                     Text("AGY 左 · Alma 中 · Ping 右")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: fs(12), weight: .semibold))
                         .foregroundColor(secondaryTextColor)
                 }
                 Spacer()
                 // 坚果云：右上角小节点，只作冷备，不参与通讯判定
                 HStack(spacing: 4) {
                     Image(systemName: "externaldrive.fill")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: fs(12), weight: .semibold))
                     Text("坚果云 · 冷备")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(12), weight: .bold))
                     Circle()
                         .fill(monitor.nutstoreOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
                         .frame(width: 5, height: 5)
@@ -2659,9 +2682,9 @@ struct DynamicIslandView: View {
 
                     HStack(spacing: 4) {
                         Image(systemName: "bolt.horizontal.fill")
-                            .font(.system(size: 10, weight: .bold))
+                            .font(.system(size: fs(11), weight: .bold))
                         Text("Funnel 443 · 主通道")
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(12), weight: .bold))
                     }
                     .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
                     .padding(.horizontal, 7)
@@ -2690,20 +2713,20 @@ struct DynamicIslandView: View {
             // Tailscale：底部基座横条
             HStack(spacing: 7) {
                 Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(textBlue)
                 Text("Tailscale 私网 · 基座")
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .font(.system(size: fs(12), weight: .bold))
                     .foregroundColor(primaryTextColor)
                 Text("跨机底座，不承载业务脉冲")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
                 Spacer()
                 Circle()
                     .fill(monitor.tailscaleOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
                     .frame(width: 6, height: 6)
                 Text(monitor.tailscaleOnline ? "在线" : "离线")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(monitor.tailscaleOnline ? textGreen : textRed)
             }
             .padding(.horizontal, 10)
@@ -2717,15 +2740,15 @@ struct DynamicIslandView: View {
                     .frame(width: 5, height: 5)
                 if monitor.activePulses.isEmpty {
                     Text("最近 15 秒无通讯 · 脉冲静默")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: fs(12), weight: .semibold))
                         .foregroundColor(secondaryTextColor)
                 } else {
                     Text("最近 15 秒 \(monitor.activePulses.reduce(0) { $0 + $1.count }) 次通讯")
-                        .font(.system(size: 11, weight: .bold))
+                        .font(.system(size: fs(12), weight: .bold))
                         .foregroundColor(textGreen)
                     ForEach(Array(monitor.activePulses.prefix(3))) { pulse in
                         Text("\(AgentRoster.identity(for: pulse.source)?.short ?? pulse.source) → \(AgentRoster.identity(for: pulse.target)?.short ?? pulse.target) ×\(pulse.count)")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .font(.system(size: fs(12), weight: .semibold, design: .monospaced))
                             .foregroundColor(secondaryTextColor)
                     }
                 }
@@ -2747,14 +2770,14 @@ struct DynamicIslandView: View {
     func channelCopyRow(tier: String, name: String, detail: String) -> some View {
         HStack(spacing: 5) {
             Text(tier)
-                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .font(.system(size: fs(12), weight: .bold))
                 .foregroundColor(textGray)
                 .frame(width: 40, alignment: .leading)
             Text(name)
-                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .font(.system(size: fs(12), weight: .bold))
                 .foregroundColor(primaryTextColor)
             Text("· \(detail)")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: fs(12), weight: .semibold))
                 .foregroundColor(secondaryTextColor)
             Spacer(minLength: 0)
         }
@@ -2772,14 +2795,14 @@ struct DynamicIslandView: View {
                     .frame(width: 40, height: 40)
                     .shadow(color: agent.color.opacity(isActive ? 0.55 : 0), radius: 5)
                 Image(systemName: agent.symbol)
-                    .font(.system(size: 14, weight: .bold))
+                    .font(.system(size: fs(14), weight: .bold))
                     .foregroundColor(agent.color)
             }
             Text(agent.short)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .font(.system(size: fs(13), weight: .bold))
                 .foregroundColor(primaryTextColor)
             Text("\(monitor.pendingCount(for: agent.key)) 待办")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: fs(12), weight: .semibold))
                 .foregroundColor(secondaryTextColor)
         }
         .frame(width: 100, height: 82, alignment: .top)
@@ -2940,11 +2963,11 @@ struct DynamicIslandView: View {
                             .fill(Color(hex: "8B5CF6"))
                             .frame(width: 18, height: 18)
                         Image(systemName: "bell.badge.fill")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(.system(size: fs(12), weight: .bold))
                             .foregroundColor(.white)
                     }
                     Text("架构调度 · 发起方亲自视觉验收闭环")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(textPurple)
                     
                     Spacer()
@@ -2957,7 +2980,7 @@ struct DynamicIslandView: View {
                                 }
                             }) {
                                 Image(systemName: "chevron.left")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .font(.system(size: fs(12), weight: .bold))
                                     .foregroundColor(primaryTextColor)
                                     .frame(width: 18, height: 18)
                                     .background(squircleCardBackground)
@@ -2965,7 +2988,7 @@ struct DynamicIslandView: View {
                             .buttonStyle(PlainButtonStyle())
                             
                             Text("\(safeIdx + 1)/\(count)")
-                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .font(.system(size: fs(13), weight: .bold, design: .monospaced))
                                 .foregroundColor(secondaryTextColor)
                             
                             Button(action: {
@@ -2974,7 +2997,7 @@ struct DynamicIslandView: View {
                                 }
                             }) {
                                 Image(systemName: "chevron.right")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .font(.system(size: fs(12), weight: .bold))
                                     .foregroundColor(primaryTextColor)
                                     .frame(width: 18, height: 18)
                                     .background(squircleCardBackground)
@@ -2990,7 +3013,7 @@ struct DynamicIslandView: View {
                     // Task Title + 4-Step Stepper
                     HStack(alignment: .center) {
                         Text(item.title)
-                            .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(13), weight: .bold))
                             .foregroundColor(primaryTextColor)
                             .lineLimit(1)
                         Spacer()
@@ -3001,19 +3024,19 @@ struct DynamicIslandView: View {
                     HStack(spacing: 8) {
                         HStack(spacing: 4) {
                             Text("履约方: \(item.from)")
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.system(size: fs(13), weight: .semibold))
                                 .foregroundColor(textBlue)
                             Text("➔")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                             Text("派单方: \(item.to)")
-                                .font(.system(size: 13, weight: .bold))
+                                .font(.system(size: fs(13), weight: .bold))
                                 .foregroundColor(textPurple)
                         }
                         
                         if !item.artifacts.isEmpty {
                             Text("•")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                             Button(action: {
                                 let ap = item.artifacts.hasPrefix("/") ? item.artifacts : "\(monitor.rootPath)/../\(item.artifacts)"
@@ -3021,9 +3044,9 @@ struct DynamicIslandView: View {
                             }) {
                                 HStack(spacing: 3) {
                                     Image(systemName: "arrow.up.right.square.fill")
-                                        .font(.system(size: 11, weight: .semibold))
+                                        .font(.system(size: fs(12), weight: .semibold))
                                     Text("产物: \(item.artifacts)")
-                                        .font(.system(size: 13, weight: .semibold))
+                                        .font(.system(size: fs(13), weight: .semibold))
                                         .lineLimit(1)
                                 }
                                 .foregroundColor(accentTextColor)
@@ -3038,9 +3061,9 @@ struct DynamicIslandView: View {
                         }) {
                             HStack(spacing: 2) {
                                 Image(systemName: "sparkles")
-                                    .font(.system(size: 11, weight: .semibold))
+                                    .font(.system(size: fs(12), weight: .semibold))
                                 Text(monitor.expandedTaskId == item.id ? "收起" : "重点")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .font(.system(size: fs(12), weight: .bold))
                             }
                             .foregroundColor(monitor.expandedTaskId == item.id ? accentOnColor : accentTextColor)
                             .padding(.horizontal, 7)
@@ -3056,7 +3079,7 @@ struct DynamicIslandView: View {
                             NSWorkspace.shared.open(URL(fileURLWithPath: path))
                         }) {
                             Text("原文")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 1.5)
@@ -3072,14 +3095,14 @@ struct DynamicIslandView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 4) {
                                 Image(systemName: "text.quote")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .font(.system(size: fs(12), weight: .bold))
                                     .foregroundColor(accentTextColor)
                                 Text("核心提炼重点")
-                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                    .font(.system(size: fs(13), weight: .bold))
                                     .foregroundColor(accentTextColor)
                             }
                             Text(item.highlights.isEmpty ? "（本单据暂无正文摘要）" : item.highlights)
-                                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                .font(.system(size: fs(13), weight: .semibold))
                                 .foregroundColor(primaryTextColor)
                                 .lineSpacing(3)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -3117,40 +3140,40 @@ struct DynamicIslandView: View {
                     .fill(Color(hex: "059669").opacity(monitor.panelIsDark ? 0.20 : 0.12))
                     .frame(width: 34, height: 34)
                 Image(systemName: "checkmark.shield.fill")
-                    .font(.system(size: 16, weight: .bold))
+                    .font(.system(size: fs(16), weight: .bold))
                     .foregroundColor(textGreen)
             }
             
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {
-                    Text("全网架构就绪 · 0 积压待办")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                    Text(totalPending == 0 ? "全网架构就绪 · 0 积压待办" : "全网链路就绪 · 0 待你验收")
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                     Text("•")
                         .foregroundColor(secondaryTextColor)
                     Text("Funnel 443 专线直达")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: fs(13), weight: .semibold))
                         .foregroundColor(textGreen)
                 }
                 
                 HStack(spacing: 6) {
                     HStack(spacing: 3) {
                         Image(systemName: "circle.hexagongrid.fill")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: fs(12), weight: .semibold))
                             .foregroundColor(accentTextColor)
                         Text(monitor.tokenTotal)
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(13), weight: .bold))
                             .foregroundColor(primaryTextColor)
                     }
                     Text("·")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: fs(12), weight: .semibold))
                         .foregroundColor(secondaryTextColor)
                     HStack(spacing: 3) {
                         Image(systemName: "bolt.fill")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: fs(12), weight: .semibold))
                             .foregroundColor(textGreen)
                         Text("缓存率 \(monitor.tokenCacheRate)")
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .font(.system(size: fs(12), weight: .semibold))
                             .foregroundColor(secondaryTextColor)
                     }
                 }
@@ -3163,9 +3186,9 @@ struct DynamicIslandView: View {
             }) {
                 HStack(spacing: 4) {
                     Image(systemName: "sparkle.magnifyingglass")
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.system(size: fs(13), weight: .bold))
                     Text("全网核验")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                 }
                 .foregroundColor(.white)
                 .padding(.horizontal, 10)
@@ -3192,11 +3215,11 @@ struct DynamicIslandView: View {
                             .fill(iconBg)
                             .frame(width: 22, height: 22)
                         Image(systemName: icon)
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: fs(13), weight: .bold))
                             .foregroundColor(.white)
                     }
                     Text(title)
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                     Spacer()
                     if hasPending {
@@ -3206,7 +3229,7 @@ struct DynamicIslandView: View {
                     }
                 }
                 Text(subtitle)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .semibold))
                     .foregroundColor(hasPending ? textTint : secondaryTextColor)
             }
             .padding(.horizontal, 10)
@@ -3221,22 +3244,22 @@ struct DynamicIslandView: View {
     func lifecycleStepperView(stage: String) -> some View {
         HStack(spacing: 3) {
             stepperNode(name: "派单", active: true, done: stage != "dispatched")
-            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "接单", active: stage == "accepted" || stage == "submitted" || stage == "confirmed", done: stage == "submitted" || stage == "confirmed")
-            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "待验", active: stage == "submitted" || stage == "confirmed", done: stage == "confirmed", highlight: stage == "submitted")
-            Text("›").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "结案", active: stage == "confirmed", done: stage == "confirmed")
         }
     }
 
     func stepperNode(name: String, active: Bool, done: Bool, highlight: Bool = false) -> some View {
-        HStack(spacing: 2.5) {
+        HStack(spacing: 3) {
             Circle()
                 .fill(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.35)))
                 .frame(width: 5, height: 5)
             Text(name)
-                .font(.system(size: 11, weight: highlight || done || active ? .bold : .semibold, design: .rounded))
+                .font(.system(size: fs(12), weight: highlight || done || active ? .bold : .semibold))
                 .foregroundColor(highlight ? (monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9")) : (active ? (done ? (monitor.panelIsDark ? Color(hex: "30D158") : Color(hex: "047857")) : primaryTextColor) : secondaryTextColor))
         }
         .padding(.horizontal, 4.5)
@@ -3254,7 +3277,7 @@ struct DynamicIslandView: View {
                     .frame(width: 6, height: 6)
                     .shadow(color: (isOk ? Color(hex: "10B981") : Color(hex: "EF4444")).opacity(0.5), radius: 1.5)
                 Text(name)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: fs(13), weight: .semibold))
                     .foregroundColor(isOk ? secondaryTextColor : Color(hex: "EF4444"))
             }
         }
@@ -3294,9 +3317,9 @@ struct DynamicIslandView: View {
                 }) {
                     HStack(spacing: 5) {
                         Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: fs(13), weight: .bold))
                         Text("返回")
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .font(.system(size: fs(13), weight: .bold))
                     }
                     .foregroundColor(accentTextColor)
                     .padding(.horizontal, 10)
@@ -3313,7 +3336,7 @@ struct DynamicIslandView: View {
                     Circle().fill(AgentRoster.identity(for: agent)?.color ?? accentColor)
                         .frame(width: 8, height: 8)
                     Text("\(agentDisplayName(agent)) 收件箱 · \(tasks.count) 件未读")
-                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                        .font(.system(size: fs(13), weight: .bold))
                         .foregroundColor(primaryTextColor)
                 }
                 
@@ -3324,13 +3347,13 @@ struct DynamicIslandView: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "folder.fill")
-                            .font(.system(size: 13))
+                            .font(.system(size: fs(13)))
                         Text("访达")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.system(size: fs(13), weight: .semibold))
                     }
                     .foregroundColor(secondaryTextColor)
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 3.5)
+                    .padding(.vertical, 4)
                     .background(
                         Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                     )
@@ -3354,25 +3377,25 @@ struct DynamicIslandView: View {
                                                 .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
                                                 .frame(width: 24, height: 24)
                                             Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.badge.fill" : "doc.text.fill"))
-                                                .font(.system(size: 13, weight: .bold))
+                                                .font(.system(size: fs(13), weight: .bold))
                                                 .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
                                         }
                                         
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(task.title)
-                                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                .font(.system(size: fs(13), weight: .bold))
                                                 .foregroundColor(primaryTextColor)
                                                 .lineLimit(1)
                                             
                                             HStack(spacing: 6) {
                                                 lifecycleStepperView(stage: task.stage)
-                                                Text("•").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+                                                Text("•").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
                                                 Text("\(task.from) ➔ \(task.to)")
-                                                    .font(.system(size: 11, weight: .semibold))
+                                                    .font(.system(size: fs(12), weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                 if !task.eta.isEmpty {
                                                     Text("• \(task.eta)")
-                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .font(.system(size: fs(12), weight: .semibold))
                                                         .foregroundColor(textBlue)
                                                 }
                                             }
@@ -3387,13 +3410,13 @@ struct DynamicIslandView: View {
                                             }) {
                                                 HStack(spacing: 2) {
                                                     Image(systemName: "sparkles")
-                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .font(.system(size: fs(12), weight: .semibold))
                                                     Text(monitor.expandedTaskId == task.id ? "收起" : "重点")
-                                                        .font(.system(size: 11, weight: .bold))
+                                                        .font(.system(size: fs(12), weight: .bold))
                                                 }
                                                 .foregroundColor(monitor.expandedTaskId == task.id ? accentOnColor : accentTextColor)
                                                 .padding(.horizontal, 7)
-                                                .padding(.vertical, 3.5)
+                                                .padding(.vertical, 4)
                                                 .background(
                                                     Capsule().fill(monitor.expandedTaskId == task.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                                                 )
@@ -3405,10 +3428,10 @@ struct DynamicIslandView: View {
                                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                                             }) {
                                                 Text("原文")
-                                                    .font(.system(size: 11, weight: .semibold))
+                                                    .font(.system(size: fs(12), weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                     .padding(.horizontal, 6)
-                                                    .padding(.vertical, 3.5)
+                                                    .padding(.vertical, 4)
                                                     .background(
                                                         Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                                     )
@@ -3422,14 +3445,14 @@ struct DynamicIslandView: View {
                                         VStack(alignment: .leading, spacing: 4) {
                                             HStack(spacing: 4) {
                                                 Image(systemName: "text.quote")
-                                                    .font(.system(size: 11, weight: .bold))
+                                                    .font(.system(size: fs(12), weight: .bold))
                                                     .foregroundColor(accentTextColor)
                                                 Text("核心提炼重点")
-                                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                    .font(.system(size: fs(13), weight: .bold))
                                                     .foregroundColor(accentTextColor)
                                             }
                                             Text(task.highlights.isEmpty ? "（本单据暂无正文摘要）" : task.highlights)
-                                                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                                .font(.system(size: fs(13), weight: .semibold))
                                                 .foregroundColor(primaryTextColor)
                                                 .lineSpacing(3)
                                                 .fixedSize(horizontal: false, vertical: true)
@@ -3455,10 +3478,10 @@ struct DynamicIslandView: View {
                     } else {
                         HStack(spacing: 6) {
                             Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 13, weight: .bold))
+                                .font(.system(size: fs(13), weight: .bold))
                                 .foregroundColor(textGreen)
                             Text("当前无积压待办 · 全员就绪")
-                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                .font(.system(size: fs(13), weight: .bold))
                                 .foregroundColor(textGreen)
                         }
                         .padding(.vertical, 8)
@@ -3469,10 +3492,10 @@ struct DynamicIslandView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 5) {
                                 Image(systemName: "clock.arrow.circlepath")
-                                    .font(.system(size: 11, weight: .semibold))
+                                    .font(.system(size: fs(12), weight: .semibold))
                                     .foregroundColor(secondaryTextColor)
                                 Text("最新结案回信 · 已办结流")
-                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                    .font(.system(size: fs(13), weight: .bold))
                                     .foregroundColor(secondaryTextColor)
                                 Spacer()
                             }
@@ -3488,21 +3511,21 @@ struct DynamicIslandView: View {
                                                     .fill(Color(hex: "059669").opacity(0.16))
                                                     .frame(width: 22, height: 22)
                                                 Image(systemName: "checkmark")
-                                                    .font(.system(size: 11, weight: .bold))
+                                                    .font(.system(size: fs(12), weight: .bold))
                                                     .foregroundColor(textGreen)
                                             }
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(done.title)
-                                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                    .font(.system(size: fs(13), weight: .bold))
                                                     .foregroundColor(primaryTextColor)
                                                     .lineLimit(1)
                                                 HStack(spacing: 4) {
                                                     Text("回件: \(done.from) ➔ \(done.to)")
-                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .font(.system(size: fs(12), weight: .semibold))
                                                         .foregroundColor(secondaryTextColor)
-                                                    Text("•").font(.system(size: 11, weight: .semibold)).foregroundColor(secondaryTextColor)
+                                                    Text("•").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
                                                     Text(done.date)
-                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .font(.system(size: fs(12), weight: .semibold))
                                                         .foregroundColor(secondaryTextColor)
                                                 }
                                             }
@@ -3513,13 +3536,13 @@ struct DynamicIslandView: View {
                                             }) {
                                                 HStack(spacing: 2) {
                                                     Image(systemName: "sparkles")
-                                                        .font(.system(size: 11, weight: .semibold))
+                                                        .font(.system(size: fs(12), weight: .semibold))
                                                     Text(monitor.expandedTaskId == done.id ? "收起" : "重点")
-                                                        .font(.system(size: 11, weight: .bold))
+                                                        .font(.system(size: fs(12), weight: .bold))
                                                 }
                                                 .foregroundColor(monitor.expandedTaskId == done.id ? accentOnColor : accentTextColor)
                                                 .padding(.horizontal, 7)
-                                                .padding(.vertical, 3.5)
+                                                .padding(.vertical, 4)
                                                 .background(
                                                     Capsule().fill(monitor.expandedTaskId == done.id ? accentColor : accentColor.opacity(monitor.panelIsDark ? 0.20 : 0.10))
                                                 )
@@ -3531,10 +3554,10 @@ struct DynamicIslandView: View {
                                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                                             }) {
                                                 Text("原文")
-                                                    .font(.system(size: 11, weight: .semibold))
+                                                    .font(.system(size: fs(12), weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
                                                     .padding(.horizontal, 6)
-                                                    .padding(.vertical, 3.5)
+                                                    .padding(.vertical, 4)
                                                     .background(
                                                         Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05))
                                                     )
@@ -3547,14 +3570,14 @@ struct DynamicIslandView: View {
                                             VStack(alignment: .leading, spacing: 4) {
                                                 HStack(spacing: 4) {
                                                     Image(systemName: "text.quote")
-                                                        .font(.system(size: 11, weight: .bold))
+                                                        .font(.system(size: fs(12), weight: .bold))
                                                         .foregroundColor(accentTextColor)
                                                     Text("核心提炼重点")
-                                                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                        .font(.system(size: fs(13), weight: .bold))
                                                         .foregroundColor(accentTextColor)
                                                 }
                                                 Text(done.highlights.isEmpty ? "（本回信暂无正文摘要）" : done.highlights)
-                                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                                    .font(.system(size: fs(13), weight: .semibold))
                                                     .foregroundColor(primaryTextColor)
                                                     .lineSpacing(3)
                                                     .fixedSize(horizontal: false, vertical: true)
@@ -3580,16 +3603,16 @@ struct DynamicIslandView: View {
                         }
                     }
                 }
-                .padding(.vertical, 3.5)
+                .padding(.vertical, 4)
             }
             
             // Bottom Guidance Line
             HStack(spacing: 5) {
                 Image(systemName: "hand.raised.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: fs(12), weight: .semibold))
                     .foregroundColor(textAmber)
                 Text("露露掌握最高裁决权 · 见真实回信与产物方可收口")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: fs(13), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
             }
             .padding(.bottom, 8)
@@ -3604,10 +3627,10 @@ struct DynamicIslandView: View {
             switch monitor.skin {
             case .glass:
                 return monitor.panelIsDark
-                    ? Color(hex: "141D2E").opacity(0.42)
-                    : Color.white.opacity(0.46)
+                    ? Color(hex: "141D2E").opacity(0.58)
+                    : Color.white.opacity(0.78)
             case .obsidian:
-                return Color.white.opacity(0.09)
+                return Color.white.opacity(0.11)
             case .ceramic:
                 return monitor.panelIsDark
                     ? Color(hex: "2A2620").opacity(0.84)
@@ -3635,9 +3658,9 @@ struct DynamicIslandView: View {
                 shape.stroke(borderGradient, lineWidth: 1.0)
             )
             .shadow(
-                color: Color.black.opacity(monitor.panelIsDark ? 0.46 : 0.14),
-                radius: 4.5,
-                y: 2.0
+                color: Color.black.opacity(monitor.panelIsDark ? 0.46 : 0.12),
+                radius: 4,
+                y: 2
             )
     }
 
@@ -3765,7 +3788,7 @@ struct DynamicIslandView: View {
     }
     
     var secondaryTextColor: Color {
-        monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "48484A")
+        monitor.panelIsDark ? Color(hex: "D1D5DB") : Color(hex: "374151")
     }
 
     /// 正文用强调色（浅色模式下压暗，保证 ≥4.5:1；不靠 opacity 调淡）
@@ -3864,18 +3887,18 @@ struct DynamicIslandView: View {
         switch monitor.currentMode {
         case .compact:
             return monitor.preferredCompactWidth
-        case .notification: return 340
+        case .notification: return evenCeil(340 * uiScale)
         case .expanded:
-            return 560
+            return evenCeil(560 * uiScale)
         }
     }
     
     var contentHeight: CGFloat {
         switch monitor.currentMode {
-        case .compact: return 40
-        case .notification: return 38
+        case .compact: return evenCeil(40 * uiScale)
+        case .notification: return evenCeil(38 * uiScale)
         case .expanded:
-            return monitor.expandedContentHeight
+            return evenCeil(monitor.expandedContentHeight * uiScale)
         }
     }
     
@@ -4200,8 +4223,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func launchVirtualTest(on id: CGDirectDisplayID) {
         let screen = virtualScreenOrExit(id: id)
-        guard NSApp.setActivationPolicy(.accessory), !NSApp.isActive else {
-            VirtualIslandDisplay.stop("cannot run as a background accessory")
+        _ = NSApp.setActivationPolicy(.accessory)
+        NSApp.deactivate()
+        guard NSApp.activationPolicy() == .accessory, !NSApp.isActive else {
+            VirtualIslandDisplay.stop("cannot run as a background accessory (policy=\(NSApp.activationPolicy().rawValue), active=\(NSApp.isActive))")
         }
 
         let initialFrame = VirtualIslandDisplay.clamp(panelFrame(for: .compact, in: screen.frame), to: screen.frame)
@@ -4501,13 +4526,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appearanceMenu.addItem(NSMenuItem.separator())
         appearanceMenu.addItem(makeHeader("尺寸"))
         scaleMenuItems.removeAll()
-        var percent = 80
-        while percent <= 140 {
-            let it = makeItem("\(percent)%", "arrow.up.left.and.arrow.down.right", #selector(setUIScaleAction(_:)))
+        for sc in AgentMonitor.allowedScales {
+            let percent = Int((sc * 100).rounded())
+            let label = percent == 100 ? "标准 100%" : (percent == 110 ? "舒适 110%" : "大字 120%")
+            let it = makeItem(label, "arrow.up.left.and.arrow.down.right", #selector(setUIScaleAction(_:)))
             it.tag = percent
             appearanceMenu.addItem(it)
             scaleMenuItems[percent] = it
-            percent += 5
         }
 
         appearanceMenu.addItem(NSMenuItem.separator())
@@ -4582,17 +4607,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let windowWidth: CGFloat
         let windowHeight: CGFloat
         
-        let scale = monitor.uiScale
+        let scale = CGFloat(monitor.uiScale)
         switch mode {
         case .compact:
-            windowWidth = monitor.preferredCompactWidth * scale + 24
-            windowHeight = 40 * scale + 8
+            windowWidth = monitor.preferredCompactWidth + 24
+            windowHeight = evenCeil(40 * scale) + 8
         case .notification:
-            windowWidth = 340 * scale + 24
-            windowHeight = 38 * scale + 8
+            windowWidth = evenCeil(340 * scale) + 24
+            windowHeight = evenCeil(38 * scale) + 8
         case .expanded:
-            windowWidth = 560 * scale + 24
-            windowHeight = monitor.expandedContentHeight * scale + 16
+            windowWidth = evenCeil(560 * scale) + 24
+            windowHeight = evenCeil(monitor.expandedContentHeight * scale) + 16
         }
 
         let x: CGFloat
