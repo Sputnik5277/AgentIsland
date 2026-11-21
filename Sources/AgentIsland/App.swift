@@ -47,20 +47,46 @@ struct AppleGlassBackground: NSViewRepresentable {
     var material: NSVisualEffectView.Material = .popover
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
     var state: NSVisualEffectView.State = .active
-    
-    func makeNSView(context: Context) -> NSVisualEffectView {
+    /// macOS 26+ 原生液态玻璃的皮肤色（tintColor 保住三皮肤可区分）
+    var glassTint: NSColor = .clear
+    var cornerRadius: CGFloat = 16
+    /// 像素验收时可用 AGENT_ISLAND_GLASS=0 强制走旧 NSVisualEffectView 对照组
+    var forceFallback: Bool = ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
+
+    func makeNSView(context: Context) -> NSView {
+        if #available(macOS 26.0, *), !forceFallback {
+            let v = NSGlassEffectView()
+            v.style = .regular
+            v.cornerRadius = cornerRadius
+            v.tintColor = glassTint
+            if #available(macOS 27.0, *) {
+                v.effectIsInteractive = false
+            }
+            return v
+        }
+        return makeFallback()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        if #available(macOS 26.0, *), let v = nsView as? NSGlassEffectView, !forceFallback {
+            v.style = .regular
+            v.cornerRadius = cornerRadius
+            v.tintColor = glassTint
+            return
+        }
+        guard let v = nsView as? NSVisualEffectView else { return }
+        v.material = material
+        v.blendingMode = blendingMode
+        v.state = state
+    }
+
+    private func makeFallback() -> NSVisualEffectView {
         let v = NSVisualEffectView()
         v.material = material
         v.blendingMode = blendingMode
         v.state = state
         v.wantsLayer = true
         return v
-    }
-    
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blendingMode
-        nsView.state = state
     }
 }
 
@@ -1313,7 +1339,9 @@ struct DynamicIslandView: View {
                 // Layer 1: Apple Native Visual Effect Blur (Auto Light / Dark)
                 AppleGlassBackground(
                     material: monitor.panelIsDark ? .hudWindow : .popover,
-                    blendingMode: .behindWindow
+                    blendingMode: .behindWindow,
+                    glassTint: glassTintNSColor,
+                    cornerRadius: cornerRadius
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 
@@ -1343,8 +1371,10 @@ struct DynamicIslandView: View {
                         lineWidth: 0.9
                     )
                 
-                // Content View
-                contentForCurrentMode
+                // Content View（GLASS_PROBE 仅用于像素验收：留空面板，只量玻璃本身）
+                if ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS_PROBE"] != "1" {
+                    contentForCurrentMode
+                }
             }
             .frame(width: contentWidth, height: contentHeight, alignment: .top)
             // 内容溢出必须裁掉，否则白卡片会盖过玻璃底边、溢出圆角外
@@ -1743,7 +1773,7 @@ struct DynamicIslandView: View {
                 monitor.showTopology.toggle()
             }
         }) {
-            ZStack {
+            VStack(spacing: 0) {
                 // 迷你条也不画空闲底轨：三层通道只用节点/色阶交代，零连线。
                 HStack(spacing: 0) {
                     miniChannelNode(
@@ -1789,6 +1819,17 @@ struct DynamicIslandView: View {
                     .offset(y: -7)
                 }
                 .padding(.horizontal, 10)
+                .frame(height: 27)
+
+                // V5 补充：迷你条常驻「最近通讯」，直接读 activePulses，不引入新数据模型。
+                Text(miniRecentCommText)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .frame(height: 15)
             }
             .frame(height: 44)
             .background(squircleCardBackground)
@@ -1796,6 +1837,14 @@ struct DynamicIslandView: View {
         }
         .buttonStyle(PlainButtonStyle())
         .help("底座 Tailscale：私网底座 · SSH 可达\n主通道 Funnel 443：HTTPS 专用通道 · 主传输路径\n冷备 坚果云：只读冷备 · 灾难恢复底仓\n点击展开/收起横向链路")
+    }
+
+    var miniRecentCommText: String {
+        guard let p = monitor.activePulses.first else { return "最近通讯：无通讯" }
+        let s = AgentRoster.identity(for: p.source)?.short ?? p.source.uppercased()
+        let t = AgentRoster.identity(for: p.target)?.short ?? p.target.uppercased()
+        let extra = monitor.activePulses.count > 1 ? " · +\(monitor.activePulses.count - 1) 条" : ""
+        return "最近通讯：\(s) → \(t) ×\(p.count)\(extra)"
     }
 
     func miniChannelNode(name: String, icon: String, ok: Bool, tint: Color, detail: String) -> some View {
@@ -2281,7 +2330,8 @@ struct DynamicIslandView: View {
                     .fill(agent.color.opacity(isActive ? 0.26 : 0.13))
                     .frame(width: 40, height: 40)
                 Circle()
-                    .stroke(agent.color.opacity(isActive ? 0.95 : 0.35), lineWidth: isActive ? 2 : 1)
+                    .stroke(isActive ? agent.color.opacity(0.95) : idleRingColor(for: agent),
+                            lineWidth: isActive ? 2 : 1)
                     .frame(width: 40, height: 40)
                     .shadow(color: agent.color.opacity(isActive ? 0.55 : 0), radius: 5)
                 Image(systemName: agent.symbol)
@@ -2298,7 +2348,24 @@ struct DynamicIslandView: View {
         .frame(width: 100, height: 82, alignment: .top)
     }
 
-    /// 只有 activePulses 非空时才挂载；光点速度/数量随 15 秒内事件数增加
+    /// V4：空闲节点环 ≥2.2:1。0.35 实测仅 1.5–1.7:1；0.5 在浅底下仍不足，
+    /// 故浅色按身份色压暗后 0.62、深色 0.70（紫在曜石/陶瓷深底再用 #9572F5 保住对比度）。
+    func idleRingColor(for agent: AgentIdentity) -> Color {
+        if monitor.panelIsDark {
+            switch agent.key {
+            case "ping": return Color(hex: "9572F5").opacity(0.70)
+            default: return agent.color.opacity(0.70)
+            }
+        }
+        switch agent.key {
+        case "agy": return Color(hex: "0A5FCF").opacity(0.62)
+        case "alma": return Color(hex: "B45309").opacity(0.62)
+        case "ping": return Color(hex: "6D28D9").opacity(0.62)
+        default: return agent.color.opacity(0.62)
+        }
+    }
+
+    /// 只有 activePulses 非空时才挂载；每条边固定 1 个光点、共享 2.4s 周期
     func topologyPulseLayer(width: CGFloat, railY: CGFloat) -> some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
             Canvas { context, size in
@@ -2310,7 +2377,7 @@ struct DynamicIslandView: View {
                     default: return size.width * 0.5
                     }
                 }
-                for pulse in monitor.activePulses {
+                for (edgeIndex, pulse) in monitor.activePulses.enumerated() {
                     let source = AgentRoster.identity(for: pulse.source)
                     let color = source?.color ?? Color(hex: "60A5FA")
                     let a = CGPoint(x: anchorX(pulse.source), y: railY)
@@ -2333,17 +2400,17 @@ struct DynamicIslandView: View {
                     head.closeSubpath()
                     context.fill(head, with: .color(color.opacity(0.98)))
 
-                    let dots = 2 + min(pulse.count, 3)
-                    let speed = 0.55 + Double(min(pulse.count, 6)) * 0.10
-                    for i in 0..<dots {
-                        let phase = (now * speed + Double(i) / Double(dots)).truncatingRemainder(dividingBy: 1.0)
-                        let x = a.x + (b.x - a.x) * CGFloat(phase)
-                        let glow = CGRect(x: x - 5, y: railY - 5, width: 10, height: 10)
-                        let core = CGRect(x: x - 2.2, y: railY - 2.2, width: 4.4, height: 4.4)
-                        context.fill(Path(ellipseIn: glow), with: .color(color.opacity(0.22)))
-                        context.fill(Path(ellipseIn: core), with: .color(.white.opacity(0.95)))
-                        context.fill(Path(ellipseIn: core.insetBy(dx: 1.2, dy: 1.2)), with: .color(color))
-                    }
+                    // V5：每条边只有 1 个光点，全边共享 2.4s 周期；半径 3、单层 4px 辉光。
+                    // 两条边同时活跃 = 两个点（0.3s 相位差），绝不叠成一串。
+                    let cycle: Double = 2.4
+                    let phase = (now / cycle + Double(edgeIndex) * 0.3 / cycle)
+                        .truncatingRemainder(dividingBy: 1.0)
+                    let x = a.x + (b.x - a.x) * CGFloat(phase)
+                    let glow = CGRect(x: x - 4, y: railY - 4, width: 8, height: 8)
+                    let core = CGRect(x: x - 3, y: railY - 3, width: 6, height: 6)
+                    context.fill(Path(ellipseIn: glow), with: .color(color.opacity(0.20)))
+                    context.fill(Path(ellipseIn: core), with: .color(color.opacity(0.92)))
+                    context.fill(Path(ellipseIn: core.insetBy(dx: 1.5, dy: 1.5)), with: .color(.white.opacity(0.95)))
                 }
             }
             .frame(width: width, height: 108)
@@ -3022,28 +3089,67 @@ struct DynamicIslandView: View {
         }
     }
 
+    /// 卡片层：macOS 26+ 用 SwiftUI 原生玻璃；旧系统退回半透明填充。
+    /// 玻璃上的文字仍是实色，只有背景透明，避免“实色层把玻璃盖死”。
+    @ViewBuilder
     var squircleCardBackground: some View {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(
-                // 文字区底色：浅色 0.99 / 深色 0.95（文字本身始终实色，不用 opacity 压字）
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        Group {
+            if #available(macOS 26.0, *), !Self.forceGlassFallback {
+                shape
+                    .fill(Color.clear)
+                    .glassEffect(.regular.tint(cardGlassTint), in: shape)
+            } else {
+                shape.fill(cardFallbackFill)
+            }
+        }
+        .overlay(
+            shape.stroke(
                 monitor.panelIsDark
-                    ? Color(hex: "141418").opacity(0.95)
-                    : Color(hex: "FFFFFF").opacity(0.99)
+                    ? Color.white.opacity(0.22)
+                    : Color.white.opacity(0.95),
+                lineWidth: 0.9
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(
-                        monitor.panelIsDark
-                            ? Color.white.opacity(0.22)
-                            : Color.white.opacity(0.95),
-                        lineWidth: 0.9
-                    )
-            )
-            .shadow(
-                color: Color.black.opacity(monitor.panelIsDark ? 0.28 : 0.06),
-                radius: 2.5,
-                y: 1.2
-            )
+        )
+        .shadow(
+            color: Color.black.opacity(monitor.panelIsDark ? 0.28 : 0.06),
+            radius: 2.5,
+            y: 1.2
+        )
+    }
+
+    static var forceGlassFallback: Bool {
+        ProcessInfo.processInfo.environment["AGENT_ISLAND_GLASS"] == "0"
+    }
+
+    var cardGlassTint: Color {
+        switch monitor.skin {
+        case .glass:
+            return monitor.panelIsDark
+                ? Color(hex: "0B1526").opacity(0.45)
+                : Color(hex: "EAF4FF").opacity(0.30)
+        case .obsidian:
+            return Color(hex: "0A0A0C").opacity(0.55)
+        case .ceramic:
+            return monitor.panelIsDark
+                ? Color(hex: "2A2620").opacity(0.50)
+                : Color(hex: "F7EFDF").opacity(0.48)
+        }
+    }
+
+    var cardFallbackFill: Color {
+        switch monitor.skin {
+        case .glass:
+            return monitor.panelIsDark
+                ? Color(hex: "141418").opacity(0.68)
+                : Color(hex: "FFFFFF").opacity(0.72)
+        case .obsidian:
+            return Color(hex: "141418").opacity(0.86)
+        case .ceramic:
+            return monitor.panelIsDark
+                ? Color(hex: "2A2620").opacity(0.80)
+                : Color(hex: "FBF5E9").opacity(0.86)
+        }
     }
     
     var totalPending: Int {
@@ -3055,20 +3161,34 @@ struct DynamicIslandView: View {
     /// - 曜石深色：不论系统明暗都使用近黑石板，文字自动切浅色
     /// - 陶瓷实心：暖象牙实底，无透视
     var panelFill: Color {
-        let tint = monitor.currentMode == .compact ? monitor.skin.compactTint : monitor.skin.expandedTint
+        // 原生玻璃已在下层折射；这层只保留皮肤色感，不能再盖成不透明实色。
         switch monitor.skin {
         case .glass:
             return monitor.panelIsDark
-                ? Color(hex: "101A2E").opacity(tint.dark * 0.84)
-                : Color(hex: "F5F9FF").opacity(tint.light * 0.70)
+                ? Color(hex: "101A2E").opacity(0.40)
+                : Color(hex: "F5F9FF").opacity(0.26)
         case .obsidian:
-            return monitor.panelIsDark
-                ? Color(hex: "050506").opacity(tint.dark)
-                : Color(hex: "050506").opacity(0.97)
+            return Color(hex: "050506").opacity(monitor.panelIsDark ? 0.80 : 0.90)
         case .ceramic:
             return monitor.panelIsDark
-                ? Color(hex: "2A2620").opacity(tint.dark)
-                : Color(hex: "F6F1E7").opacity(tint.light)
+                ? Color(hex: "2A2620").opacity(0.74)
+                : Color(hex: "F6F1E7").opacity(0.78)
+        }
+    }
+
+    /// 传给 NSGlassEffectView.tintColor：只染色、不遮折射
+    var glassTintNSColor: NSColor {
+        switch monitor.skin {
+        case .glass:
+            return monitor.panelIsDark
+                ? NSColor(srgbRed: 0.043, green: 0.082, blue: 0.149, alpha: 0.30)
+                : NSColor(srgbRed: 0.863, green: 0.922, blue: 1.0, alpha: 0.22)
+        case .obsidian:
+            return NSColor(srgbRed: 0.020, green: 0.020, blue: 0.024, alpha: 0.55)
+        case .ceramic:
+            return monitor.panelIsDark
+                ? NSColor(srgbRed: 0.165, green: 0.149, blue: 0.125, alpha: 0.45)
+                : NSColor(srgbRed: 0.965, green: 0.945, blue: 0.906, alpha: 0.35)
         }
     }
 
@@ -3142,7 +3262,7 @@ struct DynamicIslandView: View {
     var textPurple: Color { monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9") }
     var textAmber: Color { monitor.panelIsDark ? Color(hex: "FFD60A") : Color(hex: "B45309") }
     var textRed: Color { monitor.panelIsDark ? Color(hex: "FF6961") : Color(hex: "C1121F") }
-    var textGray: Color { monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "6B7280") }
+    var textGray: Color { monitor.panelIsDark ? Color(hex: "C7C7CC") : Color(hex: "4B5563") }
     
     var compactBadgeColor: Color {
         if !monitor.funnelOnline || !monitor.nutstoreOnline || !monitor.tailscaleOnline || monitor.fusedCount > 0 {

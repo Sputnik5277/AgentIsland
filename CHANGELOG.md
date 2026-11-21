@@ -5,6 +5,27 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.8.0] - 2026-11-21
+
+### 💎 Native Liquid Glass, Converged Pulses & Measured Contrast / 原生液态玻璃、脉冲收敛与对比度实测
+
+- **💎 真·原生液态玻璃（macOS 26+）**
+  - 面板层改用 AppKit `NSGlassEffectView`（`.regular` + 皮肤 `tintColor`），macOS 26 以下自动回退 `NSVisualEffectView`；卡片层改用 SwiftUI `.glassEffect(.regular.tint(...), in:)`，同样按可用性回退半透明填充。
+  - `panelFill` / 卡片填充按皮肤压到 0.26–0.90，不再用接近不透明的实色盖住折射；玻璃/曜石/陶瓷靠 tint 区分，而不是靠不透明度。
+  - 像素验收：面板背后铺饱和色带，实测面板内像素与壁纸色差及边缘模糊过渡宽度；`AGENT_ISLAND_GLASS=0` 可切旧材质做对照。
+- **⭕ 脉冲收敛（对标 dynamic-archify）**
+  - 每条活动边只画 1 个光点，全边共享 2.4s 周期（0.3s 相位差），半径 3、单层 4px 辉光；双向并发 = 两个点，不再叠成 2–5 点串。
+- **🔤 次要灰字对比度**
+  - 浅色 `textGray` 由 `#6B7280` 改为 `#4B5563`；全页次要灰字按浅/深 × 三皮肤实测 WCAG，最低值见验收记录。
+- **🖼️ 空闲节点环**
+  - 空闲节点外环由 0.35 提升到 ≥2.2:1；浅色下按身份色压暗（0.62），深色下 0.70（紫青在深底再取 `#9572F5`）。
+- **📡 迷你链路条补「最近通讯」**
+  - 44pt 内新增一行 `最近通讯：Ping → AGY ×1 / 无通讯`，直接读现有 `activePulses`，零新数据模型。
+- **🧭 空闲零连线语义**
+  - D1 维持硬门：无通讯时零连线、零脉冲、零光点；脉冲层只在 `activePulses` 非空时挂载。
+
+---
+
 ## [v1.7.2] - 2026-11-20
 
 ### 🧭 UX Redesign, Five-Group Menu & Full-Size AppIcon / UX 重构、五组菜单与全尺寸 AppIcon

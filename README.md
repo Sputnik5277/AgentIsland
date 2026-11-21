@@ -35,7 +35,7 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 
 ### Key Features
 
-- 💎 **Apple Liquid Glass Design**: Authentic system frosted glass using native `NSVisualEffectView`, providing real-time backdrop blur and razor-sharp specular highlights.
+- 💎 **Apple Liquid Glass Design**: Real native liquid glass on macOS 26+ (`NSGlassEffectView` for the panel, SwiftUI `.glassEffect` for cards, with skin `tintColor`), falling back to `NSVisualEffectView` on older systems. Tint layers are compressed per skin so the backdrop refraction actually shows through.
 - 🎛️ **1:1 Control Center Layout**: Squircle modules patterned directly after the macOS Control Center grid.
 - 🩺 **Interactive Channel Self-Healing**: Click red channel dots to auto-launch or restart background sync daemons (Nutstore, Funnel 64M, Tailscale).
 - 📂 **Direct Agent Inbox Drilldown**: Click any agent pill to instantly open its handoffs inbox folder in Finder.
@@ -54,6 +54,12 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 - 🖱️ **Five-group context menu + merged Appearance submenu**: 中控台 / 打开 / 自检 / 外观 / 退出 groups; Option shortcuts `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`; SF Symbols only (no emoji); one 「外观设置」 submenu covering theme, skin, form, 80–140% scale, dock edge, and accent color.
 - 🔤 **Typography floor**: body text ≥13pt, secondary text ≥11pt, `.semibold` minimum, opaque text colors; the expanded panel stays ≤420pt tall with layered 8 / 18–20 / 24–28px spacing.
 - 🖼️ **Full-size AppIcon**: `.icns` with 16/32/128/256/512/1024px, declared via `CFBundleIconFile`, packaged by `build.sh`, and installed in `~/Applications/AgentIsland.app`.
+
+### Idle Zero-Line Semantics & Polling Boundary (v1.8.0)
+
+- **No communication → no line, no pulse, no dot.** When `activePulses` is empty the topology and the mini strip draw zero connecting lines; the pulse layer is only mounted when at least one edge is active. Node rings stay visible at ≥2.2:1 contrast in their weakened idle state.
+- **2-second polling has a blind spot.** The event feed is sampled every 2s and aggregated over a 15s window. An event that arrives and ages out between two samples, or lands in a missed log line, can be absent from the topology — the view only claims what was actually sampled. The handoff files themselves remain the source of truth.
+- **Pulse shape**: one dot per active edge, shared 2.4s period, radius 3, a single 4px glow; two concurrent edges show as two dots, never a chain.
 
 ### Quick Start
 
@@ -84,7 +90,7 @@ open /Applications/AgentIsland.app
 
 ### 核心特性
 
-- 💎 **苹果原厂液态玻璃**：底层调用硬件加速 `NSVisualEffectView` 实时折射背景，搭配 1.0px 水晶切面内高光，通透纯净。
+- 💎 **苹果原厂液态玻璃**：macOS 26+ 面板使用真 `NSGlassEffectView`、卡片使用 SwiftUI `.glassEffect`，以皮肤 `tintColor` 保留玻璃/曜石/陶瓷区分；旧系统自动回退 `NSVisualEffectView`。面板内实色层已按皮肤压缩，折射真实可见。
 - 🎛️ **1:1 苹果控制中心网格**：完全复刻 macOS 经典 Squircle 圆角胶囊模块，信息层次分明。
 - 🩺 **通道红灯点击自愈**：通道异常红灯时点击直接唤起启动或热启服务（坚果云自动唤醒 / Funnel 一键热启 / Tailscale 跳转）。
 - 📂 **智能体收件箱一秒下钻**：点击白 / Alma / Ping 药丸卡片，一键在 Finder 中打开对应待办收件箱目录，待办单单一清二楚。
@@ -104,6 +110,12 @@ open /Applications/AgentIsland.app
 - 🖱️ **右键菜单五组结构 + 外观设置合并子菜单**：中控台 / 打开 / 自检 / 外观 / 退出；Option 快捷键 `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`；全部 SF Symbols、零 emoji；原「外观模式」「主题强调色」合并进单一「外观设置」子菜单，内含明暗模式、皮肤、形态、80–140% 尺寸、停靠边与强调色。
 - 🔤 **字号下限**：正文 ≥13pt、次要 ≥11pt，字重最低 `.semibold`，文字实色；展开态总高 ≤420pt，按 8 / 18–20 / 24–28px 三层留白。
 - 🖼️ **全尺寸 AppIcon**：`.icns` 覆盖 16/32/128/256/512/1024px，`Info.plist` 声明 `CFBundleIconFile`，`build.sh` 打包进 `Contents/Resources`，并安装到 `~/Applications/AgentIsland.app`。
+
+### 空闲零连线语义与轮询边界（v1.8.0）
+
+- **没有通信，就没有连线、脉冲和点**：`activePulses` 为空时，链路图与迷你条一律不画连接线；脉冲层仅在至少一条边活跃时挂载。节点空闲环仍保持 ≥2.2:1 对比度，弱化但看得见。
+- **2 秒轮询有盲区**：事件日志每 2 秒采样一次，按 15 秒窗口聚合；在两次采样之间到达又过期的单条事件，或未被采到的日志行，可能不在链路图中出现。界面只声明实际采到的通讯，原始 handoff 文件才是事实源。
+- **脉冲形态**：每条活跃边 1 个光点，共享 2.4s 周期，半径 3、单层 4px 辉光；两条边并发时是两个点，不会叠成串。
 
 ### 快速开始
 
