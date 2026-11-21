@@ -462,6 +462,8 @@ class AgentMonitor: ObservableObject {
     private var breathTimer: Timer?
     private var commTimer: Timer?
     private var lastToggleTime: Date = Date.distantPast
+    private let refreshLock = NSLock()
+    private var isRefreshingInFlight = false
     
     func canToggle() -> Bool {
         let now = Date()
@@ -903,8 +905,20 @@ class AgentMonitor: ObservableObject {
     
     func refreshAll() {
         guard preferences != nil else { return }
+        refreshLock.lock()
+        if isRefreshingInFlight {
+            refreshLock.unlock()
+            return
+        }
+        isRefreshingInFlight = true
+        refreshLock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
+            defer {
+                self.refreshLock.lock()
+                self.isRefreshingInFlight = false
+                self.refreshLock.unlock()
+            }
             
             let snapshot = self.fetchInboxesJSON()
             let dataOK = snapshot != nil
@@ -1080,10 +1094,13 @@ print(f"RECONCILE_DONE:{reconciled}:{archived}")
 """]
             let pipe = Pipe()
             p.standardOutput = pipe
-            try? p.run()
-            p.waitUntilExit()
-            
-            let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.standardError = FileHandle.nullDevice
+            var outputData = Data()
+            do {
+                try p.run()
+                outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+            } catch {}
             let outStr = String(data: outputData, encoding: .utf8) ?? ""
             var arcCount = 0
             if let m = outStr.components(separatedBy: "RECONCILE_DONE:").last?.trimmingCharacters(in: .whitespacesAndNewlines) {
@@ -1440,11 +1457,11 @@ print(json.dumps(res, ensure_ascii=False))
 """]
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        p.standardError = FileHandle.nullDevice
         do {
             try p.run()
-            p.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
             if let root = try? JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]] {
                 var output: [String: [TaskItem]] = [:]
                 for (box, arr) in root {
