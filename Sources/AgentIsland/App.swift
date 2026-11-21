@@ -366,16 +366,18 @@ class AgentMonitor: ObservableObject {
             }()
             return CGFloat(((tCount + dCount <= 4) ? 340 : 410) + extra)
         }
-        if showTopology { return 300 + extra }
+        // 内联链路：总览头部 + 迷你条 + 300pt 展开区（含三层通道原文案）
+        if showTopology { return 360 + extra }
         if showSettings { return 560 + extra }
 
-        var h: CGFloat = 26
+        // 头部实际行高比旧估值高 8pt；补足后内容不再溢出玻璃底边
+        var h: CGFloat = 34
         if enabledSections[PanelSectionKey.overview.rawValue] ?? true { h += 16 }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
             h += pendingConfirms.isEmpty ? 49 : 92
         }
         if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 40 }
-        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 93 }
+        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 44 }
         if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 18 }
         let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
             partial + ((enabledSections[key.rawValue] ?? true) ? 1 : 0)
@@ -1312,7 +1314,14 @@ struct DynamicIslandView: View {
                 // Layer 2: Solid Obsidian & Ceramic Glass Tint (深浅色双模原生适配，防HDR溢色强化)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .fill(panelFill)
-                
+
+                // Layer 2.5: 0.5px inset stroke，做出玻璃砖内壁切面
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(
+                        Color.white.opacity(monitor.panelIsDark ? 0.14 : 0.30),
+                        lineWidth: 0.5
+                    )
+
                 // Layer 3: Razor Specular Border (深浅色自适应金属高反差切面)
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(
@@ -1332,18 +1341,24 @@ struct DynamicIslandView: View {
                 contentForCurrentMode
             }
             .frame(width: contentWidth, height: contentHeight, alignment: .top)
+            // 内容溢出必须裁掉，否则白卡片会盖过玻璃底边、溢出圆角外
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            // 玻璃边缘压在裁剪之后：顶部 1px 镜面高光 + 底部 1px 深色压边，不被内容盖住
+            .overlay {
+                glassMirrorEdge
+            }
             .scaleEffect(monitor.uiScale, anchor: .top)
             .frame(width: contentWidth * monitor.uiScale, height: contentHeight * monitor.uiScale, alignment: .top)
             .animation(.spring(response: 0.32, dampingFraction: 0.76), value: monitor.currentMode)
             .animation(.easeInOut(duration: 0.25), value: monitor.panelIsDark)
             .animation(.easeInOut(duration: 0.22), value: monitor.skin)
             .animation(.easeInOut(duration: 0.22), value: monitor.uiScale)
-            // Soft Unclipped Ambient Shadow
+            // Outer two-level shadow：大范围柔光 + 1.5px 贴边
             .shadow(
                 color: Color.black.opacity(monitor.panelIsDark ? 0.45 : 0.16),
-                radius: monitor.panelIsDark ? 12 : 8,
+                radius: monitor.panelIsDark ? 18 : 12,
                 x: 0,
-                y: monitor.panelIsDark ? 5 : 3
+                y: monitor.panelIsDark ? 6 : 4
             )
             .shadow(
                 color: Color.black.opacity(monitor.panelIsDark ? 0.20 : 0.05),
@@ -1360,6 +1375,39 @@ struct DynamicIslandView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// 顶部 1px 镜面高光（深色 0.65 / 浅色 0.98）+ 底部 1px 深色压边
+    var glassMirrorEdge: some View {
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                LinearGradient(
+                    stops: [
+                        .init(color: Color.white.opacity(monitor.panelIsDark ? 0.65 : 0.98), location: 0.0),
+                        .init(color: Color.white.opacity(monitor.panelIsDark ? 0.26 : 0.52), location: 0.55),
+                        .init(color: Color.white.opacity(monitor.panelIsDark ? 0.06 : 0.16), location: 1.0)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(height: 1)
+
+                Spacer(minLength: 0)
+
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(monitor.panelIsDark ? 0.55 : 0.18),
+                        Color.black.opacity(monitor.panelIsDark ? 0.20 : 0.04)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(height: 1)
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+        .allowsHitTesting(false)
     }
     
     @ViewBuilder
@@ -1480,7 +1528,7 @@ struct DynamicIslandView: View {
                         .foregroundColor(.white)
                         .font(.system(size: 13, weight: .bold))
                 }
-                Text("AgentIsland 总览")
+                Text("总览")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundColor(primaryTextColor)
 
@@ -1493,14 +1541,14 @@ struct DynamicIslandView: View {
                         .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.16)))
                 }
 
-                // 顶部视图模式切换：待办总览 vs 链路架构
+                // 顶部只剩「总览 / 待办总览」两个入口；链路架构改为总览内联区块
                 HStack(spacing: 2) {
                     Button(action: {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             monitor.showTopology = false
                         }
                     }) {
-                        Text("📋 待办总览")
+                        Text("待办总览")
                             .font(.system(size: 13, weight: !monitor.showTopology ? .bold : .semibold, design: .rounded))
                             .foregroundColor(!monitor.showTopology ? accentOnColor : secondaryTextColor)
                             .padding(.horizontal, 7)
@@ -1510,22 +1558,7 @@ struct DynamicIslandView: View {
                             )
                     }
                     .buttonStyle(PlainButtonStyle())
-                    
-                    Button(action: {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            monitor.showTopology = true
-                        }
-                    }) {
-                        Text("🌐 链路架构")
-                            .font(.system(size: 13, weight: monitor.showTopology ? .bold : .semibold, design: .rounded))
-                            .foregroundColor(monitor.showTopology ? accentOnColor : secondaryTextColor)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(
-                                Capsule().fill(monitor.showTopology ? accentColor : Color.clear)
-                            )
-                    }
-                    .buttonStyle(PlainButtonStyle())
+                    .help("回到总览，收起内联链路")
                 }
                 .padding(2)
                 .background(
@@ -1577,8 +1610,12 @@ struct DynamicIslandView: View {
             }
             
             if monitor.showTopology {
-                // 架构链路是「深挖视图」，首屏默认永远是总览
-                architectureTopologyView
+                // 链路架构内联在总览里：迷你条常驻，点一下就地展开，不占独立 tab
+                VStack(spacing: 10) {
+                    miniLinkStrip
+                    architectureTopologyView
+                }
+                .padding(.horizontal, 14)
             } else if monitor.showSettings {
                 settingsView
             } else {
@@ -1613,7 +1650,7 @@ struct DynamicIslandView: View {
             inboxCardsRow
                 .padding(.horizontal, 14)
         case .channels:
-            channelHierarchyView
+            miniLinkStrip
                 .padding(.horizontal, 14)
                 .padding(.top, 2)
         case .assets:
@@ -1691,6 +1728,97 @@ struct DynamicIslandView: View {
     }
 
     /// 底部三层通道：底座(网络) → 主通道(Funnel) → 冷备(坚果云)，不再并排混淆
+    // MARK: - 40–44pt 迷你链路条（替换 93pt 通道三层区块）
+    // 三层语义靠纵向位置 + 色阶区分：Tailscale 基座下沉、Funnel 主通道居中抬升、坚果云冷备上浮。
+    // 原文案不丢：hover 出完整说明；点击展开后链路图底部再给出三层原文。
+    var miniLinkStrip: some View {
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                monitor.showTopology.toggle()
+            }
+        }) {
+            ZStack {
+                GeometryReader { geo in
+                    Path { p in
+                        p.move(to: CGPoint(x: 18, y: 29))
+                        p.addLine(to: CGPoint(x: max(18, geo.size.width - 18), y: 29))
+                    }
+                    .stroke(linkSkeletonColor, style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
+                }
+
+                HStack(spacing: 0) {
+                    miniChannelNode(
+                        name: "Tailscale",
+                        icon: "network",
+                        ok: monitor.tailscaleOnline,
+                        tint: monitor.panelIsDark ? Color(hex: "94A3B8") : Color(hex: "475569"),
+                        detail: "底座 · Tailscale：私网底座 · SSH 可达"
+                    )
+                    .offset(y: 4)
+
+                    Spacer(minLength: 6)
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "bolt.horizontal.fill")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Funnel 443")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                        Image(systemName: monitor.showTopology ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundColor(monitor.activePulses.isEmpty
+                        ? (monitor.panelIsDark ? Color(hex: "7DD3FC") : Color(hex: "0369A1"))
+                        : Color(hex: "059669"))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(
+                        monitor.activePulses.isEmpty
+                            ? Color(hex: "0369A1").opacity(0.12)
+                            : Color(hex: "059669").opacity(0.16)
+                    ))
+                    .offset(y: -2)
+
+                    Spacer(minLength: 6)
+
+                    miniChannelNode(
+                        name: "坚果云",
+                        icon: "externaldrive.fill",
+                        ok: monitor.nutstoreOnline,
+                        tint: monitor.panelIsDark ? Color(hex: "9CA3AF") : Color(hex: "4B5563"),
+                        detail: "冷备 · 坚果云：只读冷备 · 灾难恢复底仓"
+                    )
+                    .offset(y: -7)
+                }
+                .padding(.horizontal, 10)
+            }
+            .frame(height: 44)
+            .background(squircleCardBackground)
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(PlainButtonStyle())
+        .help("底座 Tailscale：私网底座 · SSH 可达\n主通道 Funnel 443：HTTPS 专用通道 · 主传输路径\n冷备 坚果云：只读冷备 · 灾难恢复底仓\n点击展开/收起横向链路")
+    }
+
+    func miniChannelNode(name: String, icon: String, ok: Bool, tint: Color, detail: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .bold))
+            Text(name)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+            Circle()
+                .fill(ok ? Color(hex: "10B981") : Color(hex: "EF4444"))
+                .frame(width: 5, height: 5)
+        }
+        .foregroundColor(tint)
+        .help(detail)
+    }
+
+    var linkSkeletonColor: Color {
+        monitor.panelIsDark
+            ? Color.white.opacity(0.12)
+            : Color(hex: "1C1C1E").opacity(0.12)
+    }
+
     var channelHierarchyView: some View {
         VStack(spacing: 5) {
             channelTierRow(
@@ -2047,13 +2175,13 @@ struct DynamicIslandView: View {
                 let width = geo.size.width
                 let railY: CGFloat = 34
                 ZStack {
-                    // Funnel 443：只在真实通讯时出现；空闲时完全不画线（Tailscale 基座另绘）
-                    if !monitor.activePulses.isEmpty {
-                        Capsule()
-                            .fill(secondaryTextColor.opacity(monitor.panelIsDark ? 0.30 : 0.34))
-                            .frame(width: max(0, width - 28), height: 2)
-                            .position(x: width / 2, y: railY)
+                    // D1：空闲也保留 12% 虚线骨架，只交代架构，不冒充通讯；
+                    // 真实通讯时由 pulseLayer 在对应 source→target 段覆盖实线 + 箭头 + 光点。
+                    Path { p in
+                        p.move(to: CGPoint(x: 14, y: railY))
+                        p.addLine(to: CGPoint(x: max(14, width - 14), y: railY))
                     }
+                    .stroke(linkSkeletonColor, style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
 
                     HStack(spacing: 4) {
                         Image(systemName: "bolt.horizontal.fill")
@@ -2130,8 +2258,32 @@ struct DynamicIslandView: View {
                 Spacer()
             }
             .padding(.horizontal, 12)
+
+            // D3：迷你条压缩后，原文案不丢——展开态在这里给出完整三层说明
+            VStack(alignment: .leading, spacing: 2) {
+                channelCopyRow(tier: "底座", name: "Tailscale", detail: "私网底座 · SSH 可达")
+                channelCopyRow(tier: "主通道", name: "Funnel 443", detail: "HTTPS 专用通道 · 主传输路径")
+                channelCopyRow(tier: "冷备", name: "坚果云", detail: "只读冷备 · 灾难恢复底仓")
+            }
+            .padding(.horizontal, 12)
         }
         .padding(.horizontal, 14)
+    }
+
+    func channelCopyRow(tier: String, name: String, detail: String) -> some View {
+        HStack(spacing: 5) {
+            Text(tier)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(textGray)
+                .frame(width: 40, alignment: .leading)
+            Text(name)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(primaryTextColor)
+            Text("· \(detail)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(secondaryTextColor)
+            Spacer(minLength: 0)
+        }
     }
 
     func topologyNode(agent: AgentIdentity, isActive: Bool) -> some View {
@@ -2175,11 +2327,23 @@ struct DynamicIslandView: View {
                     let color = source?.color ?? Color(hex: "60A5FA")
                     let a = CGPoint(x: anchorX(pulse.source), y: railY)
                     let b = CGPoint(x: anchorX(pulse.target), y: railY)
+                    let dir: CGFloat = b.x >= a.x ? 1 : -1
+                    let start = CGPoint(x: a.x + dir * 22, y: railY)
+                    let tip = CGPoint(x: b.x - dir * 24, y: railY)
 
+                    // 实色描边（不再用 55% 低对比度线；深浅色都按实色画）
                     var line = Path()
-                    line.move(to: a)
-                    line.addLine(to: b)
-                    context.stroke(line, with: .color(color.opacity(0.55)), lineWidth: 1.6)
+                    line.move(to: start)
+                    line.addLine(to: CGPoint(x: tip.x - dir * 6, y: railY))
+                    context.stroke(line, with: .color(color.opacity(0.95)), lineWidth: 2.2)
+
+                    // 方向箭头
+                    var head = Path()
+                    head.move(to: tip)
+                    head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY - 4.5))
+                    head.addLine(to: CGPoint(x: tip.x - dir * 8, y: railY + 4.5))
+                    head.closeSubpath()
+                    context.fill(head, with: .color(color.opacity(0.98)))
 
                     let dots = 2 + min(pulse.count, 3)
                     let speed = 0.55 + Double(min(pulse.count, 6)) * 0.10
@@ -2873,9 +3037,10 @@ struct DynamicIslandView: View {
     var squircleCardBackground: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(
+                // 文字区底色：浅色 0.99 / 深色 0.95（文字本身始终实色，不用 opacity 压字）
                 monitor.panelIsDark
-                    ? Color.white.opacity(0.20)
-                    : Color.white.opacity(0.96)
+                    ? Color(hex: "141418").opacity(0.95)
+                    : Color(hex: "FFFFFF").opacity(0.99)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -3041,8 +3206,11 @@ struct DynamicIslandView: View {
     
     var cornerRadius: CGFloat {
         switch monitor.currentMode {
-        case .compact: return monitor.islandForm == .capsule ? 14 : 10
-        case .notification: return monitor.islandForm == .capsule ? 17 : 14
+        case .compact:
+            // 胶囊圆角 = 高度的一半，不再固定 14
+            return monitor.islandForm == .capsule ? contentHeight / 2 : 10
+        case .notification:
+            return monitor.islandForm == .capsule ? contentHeight / 2 : 14
         case .expanded: return monitor.islandForm == .capsule ? 18 : 22
         }
     }
