@@ -667,6 +667,46 @@ class AgentMonitor: ObservableObject {
                let mode = ThemeMode(rawValue: raw) {
                 themeMode = mode
             }
+            if let drawer = env["AGENT_ISLAND_TEST_DRAWER"], !drawer.isEmpty, customMultiRoot.isEmpty {
+                let sampleStages: [(String, String, String, String)] = [
+                    ("dispatched", "待接单", "超时 42m", "2026-11-22 10:45 +08"),
+                    ("relay", "需前台接力", "待前台接力", "2026-11-22 11:02 +08"),
+                    ("accepted", "履约中", "滞留 1h", "2026-11-22 10:15 +08"),
+                    ("accepted", "履约中", "预计 3 分钟", "2026-11-22 11:20 +08"),
+                    ("dispatched", "待接单", "超时 18m", "2026-11-22 11:12 +08"),
+                    ("relay", "需前台接力", "待前台接力", "2026-11-22 10:50 +08"),
+                    ("accepted", "履约中", "履约推进中", "2026-11-22 11:24 +08"),
+                    ("dispatched", "待接单", "", "2026-11-22 11:28 +08"),
+                    ("accepted", "履约中", "滞留 2h", "2026-11-22 09:10 +08"),
+                    ("dispatched", "待接单", "超时 3h", "2026-11-22 08:20 +08"),
+                ]
+                let mocked = sampleStages.enumerated().map { idx, spec in
+                    TaskItem(
+                        file: "sample-\(idx + 1)-20261122.md",
+                        from: drawer == "ping" ? "agy" : "ping",
+                        to: drawer,
+                        date: spec.3,
+                        title: "美团闭环抽屉压测工单 #\(idx + 1) · \(spec.1)",
+                        stage: spec.0,
+                        statusText: spec.1,
+                        artifacts: "",
+                        eta: spec.2,
+                        highlights: "虚拟屏 1x 满载防裁切验收样例：验证顶栏返回/标题/搜索不被挤出视口。"
+                    )
+                }
+                if drawer == "ping" {
+                    pingTasks = mocked
+                    pingPending = mocked.count
+                } else if drawer == "agy" {
+                    agyTasks = mocked
+                    agyPending = mocked.count
+                } else if drawer == "alma" {
+                    almaTasks = mocked
+                    almaPending = mocked.count
+                }
+                totalAccepted = mocked.filter { $0.stage == "accepted" || $0.stage == "relay" }.count
+                totalDispatched = mocked.filter { $0.stage == "dispatched" }.count
+            }
             checkAppearance()
             reloadWakeState(force: true)
             if !customEventLog.isEmpty && !customMultiRoot.isEmpty {
@@ -1811,7 +1851,7 @@ except Exception:
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = ["-c", """
-import sys, json, os, re
+import sys, json, os, re, time
 from pathlib import Path
 sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
 import handoff
@@ -1953,8 +1993,19 @@ for box in boxes:
         if orig_frm == box and orig_to != box:
             continue
 
-        cur_status = str(latest_meta.get('status', '待办'))
-        if cur_status == '履约中' or any('-accept' in p.name for p, _, _ in files):
+        full_txt = latest_p.read_text(encoding='utf-8', errors='replace')
+        if ('【Step 4' in full_txt) or ('核验 + 确认' in full_txt) or ('核验+确认' in full_txt) or ('已确认结案' in full_txt):
+            continue
+
+        cur_status = str(latest_meta.get('status', '待办')).strip()
+        head_lines = full_txt.splitlines()[:140]
+        has_inline_step2 = ('【Step 2' in full_txt) or any(ln.lstrip().startswith('##') and 'Step 2' in ln for ln in head_lines)
+        if cur_status == '需前台接力' or '【Step 2.5 需前台接力】' in full_txt:
+            stage = 'relay'
+            status_text = '需前台接力'
+            total_accepted += 1
+            eta = '待前台接力'
+        elif cur_status in ('履约中', '进行中') or any('-accept' in p.name for p, _, _ in files) or has_inline_step2:
             stage = 'accepted'
             status_text = '履约中'
             total_accepted += 1
@@ -1968,6 +2019,14 @@ for box in boxes:
             total_dispatched += 1
             eta = ''
 
+        age_sec = max(0, time.time() - latest_p.stat().st_mtime)
+        if stage == 'dispatched' and age_sec >= 900:
+            hrs = int(age_sec // 3600)
+            eta = f'超时 {hrs}h' if hrs >= 1 else f'超时 {int(age_sec // 60)}m'
+        elif stage == 'accepted' and age_sec >= 1800 and (not eta or eta == '履约推进中'):
+            hrs = int(age_sec // 3600)
+            eta = f'滞留 {hrs}h' if hrs >= 1 else f'滞留 {int(age_sec // 60)}m'
+
         items.append({
             'file': latest_p.name,
             'from': str(latest_meta.get('from', '未知')),
@@ -1979,7 +2038,7 @@ for box in boxes:
             'statusText': status_text,
             'artifacts': str(latest_meta.get('artifacts', '')),
             'eta': eta,
-            'highlights': handoff.extract_highlights(latest_p.read_text(encoding='utf-8', errors='replace'))
+            'highlights': handoff.extract_highlights(full_txt)
         })
 
     items.sort(key=lambda x: x['mtime'], reverse=True)
@@ -4126,27 +4185,33 @@ struct DynamicIslandView: View {
     
     // 四段架构履约轴 (派单 ➔ 接单 ➔ 待验 ➔ 结案)
     func lifecycleStepperView(stage: String) -> some View {
-        HStack(spacing: 3) {
+        let isRelay = stage == "relay"
+        let hasAccepted = stage == "accepted" || isRelay || stage == "submitted" || stage == "confirmed"
+        let hasSubmitted = stage == "submitted" || stage == "confirmed"
+        return HStack(spacing: 2) {
             stepperNode(name: "派单", active: true, done: stage != "dispatched")
-            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
-            stepperNode(name: "接单", active: stage == "accepted" || stage == "submitted" || stage == "confirmed", done: stage == "submitted" || stage == "confirmed")
-            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
-            stepperNode(name: "待验", active: stage == "submitted" || stage == "confirmed", done: stage == "confirmed", highlight: stage == "submitted")
-            Text("›").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
+            Text("›").font(.system(size: fs(11), weight: .semibold)).foregroundColor(secondaryTextColor)
+            stepperNode(name: "接单", active: hasAccepted, done: isRelay || hasSubmitted)
+            Text("›").font(.system(size: fs(11), weight: .semibold)).foregroundColor(secondaryTextColor)
+            stepperNode(name: isRelay ? "接力" : "待验", active: isRelay || hasSubmitted, done: stage == "confirmed", highlight: stage == "submitted" || isRelay)
+            Text("›").font(.system(size: fs(11), weight: .semibold)).foregroundColor(secondaryTextColor)
             stepperNode(name: "结案", active: stage == "confirmed", done: stage == "confirmed")
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     func stepperNode(name: String, active: Bool, done: Bool, highlight: Bool = false) -> some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 2.5) {
             Circle()
                 .fill(highlight ? Color(hex: "8B5CF6") : (active ? (done ? Color(hex: "10B981") : accentColor) : secondaryTextColor.opacity(0.35)))
                 .frame(width: 5, height: 5)
             Text(name)
-                .font(.system(size: fs(12), weight: highlight || done || active ? .bold : .semibold))
+                .font(.system(size: fs(11), weight: highlight || done || active ? .bold : .semibold))
                 .foregroundColor(highlight ? (monitor.panelIsDark ? Color(hex: "BF5AF2") : Color(hex: "6D28D9")) : (active ? (done ? (monitor.panelIsDark ? Color(hex: "30D158") : Color(hex: "047857")) : primaryTextColor) : secondaryTextColor))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
-        .padding(.horizontal, 4.5)
+        .padding(.horizontal, 4)
         .padding(.vertical, 2)
         .background(
             Capsule().fill(highlight ? Color(hex: "8B5CF6").opacity(0.18) : (active ? (done ? Color(hex: "10B981").opacity(0.12) : accentColor.opacity(0.10)) : Color.clear))
@@ -4301,22 +4366,24 @@ struct DynamicIslandView: View {
             }
             .padding(.horizontal, 14)
             
-            // Task List + Done Feed Section (自适应展开 · 杜绝巨幅空白)
+            // Task List + Done Feed Section (锁定最大高并加 layoutPriority 防止 100+ 工单顶出页头)
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
                     // 1. Pending Tasks Section (if any)
                     if !tasks.isEmpty {
                         VStack(spacing: 8) {
                             ForEach(tasks) { task in
+                                let isRelay = task.stage == "relay"
+                                let isOverdue = task.eta.hasPrefix("超时") || task.eta.hasPrefix("滞留")
                                 VStack(alignment: .leading, spacing: 6) {
                                     HStack(spacing: 8) {
                                         ZStack {
                                             Circle()
-                                                .fill(task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))
+                                                .fill(isRelay ? Color(hex: "F59E0B").opacity(0.22) : (task.stage == "accepted" ? Color(hex: "3B82F6").opacity(0.18) : (task.stage == "submitted" ? Color(hex: "8B5CF6").opacity(0.18) : (isOverdue ? Color(hex: "EF4444").opacity(0.18) : Color(hex: "FF9500").opacity(0.18)))))
                                                 .frame(width: 24, height: 24)
-                                            Image(systemName: task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.badge.fill" : "doc.text.fill"))
+                                            Image(systemName: isRelay ? "figure.run" : (task.stage == "accepted" ? "bolt.fill" : (task.stage == "submitted" ? "bell.badge.fill" : (isOverdue ? "clock.badge.exclamationmark.fill" : "doc.text.fill"))))
                                                 .font(.system(size: fs(13), weight: .bold))
-                                                .foregroundColor(task.stage == "accepted" ? Color(hex: "3B82F6") : (task.stage == "submitted" ? Color(hex: "8B5CF6") : Color(hex: "D97706")))
+                                                .foregroundColor(isRelay ? textAmber : (task.stage == "accepted" ? textBlue : (task.stage == "submitted" ? Color(hex: "8B5CF6") : (isOverdue ? textRed : textAmber))))
                                         }
                                         
                                         VStack(alignment: .leading, spacing: 2) {
@@ -4325,16 +4392,18 @@ struct DynamicIslandView: View {
                                                 .foregroundColor(primaryTextColor)
                                                 .lineLimit(1)
                                             
-                                            HStack(spacing: 6) {
+                                            HStack(spacing: 4) {
                                                 lifecycleStepperView(stage: task.stage)
-                                                Text("•").font(.system(size: fs(12), weight: .semibold)).foregroundColor(secondaryTextColor)
-                                                Text("\(task.from) ➔ \(task.to)")
-                                                    .font(.system(size: fs(12), weight: .semibold))
+                                                Text("•").font(.system(size: fs(11), weight: .semibold)).foregroundColor(secondaryTextColor)
+                                                Text("\(task.from)➔\(task.to)")
+                                                    .font(.system(size: fs(11), weight: .semibold))
                                                     .foregroundColor(secondaryTextColor)
+                                                    .lineLimit(1)
                                                 if !task.eta.isEmpty {
                                                     Text("• \(task.eta)")
-                                                        .font(.system(size: fs(12), weight: .semibold))
-                                                        .foregroundColor(textBlue)
+                                                        .font(.system(size: fs(11), weight: .bold))
+                                                        .foregroundColor(isOverdue ? textRed : (isRelay ? textAmber : textBlue))
+                                                        .lineLimit(1)
                                                 }
                                             }
                                         }
@@ -4588,6 +4657,8 @@ struct DynamicIslandView: View {
                 }
                 .padding(.vertical, 4)
             }
+            .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
+            .layoutPriority(1)
             
             // Bottom Guidance Line
             HStack(spacing: 5) {
@@ -4598,8 +4669,15 @@ struct DynamicIslandView: View {
                     .font(.system(size: fs(13), weight: .semibold))
                     .foregroundColor(secondaryTextColor)
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.white.opacity(0.78))
+            )
             .padding(.bottom, 8)
         }
+        .padding(.top, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     /// 卡片层（对标 Apple WWDC25 HIG：外层独享原生 NSGlassEffectView，内容层不叠第二层玻璃，改用高区分度明度薄片 + 顶底镜面高光边 + 扎实投影）。

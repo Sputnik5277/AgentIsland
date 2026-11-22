@@ -10,6 +10,7 @@
   5. V4_DELTA_SNAPSHOT_CONTRACT — 消费 M4/M5/M6 快照及 isStale 陈旧守卫
   6. V4_BATCH_C2_CONTRACT    — M1/M2/M3 决策卡、打回、已读与剪贴板支持
   7. V4_BATCH_C3_CONTRACT    — ⌥I 全局热键、底部快发、M7 决定档案及可自定义快捷资产
+  8. V4_MEITUAN_CLOSED_LOOP_CONTRACT — 美团全链阶段识别（Step 2 / 需前台接力）及抽屉顶栏防裁切
 """
 from __future__ import annotations
 
@@ -55,6 +56,7 @@ def check_app_swift(path: Path) -> dict:
         "V4_DELTA_SNAPSHOT_CONTRACT": 0,
         "V4_BATCH_C2_CONTRACT": 0,
         "V4_BATCH_C3_CONTRACT": 0,
+        "V4_MEITUAN_CLOSED_LOOP_CONTRACT": 0,
     }
 
     def add_finding(rule: str, line_no: int, snippet: str) -> None:
@@ -133,6 +135,16 @@ def check_app_swift(path: Path) -> dict:
     for token, desc in c3_anchors:
         if token not in joined_code:
             add_finding("V4_BATCH_C3_CONTRACT", 1, desc)
+
+    # Rule 8: V4_MEITUAN_CLOSED_LOOP_CONTRACT (real Step2/relay stage + drawer clip guard)
+    r8_anchors = [
+        ("需前台接力", "missing Step2.5 foreground relay stage support"),
+        ("【Step 2", "missing inline/hand-written Step 2 stage detection in fetchInboxesJSON"),
+        (".layoutPriority(1)", "missing drawer ScrollView layoutPriority(1) clip guard"),
+    ]
+    for token, desc in r8_anchors:
+        if token not in joined_code:
+            add_finding("V4_MEITUAN_CLOSED_LOOP_CONTRACT", 1, desc)
 
     verdict = "PASS" if not findings else "FAIL"
     return {
