@@ -51,9 +51,16 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 - 🏝️ **Collapsed summary + hover expand**: the capsule shows one prioritized line (pending confirmations, unread counts, or all-read / channel-normal) instead of three green dots; approaching the pointer auto-expands the Control Center after 0.18s and collapses 0.7s after leaving.
 - 🎨 **Fixed agent identity colors**: AGY `#0A84FF`, Alma `#FF9F0A`, Ping `#7C3AED` are used consistently across collapsed dots, overview chips, inbox cards, drawer headers, and the topology view.
 - 🧱 **Three-tier channel hierarchy**: base `Tailscale` → primary `Funnel 443` → cold backup `Nutstore`, replacing the three equal-weight buttons.
-- 🖱️ **Five-group context menu + merged Appearance submenu**: 中控台 / 打开 / 自检 / 外观 / 退出 groups; Option shortcuts `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`; SF Symbols only (no emoji); one 「外观设置」 submenu covering theme, skin, form, 80–140% scale, dock edge, and accent color.
-- 🔤 **Typography floor**: body text ≥13pt, secondary text ≥11pt, `.semibold` minimum, opaque text colors; the expanded panel stays ≤420pt tall with layered 8 / 18–20 / 24–28px spacing.
+- 🖱️ **Five-group context menu + merged Appearance submenu**: 中控台 / 打开 / 自检 / 外观 / 退出 groups; global hotkey **`⌥I`** (Carbon `RegisterEventHotKey`) + menu shortcuts `⌥M ⌥D ⌥K ⌥S ⌥C ⌥P ⌥F`; SF Symbols only (no emoji); one 「外观设置」 submenu covering theme, skin, form, discrete crisp scaling (`100% / 110% / 120%` — no GPU `.scaleEffect` blur on 2K 1x displays), dock edge, and accent color.
+- 🔤 **Typography floor**: body text ≥13pt, secondary text ≥11pt, `.semibold` minimum, opaque text colors; crisp 1x rendering audited via `scripts/gate_app_hygiene.py` (`8/8` pre-compile checks).
 - 🖼️ **Full-size AppIcon**: `.icns` with 16/32/128/256/512/1024px, declared via `CFBundleIconFile`, packaged by `build.sh`, and installed in `~/Applications/AgentIsland.app`.
+
+### v4 Meituan Closed-Loop Control Center (2026-11-22 · `7041ea9`)
+
+- ⌨️ **Global Toggle (`⌥I`) & Funnel Quick Send**: summon or dismiss from any app via `⌥I`; send one-line dispatches to `Ping` / `AGY` / `Alma` via `handoff.py send --from lulu` with T1 receipt toast.
+- 🧭 **M4/M5/M6 Delta Telemetry & M1 Decision Banner**: consumes `~/.config/alma/state/pingloop-health.json`, `pingloop-convergence.jsonl`, and `a-verifier-decisions/*-fused.md` with >30m `isStale` guard; anti-anxiety capsule (`M1熔断 > 待验 > 今日新单 > 今日清零·存量N`) and in-card `机检 / 通过 / 打回 / 已读 / 复制`.
+- 🛵 **Meituan Closed-Loop Stages & Overdue Alerts**: drawer accurately distinguishes `派单 → 接单(履约中) → 需前台接力 (Step 2.5) → 待验 → 已结案`, filters hand-written inline confirmations, highlights overdue (`超时`/`滞留`) tasks, and pins the drawer header cleanly under 100+ items.
+- 📚 **Customizable M7 Quick Assets & Hygiene Gate**: 5 defaults (incl. `decisions-archive.md` & `corrections.tsv`) editable in Settings via `UserDefaults`; `build.sh` runs `scripts/gate_app_hygiene.py` (`8/8` static rules) before `swiftc`.
 
 ### Idle Zero-Line Semantics & Polling Boundary (v1.8.0)
 
@@ -113,9 +120,16 @@ open /Applications/AgentIsland.app
 - 🏝️ **收起态摘要 + 悬停展开**：胶囊只显示一行按优先级取出的摘要（待验收、未读数，或全员已读 / 链路正常），不再用三个绿点；鼠标靠近 0.18s 自动展开，离开 0.7s 自动收起。
 - 🎨 **三个 Agent 固定身份色**：AGY `#0A84FF`、Alma `#FF9F0A`、Ping `#7C3AED`，在收起态圆点、总览 chips、收件箱卡片、抽屉标题、链路架构中保持一致。
 - 🧱 **通道分三层显示**：底座 `Tailscale` → 主通道 `Funnel 443` → 冷备 `坚果云`，替代原来三个同权重按钮。
-- 🖱️ **右键菜单五组结构 + 外观设置合并子菜单**：中控台 / 打开 / 自检 / 外观 / 退出；Option 快捷键 `⌥1 ⌥K ⌥S ⌥C ⌥P ⌥F`；全部 SF Symbols、零 emoji；原「外观模式」「主题强调色」合并进单一「外观设置」子菜单，内含明暗模式、皮肤、形态、80–140% 尺寸、停靠边与强调色。
-- 🔤 **字号下限**：正文 ≥13pt、次要 ≥11pt，字重最低 `.semibold`，文字实色；展开态总高 ≤420pt，按 8 / 18–20 / 24–28px 三层留白。
+- 🖱️ **右键菜单五组结构 + 外观设置合并子菜单**：中控台 / 打开 / 自检 / 外观 / 退出；支持 Carbon 全局热键 **`⌥I`** 及快捷键 `⌥M ⌥D ⌥K ⌥S ⌥C ⌥P ⌥F`；全部 SF Symbols、零 emoji；单一「外观设置」子菜单涵盖明暗模式、皮肤、形态、离散清晰三档尺寸（`100% / 110% / 120%`，杜绝 2K 1x 屏 `.scaleEffect` 糊字）、停靠边与强调色。
+- 🔤 **字号与 2K 清晰度硬门**：正文 ≥13pt、次要 ≥11pt，字重最低 `.semibold`，文字实色；编译前必过 `scripts/gate_app_hygiene.py`（`8/8` 静态硬门：禁止管道死锁/未读 stderr/整窗 GPU 拉伸/`.rounded`/<11pt 小字与阶段倒置）。
 - 🖼️ **全尺寸 AppIcon**：`.icns` 覆盖 16/32/128/256/512/1024px，`Info.plist` 声明 `CFBundleIconFile`，`build.sh` 打包进 `Contents/Resources`，并安装到 `~/Applications/AgentIsland.app`。
+
+### v4 美团全链闭环中控台（2026-11-22 · `7041ea9`）
+
+- ⌨️ **`⌥I` 全局热键与底部快发**：任意界面按 `⌥I` 秒级呼出/收起、`Esc` 退回；底部 `Ping / AGY / Alma` 一句快发直走 Funnel 443 并弹 `T1✓` 回执。
+- 🧭 **M4/M5/M6 增量遥测与 M1 批奏折区**：直接消费 `pingloop-health.json`、`pingloop-convergence.jsonl` 与 `a-verifier-decisions/*-fused.md`（带 >30m `isStale` 陈旧守卫）；抗焦虑胶囊分级显示，支持抽屉内 `机检 / 通过 / 打回 / 已读 / 复制`。
+- 🛵 **美团订单全阶段识别与抽屉防裁切**：按 `Step 4 → Step 3/待确认 → Step 2.5/需前台接力 → Step 2/履约中 → Step 1/派单` 严格降序判态，识别 `需前台接力` 与 `超时`/`滞留` SLA 预警，并锁定百单抽屉顶栏零裁切。
+- 📚 **可自定义 M7 快捷资产**：默认含全景图 / Spaces / 交流 / 决定档案 / 纠正日志（5 项），支持在设置面板增删、持久化与一键恢复默认。
 
 ### 空闲零连线语义与轮询边界（v1.8.0）
 
