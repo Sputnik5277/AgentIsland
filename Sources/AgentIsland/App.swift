@@ -4159,7 +4159,7 @@ struct DynamicIslandView: View {
                             Text("➔")
                                 .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
-                            Text(isEscalate ? "待露露拍板 / \(item.to) 核销" : "待 \(item.to) 点确认")
+                            Text(isEscalate ? "待发起方(\(item.to))核销" : "待 \(item.to) 点确认")
                                 .font(.system(size: fs(13), weight: .bold))
                                 .foregroundColor(textPurple)
                         }
