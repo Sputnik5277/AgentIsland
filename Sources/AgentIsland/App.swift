@@ -1002,14 +1002,28 @@ class AgentMonitor: ObservableObject {
     func toggleAgyWakePaused() {
         let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
         let fm = FileManager.default
+        var resumedFromPause = false
         if fm.fileExists(atPath: pauseURL.path) {
             try? fm.removeItem(at: pauseURL)
+            resumedFromPause = true
         } else {
             try? fm.createDirectory(at: wakeStateDirURL, withIntermediateDirectories: true)
             let stamp = ISO8601DateFormatter().string(from: Date())
             try? ("paused_by_agent_island: \(stamp)\n").data(using: .utf8)?.write(to: pauseURL, options: .atomic)
         }
         reloadWakeState(force: true)
+        if resumedFromPause {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                proc.arguments = ["/Users/l/.config/alma/scripts/agy-turn.py", "--resume-backlog"]
+                proc.standardOutput = FileHandle.nullDevice
+                proc.standardError = FileHandle.nullDevice
+                try? proc.run()
+                proc.waitUntilExit()
+                self?.refreshAll()
+            }
+        }
     }
     
     func checkAppearance() {
@@ -1892,11 +1906,21 @@ for b in boxes:
             txt, meta = '', {}
         st = str(meta.get('status', '')).strip()
         tid = str(meta.get('trace_id', '')).strip()
+        is_step4_terminal = (
+            '【Step 4 终审' in txt
+            or '【Step 4a' in txt
+            or '核验 + 确认' in txt
+            or '核验+确认' in txt
+            or '已确认结案' in txt
+        )
         is_doc_closed = (
-            any(c in st for c in TERMINAL_STATUSES)
-            or '-confirm' in p.name
-            or p.name in acked_b
-            or '【Step 4' in txt
+            (st != '待整改')
+            and (
+                any(c in st for c in TERMINAL_STATUSES)
+                or '-confirm' in p.name
+                or p.name in acked_b
+                or is_step4_terminal
+            )
         )
         if is_doc_closed:
             if tid and tid not in ('none', '-'):
@@ -1994,14 +2018,31 @@ for box in boxes:
             continue
 
         full_txt = latest_p.read_text(encoding='utf-8', errors='replace')
-        if ('【Step 4' in full_txt) or ('核验 + 确认' in full_txt) or ('核验+确认' in full_txt) or ('已确认结案' in full_txt):
+        cur_status = str(latest_meta.get('status', '待办')).strip()
+        is_step4_terminal = (
+            '【Step 4 终审' in full_txt
+            or '【Step 4a' in full_txt
+            or '核验 + 确认' in full_txt
+            or '核验+确认' in full_txt
+            or '已确认结案' in full_txt
+        )
+        if cur_status != '待整改' and is_step4_terminal:
             continue
 
-        cur_status = str(latest_meta.get('status', '待办')).strip()
         head_lines = full_txt.splitlines()[:140]
         has_inline_step2 = ('【Step 2' in full_txt) or any(ln.lstrip().startswith('##') and 'Step 2' in ln for ln in head_lines)
-        # 严格从高阶段往低阶段判：已交付(Step 3/待确认)必须先于 Step 2/接力，防止已交单被降级成履约中！
-        if cur_status in ('待确认', '交付待确认') or ('【Step 3' in full_txt) or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
+        # 严格从高阶段往低阶段判：待整改/高危拍板/已交付(Step 3/待确认)优先于旧 Step 2/接力，防止打回后被旧标记遮蔽！
+        if cur_status == '待整改':
+            stage = 'rework'
+            status_text = '待整改'
+            total_dispatched += 1
+            eta = '打回待整改'
+        elif cur_status == '需高危拍板' or '【Step 2.5 需高危拍板】' in full_txt:
+            stage = 'high-risk-blocked'
+            status_text = '需高危拍板'
+            total_accepted += 1
+            eta = '高危待拍板'
+        elif cur_status in ('待确认', '交付待确认') or ('【Step 3' in full_txt) or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
             # 关键分流：待确认属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
             continue
         elif cur_status == '需前台接力' or '【Step 2.5 需前台接力】' in full_txt:
@@ -2045,7 +2086,7 @@ for box in boxes:
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
 
-# Phase 3: Pending Confirmations (发起方闭环核验中)
+# Phase 3: Pending Confirmations (发起方闭环核验中，兼容 --split -reply 与 --inline 待确认原单)
 raw_confirms = []
 for b in boxes:
     b_dir = ROOT / b
@@ -2053,16 +2094,23 @@ for b in boxes:
     all_b_files = list(b_dir.iterdir())
     for p in all_b_files:
         if not p.is_file() or handoff.is_ignored_file(p): continue
-        if not handoff.REPLY_RE.search(p.name): continue
+        if re.search(r'-(?:accept|confirm|reject)\\d*\\.md$', p.name, re.I) or p.name.startswith('receipt-'):
+            continue
+        is_reply_file = bool(handoff.REPLY_RE.search(p.name))
         try:
             txt = p.read_text(encoding='utf-8', errors='replace')
             meta, body = handoff.parse_frontmatter(txt)
             status = str(meta.get('status', '')).strip()
-            if status != '待确认': continue
-            to_agent = str(meta.get('to', '')).strip().lower()
-            b_stem = p.name.replace('.md', '').split('-reply')[0].split('-audit')[0].split('-submit')[0]
+            if status not in ('待确认', '交付待确认'): continue
+            if is_reply_file:
+                verifier = str(meta.get('to', '')).strip().lower()
+                submitter = str(meta.get('from', '未知'))
+            else:
+                verifier = str(meta.get('from', '')).strip().lower()
+                submitter = str(meta.get('to', '未知'))
+            b_stem = re.sub(r'-(?:reply\\d*|audit\\d*|submit\\d*)$', '', p.stem, flags=re.I)
             if b_stem in all_acked_bases: continue
-            acked = handoff.load_ack(to_agent)
+            acked = handoff.load_ack(verifier) if verifier else {}
             if p.name in acked or b_stem in acked: continue
             tid = str(meta.get('trace_id', '')).strip()
             rt = str(meta.get('reply_to', '')).strip()
@@ -2077,18 +2125,19 @@ for b in boxes:
             has_confirm_file = any((b_stem in f.name and '-confirm' in f.name) for f in all_b_files)
             if has_confirm_file:
                 continue
-            orig_p = b_dir / f'{b_stem}.md'
-            if orig_p.is_file():
-                o_txt = orig_p.read_text(encoding='utf-8', errors='replace')
-                o_meta, _ = handoff.parse_frontmatter(o_txt)
-                if any(c in str(o_meta.get('status', '')) for c in TERMINAL_STATUSES):
-                    continue
+            if is_reply_file:
+                orig_p = b_dir / f'{b_stem}.md'
+                if orig_p.is_file():
+                    o_txt = orig_p.read_text(encoding='utf-8', errors='replace')
+                    o_meta, _ = handoff.parse_frontmatter(o_txt)
+                    if any(c in str(o_meta.get('status', '')) for c in TERMINAL_STATUSES):
+                        continue
 
             raw_confirms.append({
                 'file': f'{b}/{p.name}',
                 'base': b_stem,
-                'from': str(meta.get('from', '未知')),
-                'to': to_agent,
+                'from': submitter,
+                'to': verifier,
                 'date': str(meta.get('date', '-')),
                 'title': clean_title(handoff.first_heading(body) or p.stem),
                 'mtime': p.stat().st_mtime,
@@ -2697,7 +2746,8 @@ struct DynamicIslandView: View {
             switch st {
             case "running": return Color(hex: "007AFF")
             case "paused": return Color(hex: "6B7280")
-            case "fused-m1", "error": return Color(hex: "EF4444")
+            case "fused-m1", "error", "high-risk-blocked", "需高危拍板": return Color(hex: "EF4444")
+            case "relay-needed", "empty-response", "待整改": return Color(hex: "F59E0B")
             default: return Color(hex: "10B981")
             }
         }()
@@ -2707,11 +2757,15 @@ struct DynamicIslandView: View {
             case "paused": return "已暂停"
             case "fused-m1": return "M1熔断"
             case "error": return "异常"
+            case "high-risk-blocked", "需高危拍板": return "需拍板"
+            case "relay-needed": return "需接力"
+            case "empty-response": return "空响应"
+            case "待整改": return "待整改"
             default: return "待命"
             }
         }()
         let barColor: Color = ws.tokenRatio >= 0.8 ? Color(hex: "F59E0B") : statusColor
-        let pulseActive = (st == "running" || st == "fused-m1")
+        let pulseActive = (st == "running" || st == "fused-m1" || st == "high-risk-blocked" || st == "需高危拍板")
 
         return HStack(spacing: 6) {
             // ① 左段：AGY 状态 + 预算进度条
