@@ -2000,7 +2000,11 @@ for box in boxes:
         cur_status = str(latest_meta.get('status', '待办')).strip()
         head_lines = full_txt.splitlines()[:140]
         has_inline_step2 = ('【Step 2' in full_txt) or any(ln.lstrip().startswith('##') and 'Step 2' in ln for ln in head_lines)
-        if cur_status == '需前台接力' or '【Step 2.5 需前台接力】' in full_txt:
+        # 严格从高阶段往低阶段判：已交付(Step 3/待确认)必须先于 Step 2/接力，防止已交单被降级成履约中！
+        if cur_status in ('待确认', '交付待确认') or ('【Step 3' in full_txt) or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
+            # 关键分流：待确认属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
+            continue
+        elif cur_status == '需前台接力' or '【Step 2.5 需前台接力】' in full_txt:
             stage = 'relay'
             status_text = '需前台接力'
             total_accepted += 1
@@ -2010,9 +2014,6 @@ for box in boxes:
             status_text = '履约中'
             total_accepted += 1
             eta = str(latest_meta.get('eta', '履约推进中'))
-        elif cur_status == '待确认' or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
-            # 关键分流：待确认属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
-            continue
         else:
             stage = 'dispatched'
             status_text = '待接单'

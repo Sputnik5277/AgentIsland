@@ -145,6 +145,14 @@ def check_app_swift(path: Path) -> dict:
     for token, desc in r8_anchors:
         if token not in joined_code:
             add_finding("V4_MEITUAN_CLOSED_LOOP_CONTRACT", 1, desc)
+    pending_line = next((i + 1 for i, c in enumerate(code_lines) if "cur_status" in c and "待确认" in c), None)
+    accepted_line = next((i + 1 for i, c in enumerate(code_lines) if "or has_inline_step2" in c), None)
+    if pending_line is None or accepted_line is None or pending_line > accepted_line:
+        add_finding(
+            "V4_MEITUAN_CLOSED_LOOP_CONTRACT",
+            pending_line or 1,
+            f"stage inversion: 待确认 check@{pending_line} must precede has_inline_step2 check@{accepted_line}",
+        )
 
     verdict = "PASS" if not findings else "FAIL"
     return {
