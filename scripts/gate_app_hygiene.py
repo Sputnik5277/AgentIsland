@@ -57,6 +57,8 @@ def check_app_swift(path: Path) -> dict:
         "V4_BATCH_C2_CONTRACT": 0,
         "V4_BATCH_C3_CONTRACT": 0,
         "V4_MEITUAN_CLOSED_LOOP_CONTRACT": 0,
+        "NOTIFICATION_INTERACTION_CONTRACT": 0,
+        "COMPACT_WIDTH_CAP": 0,
     }
 
     def add_finding(rule: str, line_no: int, snippet: str) -> None:
@@ -153,6 +155,23 @@ def check_app_swift(path: Path) -> dict:
             pending_line or 1,
             f"stage inversion: 待确认 check@{pending_line} must precede has_inline_step2 check@{accepted_line}",
         )
+
+    # Rule 9: NOTIFICATION_INTERACTION_CONTRACT (click + hover during .notification)
+    notif_m = re.search(r"func\s+notificationView\b[\s\S]{0,1600}?\n\s{4}\}", joined_code)
+    if not notif_m or ".onTapGesture" not in notif_m.group(0):
+        add_finding("NOTIFICATION_INTERACTION_CONTRACT", 1, "notificationView missing .onTapGesture expand action")
+    hover_m = re.search(r"func\s+evaluateHover\b[\s\S]{0,2000}?switch\s+monitor\.currentMode", joined_code)
+    if not hover_m or "case .compact, .notification:" not in joined_code:
+        add_finding("NOTIFICATION_INTERACTION_CONTRACT", 1, "evaluateHover missing case .compact, .notification:")
+
+    # Rule 10: COMPACT_WIDTH_CAP (prevent runaway compact pill width > 400pt)
+    cw_m = re.search(r"var\s+preferredCompactWidth\s*:\s*CGFloat\s*\{([\s\S]{0,400}?)\}", joined_code)
+    if not cw_m:
+        add_finding("COMPACT_WIDTH_CAP", 1, "missing preferredCompactWidth")
+    else:
+        cap_m = re.search(r"\bmin\(\s*(\d+(?:\.\d+)?)\s*\*\s*s\b", cw_m.group(1))
+        if not cap_m or float(cap_m.group(1)) > 400:
+            add_finding("COMPACT_WIDTH_CAP", 1, f"preferredCompactWidth cap > 400pt: {cap_m.group(0) if cap_m else 'missing'}")
 
     verdict = "PASS" if not findings else "FAIL"
     return {

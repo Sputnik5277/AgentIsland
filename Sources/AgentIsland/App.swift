@@ -74,9 +74,10 @@ struct AppleGlassBackground: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         if #available(macOS 26.0, *), let v = nsView as? NSGlassEffectView, !forceFallback {
-            v.style = glassStyle == .clear ? .clear : .regular
-            v.cornerRadius = cornerRadius
-            v.tintColor = glassTint
+            let targetStyle: NSGlassEffectView.Style = glassStyle == .clear ? .clear : .regular
+            if v.style != targetStyle { v.style = targetStyle }
+            if abs(v.cornerRadius - cornerRadius) > 0.01 { v.cornerRadius = cornerRadius }
+            if v.tintColor != glassTint { v.tintColor = glassTint }
             return
         }
         guard let v = nsView as? NSVisualEffectView else { return }
@@ -565,14 +566,19 @@ class AgentMonitor: ObservableObject {
         if dataUnknown { return "· 收件箱读取失败" }
         if fusedCount > 0 { return "· 待露露终裁" }
         if totalSubmitted > 0 {
-            let unread = todayUnreadLeaders.map { "\($0.0.short) +\($0.1)" }.joined(separator: " · ")
-            if !unread.isEmpty { return "· 今日 \(unread)" }
+            if let top = todayUnreadLeaders.first {
+                let extra = todayUnreadLeaders.count > 1 ? " 等" : ""
+                return "· 今日 \(top.0.short) +\(top.1)\(extra)"
+            }
             let names = Set(pendingConfirms.compactMap { AgentRoster.identity(for: $0.from.lowercased())?.short })
-            let joined = names.isEmpty ? "Agent" : names.sorted().joined(separator: " / ")
+            let joined = names.isEmpty ? "Agent" : names.sorted().prefix(2).joined(separator: "/")
             return "· 来自 \(joined)"
         }
         if totalTodayUnread > 0 {
-            return "· " + todayUnreadLeaders.map { "\($0.0.short) \($0.1)" }.joined(separator: " · ")
+            if let top = todayUnreadLeaders.first {
+                let extra = todayUnreadLeaders.count > 1 ? " 等" : ""
+                return "· \(top.0.short) \(top.1)\(extra)"
+            }
         }
         return totalUnread > 0 ? "· 存量 \(totalUnread)" : "· 0 待办"
     }
@@ -580,7 +586,7 @@ class AgentMonitor: ObservableObject {
     var preferredCompactWidth: CGFloat {
         let s = CGFloat(uiScale)
         let len = CGFloat(compactHeadText.count) * (15.5 * s) + CGFloat(compactTailText.count) * (12.0 * s)
-        return evenCeil(max(280 * s, min(560 * s, 72 * s + len)))
+        return evenCeil(max(260 * s, min(380 * s, 64 * s + len)))
     }
 
     /// 展开态内容高度（视图与窗口共用同一套数值，避免裁切）
@@ -1576,9 +1582,10 @@ class AgentMonitor: ObservableObject {
                 let prevTotal = self.lastKnownTotalPending
                 if prevTotal >= 0 && currentTotal > prevTotal {
                     let lead = self.unreadLeaders.first
+                    let hint = self.hoverAutoExpand ? "靠近或点击展开" : "点击展开"
                     self.triggerNotification(
                         title: "📩 \(currentTotal - prevTotal) 件新未读",
-                        subtitle: lead.map { "\($0.0.title) 收件箱 \($0.1) 件未读 · 靠近自动展开" } ?? "靠近自动展开"
+                        subtitle: lead.map { "\($0.0.title) 收件箱 \($0.1) 件未读 · \(hint)" } ?? hint
                     )
                 }
                 self.lastKnownTotalPending = currentTotal
@@ -1716,14 +1723,14 @@ class AgentMonitor: ObservableObject {
                     case "observe_pass":
                         let passed = (obj["assertions_passed"] as? Int) ?? 0
                         let total = (obj["assertions_total"] as? Int) ?? 0
-                        summary = "A级 PASS(\(passed)/\(total))"
+                        summary = "机检通过(\(passed)/\(total))"
                     case "route_b":
                         let reason = (obj["reason"] as? String) ?? "人工"
-                        summary = reason == "no_submit_assertions" ? "B级(无断言)" : "B级人工"
+                        summary = reason == "no_submit_assertions" ? "B级无断言 · 需人工" : "B级 · 需人工复核"
                     case "fused", "fused_already":
                         summary = "M1熔断"
                     default:
-                        summary = "A级 FAIL"
+                        summary = "机检不通过"
                     }
                 }
             } catch {}
@@ -2034,7 +2041,7 @@ ROOT = handoff.HANDOFFS_ROOT
 
 
 
-TERMINAL_STATUSES = ('已完成', '作废', '已关闭', '已核销', '参考', '已结案', '已确认', '已办', '已回复', '已交付', '已结算')
+TERMINAL_STATUSES = ('已完成', '作废', '已关闭', '已核销', '参考', '已结案', '已确认', '已办', '已回复', '已交付', '已结算', '通知')
 
 def clean_title(t):
     t = re.sub(r'(\\*\\*|__|`)', '', str(t or ''))
@@ -2695,6 +2702,10 @@ struct DynamicIslandView: View {
             Spacer()
         }
         .padding(.horizontal, 12)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            monitor.setMode(.expanded)
+        }
     }
     
     // MARK: - AgentIsland & Multi-Agent 架构控制中心 (苹果原厂大字阶与四层空间调度)
@@ -3062,11 +3073,19 @@ struct DynamicIslandView: View {
             ForEach(AgentRoster.all) { agent in
                 let count = monitor.pendingCount(for: agent.key)
                 let tCount = monitor.todayCount(for: agent.key)
+                let doneCount: Int = {
+                    switch agent.key {
+                    case "ping": return monitor.pingDoneTasks.count
+                    case "agy": return monitor.agyDoneTasks.count
+                    case "alma": return monitor.almaDoneTasks.count
+                    default: return 0
+                    }
+                }()
                 let sub: String = {
                     if monitor.dataUnknown { return "读取失败 · 未知" }
-                    if count == 0 { return "收件箱已读" }
-                    if tCount > 0 { return "今日 +\(tCount) · 存量 \(count)" }
-                    return "今日已清 · 存量 \(count)"
+                    if count == 0 { return "0 待办 · 已结 \(doneCount)" }
+                    if tCount > 0 { return "今日+\(tCount) · 待办\(count) · 已结\(doneCount)" }
+                    return "今日0 · 待办\(count) · 已结\(doneCount)"
                 }()
                 agentBalanceCard(
                     icon: agent.symbol,
@@ -4196,10 +4215,10 @@ struct DynamicIslandView: View {
 
                     // 批奏折动作栏：A/B 机检 + 通过(confirm) + 打回(reject)
                     HStack(spacing: 6) {
-                        let obsTag = monitor.observeResults[item.file] ?? "待机检 / B级"
+                        let obsTag = monitor.observeResults[item.file] ?? "待自动机检 · B级需复核"
                         Text(obsTag)
                             .font(.system(size: fs(11), weight: .bold))
-                            .foregroundColor(obsTag.contains("PASS") ? textGreen : (obsTag.contains("FAIL") || obsTag.contains("熔断") ? textRed : textPurple))
+                            .foregroundColor(obsTag.contains("通过") || obsTag.contains("PASS") ? textGreen : (obsTag.contains("不通过") || obsTag.contains("FAIL") || obsTag.contains("熔断") ? textRed : textPurple))
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
                             .background(Capsule().fill((obsTag.contains("PASS") ? Color(hex: "10B981") : Color(hex: "8B5CF6")).opacity(0.14)))
@@ -5782,7 +5801,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         switch monitor.currentMode {
-        case .compact:
+        case .compact, .notification:
             // 默认勿扰（仅点击展开）；即使主动开启靠近展开，也禁止拖窗按键时触发并收窄到胶囊本体内部。
             guard monitor.hoverAutoExpand else {
                 hoverInsideSince = nil
