@@ -2179,6 +2179,9 @@ for box in boxes:
         # 严格责任边界：收件人不是本箱的（如抄送件、外发件），严禁算作本箱待办！
         if orig_to and orig_to != box:
             continue
+        # 升级拍板信（escalate-highrisk-*）由发起方/露露拍板，严禁算作 Ping 自己的待办！
+        if box == 'ping' and latest_p.name.startswith('escalate-highrisk-'):
+            continue
         # 只有原单自身就是外发单且非发给当前信箱时才过滤；收到派单并签署 -accept 属于正常履约中，严禁过滤！
         if orig_frm == box and orig_to != box:
             continue
@@ -2265,7 +2268,7 @@ for b in boxes:
         if not p.is_file() or handoff.is_ignored_file(p): continue
         if re.search(r'-(?:accept|confirm|reject)\\d*\\.md$', p.name, re.I) or p.name.startswith('receipt-'):
             continue
-        is_reply_file = bool(handoff.REPLY_RE.search(p.name))
+        is_reply_file = bool(handoff.REPLY_RE.search(p.name) or '-reply' in p.name.lower())
         try:
             txt = p.read_text(encoding='utf-8', errors='replace')
             meta, body = handoff.parse_frontmatter(txt)
@@ -4149,13 +4152,14 @@ struct DynamicIslandView: View {
                     // Route & Artifact Link
                     HStack(spacing: 8) {
                         HStack(spacing: 4) {
-                            Text("履约方: \(item.from)")
+                            let isEscalate = item.file.contains("escalate-highrisk-")
+                            Text(isEscalate ? "转呈(\(item.from))" : "已送达(\(item.from))")
                                 .font(.system(size: fs(13), weight: .semibold))
                                 .foregroundColor(textBlue)
                             Text("➔")
                                 .font(.system(size: fs(12), weight: .semibold))
                                 .foregroundColor(secondaryTextColor)
-                            Text("派单方: \(item.to)")
+                            Text(isEscalate ? "待露露拍板 / \(item.to) 核销" : "待 \(item.to) 点确认")
                                 .font(.system(size: fs(13), weight: .bold))
                                 .foregroundColor(textPurple)
                         }
