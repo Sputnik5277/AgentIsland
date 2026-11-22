@@ -5,6 +5,20 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v1.8.2] - 2026-11-22
+
+### 🩺 C 节裁决三项（B / F / B-11） / Budget-zero, submit-failed, and resume gate
+
+- **🪙 `daily_tokens_limit <= 0` 不再显示成「预算 0」**
+  - 进度条改画满整条淡绿色轨道，右侧百分比位直接写「无上限」，tooltip 改「Token 预算：无上限（今日已用 514K）」。
+  - 对齐 `agy-turn.py` 的 `0 = unlimited` 口径；此前 `tokenRatio = 0` 让面板显示空条 +「341K / 0K」。
+- **🟥 补 `submit-failed` 状态**：`status == "error"` 且 `last_action == "submit-failed"` 时，状态点与文字落到红「交付失败」，不再穿过 `default` 分支显示绿色「待命」。
+- **🛑「恢复」按钮加闸（两处一起）**
+  - 点「恢复」先在面板内就地弹二次确认条（不弹系统 NSAlert —— 模态框会跑到物理主屏）。
+  - 重放上限恒为 `--max-backlog 1`；取消 = 保持暂停，一个工单都不重放。不再提供「重放全部」选项。
+  - 每次真正重放都把 argv 与脚本输出追加到 `state/island-resume.log`，并在灵动岛 toast 里写明「重放上限 N 张 / 实际排队 M 张」。
+- **🧪 自测钩子（仅显式 env 开启）**：`AGENT_ISLAND_STATE_DIR`（沙箱快照目录）、`AGENT_ISLAND_SELFTEST_RESUME`、`AGENT_ISLAND_SELFTEST_TAP_RESUME`、`AGENT_ISLAND_AGYTURN_SCRIPT`（桩脚本）。
+
 ## [v1.8.1] - 2026-11-21
 
 ### 💎 展开态高透原生玻璃 & 测试显示隔离 / High-Transmission Native Glass & Isolated Test Display

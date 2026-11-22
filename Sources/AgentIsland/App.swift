@@ -344,10 +344,18 @@ struct WakeWorkerState: Equatable {
     var elapsedS: Double = 0
     var paused: Bool = false
     var loaded: Bool = false
+    /// agy-turn 快照里的 last_action（区分同为 status=error 的「异常」与「交付失败」）
+    var lastAction: String = ""
 
     var effectiveStatus: String {
-        paused ? "paused" : status
+        if paused { return "paused" }
+        // agy-turn 在 submit 落盘失败时写 status=error + last_action=submit-failed，
+        // 只按 status 判别会显示成绿色「待命」——交付失败在面板上看起来是健康的。
+        if status == "error" && lastAction == "submit-failed" { return "submit-failed" }
+        return status
     }
+    /// daily_tokens_limit<=0 表示不限量（agy-turn 的 0=unlimited 口径），不是「预算 0」。
+    var tokenUnlimited: Bool { dailyTokensLimit <= 0 }
     var tokenRatio: Double {
         guard dailyTokensLimit > 0 else { return 0 }
         return min(1.0, max(0.0, Double(dailyTokens) / Double(dailyTokensLimit)))
@@ -355,14 +363,17 @@ struct WakeWorkerState: Equatable {
     var tokenPct: Int {
         Int((tokenRatio * 100).rounded())
     }
+    var tokenPctText: String {
+        tokenUnlimited ? "无上限" : "\(tokenPct)%"
+    }
     var tooltipText: String {
         let tokK = dailyTokens / 1000
-        let limK = dailyTokensLimit / 1000
         let shortFile = URL(fileURLWithPath: lastFile).deletingPathExtension().lastPathComponent
+        let budget = tokenUnlimited ? "Token 预算：无上限（今日已用 \(tokK)K）" : "Token 预算：\(tokK)K / \(dailyTokensLimit / 1000)K"
         if shortFile.isEmpty {
-            return "Token 预算：\(tokK)K / \(limK)K · 状态：\(effectiveStatus)"
+            return "\(budget) · 状态：\(effectiveStatus)"
         }
-        return "Token 预算：\(tokK)K / \(limK)K · 最近：\(shortFile)（\(String(format: "%.1fs", elapsedS))）"
+        return "\(budget) · 最近：\(shortFile)（\(String(format: "%.1fs", elapsedS))）"
     }
 }
 
@@ -412,6 +423,10 @@ class AgentMonitor: ObservableObject {
     @Published var lastCommRoute: String = ""
     /// AGY 后台无头唤醒实时态（监听父目录 ~/.config/alma/state/，抗 os.replace inode 替换）
     @Published var wakeState: WakeWorkerState = WakeWorkerState()
+
+    /// 「恢复」二次确认的就地面板状态（不用系统模态框，避免弹到物理主屏）
+    @Published var resumeConfirmPending: Bool = false
+    @Published var resumeConfirmBacklog: Int = 0
     @Published var deltaState: PingloopDeltaState = PingloopDeltaState()
     @Published var fusedCards: [FusedDecisionCard] = []
     @Published var observeResults: [String: String] = [:]
@@ -591,7 +606,10 @@ class AgentMonitor: ObservableObject {
         var h: CGFloat = 34
         if fusedCount > 0 || !fusedCards.isEmpty { h += 108 }
         if enabledSections[PanelSectionKey.overview.rawValue] ?? (PanelSectionKey.defaults[PanelSectionKey.overview.rawValue] ?? false) { h += 28 }
-        if enabledSections[PanelSectionKey.wake.rawValue] ?? true { h += 36 }
+        if enabledSections[PanelSectionKey.wake.rawValue] ?? true {
+            // 唤醒条本身 36；就地二次确认条再占一行（≈30 + 4 间距），不补就会把下面区块顶出视口
+            h += resumeConfirmPending ? 70 : 36
+        }
         if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
             let rejectExtra: CGFloat = (!pendingConfirms.isEmpty && rejectTargetFile != nil) ? 44 : 0
             h += (pendingConfirms.isEmpty ? 68 : 142) + rejectExtra
@@ -785,7 +803,11 @@ class AgentMonitor: ObservableObject {
     }
 
     private var wakeStateDirURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/alma/state", isDirectory: true)
+        // 仅测试实例可用 AGENT_ISLAND_STATE_DIR 指向沙箱快照（生产不传就走默认路径）
+        if let override = ProcessInfo.processInfo.environment["AGENT_ISLAND_STATE_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/alma/state", isDirectory: true)
     }
 
     func startWakeStateWatcher() {
@@ -864,6 +886,7 @@ class AgentMonitor: ObservableObject {
             next.dailyTokens = (agy["daily_tokens"] as? Int) ?? 0
             next.dailyTokensLimit = (agy["daily_tokens_limit"] as? Int) ?? 500_000
             next.lastFile = (agy["file"] as? String) ?? ""
+            next.lastAction = (agy["last_action"] as? String) ?? ""
             next.elapsedS = (agy["elapsed_s"] as? Double) ?? 0
             next.loaded = true
         }
@@ -999,30 +1022,165 @@ class AgentMonitor: ObservableObject {
         }
     }
 
+    /// 「恢复」一次最多重放多少张积压单。默认 1；只有用户在二次确认里显式选「全部」才放宽。
+    static let resumeBacklogDefault = 1
+    static let resumeBacklogUnbounded = 0
+
+    /// 点「暂停」直接生效（停下来的动作不该被确认框延迟）；
+    /// 点「恢复」要先二次确认——恢复会真的把积压单以全权限重放一遍。
     func toggleAgyWakePaused() {
+        if pauseMarkerExists {
+            beginResumeConfirmation()
+        } else {
+            applyPause()
+        }
+    }
+
+    private var pauseMarkerExists: Bool {
+        FileManager.default.fileExists(
+            atPath: wakeStateDirURL.appendingPathComponent("agy-turn.paused").path
+        )
+    }
+
+    private func applyPause() {
         let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
         let fm = FileManager.default
-        var resumedFromPause = false
-        if fm.fileExists(atPath: pauseURL.path) {
-            try? fm.removeItem(at: pauseURL)
-            resumedFromPause = true
-        } else {
-            try? fm.createDirectory(at: wakeStateDirURL, withIntermediateDirectories: true)
-            let stamp = ISO8601DateFormatter().string(from: Date())
-            try? ("paused_by_agent_island: \(stamp)\n").data(using: .utf8)?.write(to: pauseURL, options: .atomic)
-        }
+        try? fm.createDirectory(at: wakeStateDirURL, withIntermediateDirectories: true)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        try? ("paused_by_agent_island: \(stamp)\n").data(using: .utf8)?.write(to: pauseURL, options: .atomic)
         reloadWakeState(force: true)
-        if resumedFromPause {
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                proc.arguments = ["/Users/l/.config/alma/scripts/agy-turn.py", "--resume-backlog"]
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = FileHandle.nullDevice
-                try? proc.run()
-                proc.waitUntilExit()
+    }
+
+    /// 恢复前二次确认的文案。只讲「会重放几张」，上限恒为 1，不提供「重放全部」选项。
+    static func resumeConfirmationText(backlogCount: Int) -> String {
+        let queueLine = backlogCount > 0
+            ? "队列里还有 \(backlogCount) 张未接单的积压单"
+            : "队列里没有未接单的积压单"
+        return "恢复只重放队首 \(resumeBacklogDefault) 张（全权限、不限预算），不会把整队一起重跑。\(queueLine)。"
+    }
+
+    /// 二次确认就地弹在灵动岛里。不用 NSAlert：系统模态框会跑到物理主屏，违反「测试窗一律上副屏」。
+    func beginResumeConfirmation() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.resumeConfirmBacklog = Self.backlogCount()
+            self.resumeConfirmPending = true
+        }
+    }
+
+    func cancelResumeConfirmation() {
+        DispatchQueue.main.async { [weak self] in self?.resumeConfirmPending = false }
+    }
+
+    /// 点了「只重放 N 张」才真正动：上限恒为 resumeBacklogDefault，与积压数量无关。
+    func confirmResume() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.resumeConfirmPending = false
+            self.resume(maxBacklog: Self.resumeBacklogDefault)
+        }
+    }
+
+    /// 只数「未接单/待整改」的积压单，口径与 agy-turn.py `_scan_backlog_files()` 对齐（0 额外模型调用）。
+    static func backlogCount() -> Int {
+        let agyDir = URL(fileURLWithPath: Self.multiRootPath, isDirectory: true)
+            .appendingPathComponent("handoffs", isDirectory: true)
+            .appendingPathComponent("agy", isDirectory: true)
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: agyDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return 0 }
+        var count = 0
+        for f in files where f.pathExtension.lowercased() == "md" {
+            let name = f.lastPathComponent.lowercased()
+            if name.range(of: #"-(accept|reply)(\d+|-(reply|confirm)(\d+)?)*\.md$"#, options: .regularExpression) != nil { continue }
+            if Self.backlogClaims(name) { continue }
+            count += 1
+        }
+        return count
+    }
+
+    /// 已被接单/已在履约中的单不算积压（对齐 `_already_claimed` 的三类判据）。
+    static func backlogClaims(_ fileName: String) -> Bool {
+        let agyDir = URL(fileURLWithPath: Self.multiRootPath, isDirectory: true)
+            .appendingPathComponent("handoffs", isDirectory: true)
+            .appendingPathComponent("agy", isDirectory: true)
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: agyDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return false }
+        let stem = (fileName as NSString).deletingPathExtension
+        for f in files {
+            let other = f.lastPathComponent.lowercased()
+            if other.hasPrefix("\(stem.lowercased())-accept") || other.hasPrefix("\(stem.lowercased())-reply") { return true }
+        }
+        // 原单自身 status 已推进（履约中/需前台接力/待确认/已完成）时也不该重放
+        let doc = agyDir.appendingPathComponent(fileName)
+        guard let head = try? String(contentsOf: doc, encoding: .utf8).prefix(1600) else { return false }
+        for line in head.split(separator: "\n") {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("status:") {
+                let st = s.replacingOccurrences(of: "status:", with: "").trimmingCharacters(in: .whitespaces)
+                return !["待办", "待处理", "待接单", "待执行", "待整改"].contains(st)
+            }
+        }
+        return false
+    }
+
+    func resumeForSelfTest(maxBacklog: Int) { resume(maxBacklog: maxBacklog) }
+
+    func stateDirForSelfTest() -> URL { wakeStateDirURL }
+    func reloadWakeStateForSelfTest() { reloadWakeState(force: true) }
+
+    private func resume(maxBacklog: Int) {
+        let pauseURL = wakeStateDirURL.appendingPathComponent("agy-turn.paused")
+        let fm = FileManager.default
+        try? fm.removeItem(at: pauseURL)
+        reloadWakeState(force: true)
+        guard maxBacklog > 0 else { return }
+        // 用量与重放结果只进日志 + 灵动岛反馈，不再静默（上次一点就把 3 张旧单全重跑，无法回溯）
+        // 自测可把脚本换成记录 argv 的桩（AGENT_ISLAND_AGYTURN_SCRIPT），生产不传就走上游脚本
+        let script = ProcessInfo.processInfo.environment["AGENT_ISLAND_AGYTURN_SCRIPT"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? "/Users/l/.config/alma/scripts/agy-turn.py"
+        var args = [script, "--resume-backlog", "--max-backlog", "\(maxBacklog)"]
+        // 自测专用：把同一串参数加 --dry-run 跑一遍，证明参数确实这么传、但不真重放工单。
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_RESUME_DRYRUN"] == "1" { args.append("--dry-run") }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            proc.arguments = args
+            let outPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            let data = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+            proc.waitUntilExit()
+            let text = String(data: data, encoding: .utf8) ?? ""
+            Self.appendResumeLog(args: args, output: text)
+            let queued = Self.parseResumeCount(text)
+            DispatchQueue.main.async {
+                self?.showToast("已恢复唤醒 · 重放上限 \(maxBacklog) 张\(queued >= 0 ? "（实际排队 \(queued) 张）" : "")")
                 self?.refreshAll()
             }
+        }
+    }
+
+    static func parseResumeCount(_ output: String) -> Int {
+        guard let data = output.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return -1 }
+        if let c = root["count"] as? Int { return c }
+        if let results = root["results"] as? [[String: Any]] { return results.count }
+        return -1
+    }
+
+    static func appendResumeLog(args: [String], output: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] args=\(args.joined(separator: " "))"
+            + " out=\(output.replacingOccurrences(of: "\n", with: " ").prefix(600))\n"
+        // 测试实例用 AGENT_ISLAND_STATE_DIR 指沙箱，别把自测记录写进生产 state
+        let stateDir = ProcessInfo.processInfo.environment["AGENT_ISLAND_STATE_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/alma/state", isDirectory: true)
+        let logURL = stateDir.appendingPathComponent("island-resume.log")
+        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            h.seekToEndOfFile(); h.write(line.data(using: .utf8) ?? Data()); try? h.close()
+        } else {
+            try? line.data(using: .utf8)?.write(to: logURL)
         }
     }
     
@@ -1199,6 +1357,7 @@ class AgentMonitor: ObservableObject {
     }()
     private static let multiRoot = ProcessInfo.processInfo.environment["AGENT_ISLAND_MULTI_ROOT"]
         ?? "/Users/l/Nutstore Files/Obsidian_/multi-agent"
+    static var multiRootPath: String { multiRoot }
     private static let eventLog = ProcessInfo.processInfo.environment["AGENT_ISLAND_EVENT_LOG"]
         ?? "/Users/l/.local/funnel-sync/events.log"
 
@@ -2746,7 +2905,7 @@ struct DynamicIslandView: View {
             switch st {
             case "running": return Color(hex: "007AFF")
             case "paused": return Color(hex: "6B7280")
-            case "fused-m1", "error", "high-risk-blocked", "需高危拍板": return Color(hex: "EF4444")
+            case "fused-m1", "error", "high-risk-blocked", "需高危拍板", "submit-failed": return Color(hex: "EF4444")
             case "relay-needed", "empty-response", "待整改": return Color(hex: "F59E0B")
             default: return Color(hex: "10B981")
             }
@@ -2760,14 +2919,19 @@ struct DynamicIslandView: View {
             case "high-risk-blocked", "需高危拍板": return "需拍板"
             case "relay-needed": return "需接力"
             case "empty-response": return "空响应"
+            case "submit-failed": return "交付失败"
             case "待整改": return "待整改"
             default: return "待命"
             }
         }()
         let barColor: Color = ws.tokenRatio >= 0.8 ? Color(hex: "F59E0B") : statusColor
         let pulseActive = (st == "running" || st == "fused-m1" || st == "high-risk-blocked" || st == "需高危拍板")
+        // 不限量时进度条画满整条淡色轨道，不再是一条空条（空条＝看起来像 0 预算快见底）
+        let barWidth: CGFloat = ws.tokenUnlimited ? 36 : max(4, (36 * ws.tokenRatio).rounded())
 
-        return HStack(spacing: 6) {
+        return VStack(spacing: 4) {
+            if monitor.resumeConfirmPending { resumeConfirmBar }
+            HStack(spacing: 6) {
             // ① 左段：AGY 状态 + 预算进度条
             HStack(spacing: 5) {
                 Circle()
@@ -2793,12 +2957,13 @@ struct DynamicIslandView: View {
                         .fill(monitor.panelIsDark ? Color.white.opacity(0.18) : Color.black.opacity(0.14))
                         .frame(width: 36, height: 6)
                     Capsule()
-                        .fill(barColor)
-                        .frame(width: max(4, (36 * ws.tokenRatio).rounded()), height: 6)
+                        .fill(ws.tokenUnlimited ? Color(hex: "10B981").opacity(0.55) : barColor)
+                        .frame(width: barWidth, height: 6)
                 }
-                Text("\(ws.tokenPct)%")
+                Text(ws.tokenPctText)
                     .font(.system(size: fs(12), weight: .bold, design: .monospaced))
-                    .foregroundColor(ws.tokenRatio >= 0.8 ? Color(hex: "D97706") : secondaryTextColor)
+                    .foregroundColor(ws.tokenUnlimited ? secondaryTextColor
+                                     : (ws.tokenRatio >= 0.8 ? Color(hex: "D97706") : secondaryTextColor))
             }
             .help(ws.tooltipText)
 
@@ -2850,10 +3015,45 @@ struct DynamicIslandView: View {
             }
             .buttonStyle(PlainButtonStyle())
             .help(ws.paused ? "恢复 AGY 后台自动唤醒" : "暂停 AGY 后台自动唤醒（不影响前台窗口）")
+            }
         }
-        .frame(height: 36)
         .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background(squircleCardBackground)
+    }
+
+    /// 恢复前的就地二次确认条（不用系统 NSAlert，绝不把模态框弹到物理主屏）
+    var resumeConfirmBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: fs(12), weight: .bold))
+                .foregroundColor(Color(hex: "F59E0B"))
+            Text(AgentMonitor.resumeConfirmationText(backlogCount: monitor.resumeConfirmBacklog))
+                .font(.system(size: fs(12), weight: .semibold))
+                .foregroundColor(secondaryTextColor)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button(action: { monitor.confirmResume() }) {
+                Text("只重放 \(AgentMonitor.resumeBacklogDefault) 张")
+                    .font(.system(size: fs(12), weight: .bold))
+                    .foregroundColor(Color(hex: "047857"))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(Color(hex: "10B981").opacity(0.22)))
+            }
+            .buttonStyle(PlainButtonStyle())
+            Button(action: { monitor.cancelResumeConfirmation() }) {
+                Text("取消")
+                    .font(.system(size: fs(12), weight: .bold))
+                    .foregroundColor(primaryTextColor)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.14) : Color.black.opacity(0.07)))
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.12)))
     }
 
     /// 三个固定色收件箱卡（区分今日新单与历史存量，消除数字焦虑）
@@ -5175,6 +5375,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hoverInsideSince: Date?
     /// 仅快照自测使用：让定时轮询也采用同一假鼠标点，模拟真实指针停留。
     var hoverOverridePoint: NSPoint?
+    private var agentResumeFactsDumped = 0
 
     var themeAutoItem: NSMenuItem?
     var themeLightItem: NSMenuItem?
@@ -5333,6 +5534,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 自测取证：把确认条当前实读到的文字/按钮状态落盘（不弹任何系统模态框）。
+    private func dumpResumeConfirmFacts() {
+        guard let out = ProcessInfo.processInfo.environment["AGENT_ISLAND_ALERT_INFO_OUT"], !out.isEmpty else { return }
+        let monitor = self.monitor
+        let facts: [String: Any] = [
+            "pending": monitor.resumeConfirmPending,
+            "backlog_count": monitor.resumeConfirmBacklog,
+            "confirm_text": AgentMonitor.resumeConfirmationText(backlogCount: monitor.resumeConfirmBacklog),
+            "primary_button": "只重放 \(AgentMonitor.resumeBacklogDefault) 张",
+            "secondary_button": "取消（保持暂停）",
+            "panel_mode": String(describing: monitor.currentMode),
+        ]
+        if let d = try? JSONSerialization.data(withJSONObject: facts, options: [.prettyPrinted, .sortedKeys]) {
+            try? d.write(to: URL(fileURLWithPath: out))
+        }
+        if agentResumeFactsDumped < 1 { agentResumeFactsDumped += 1 }
+    }
+
     private func virtualScreenOrExit(id: CGDirectDisplayID) -> NSScreen {
         guard let screen = VirtualIslandDisplay.find(id: id) else {
             islandPanel?.orderOut(nil)
@@ -5361,6 +5580,59 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updatePanelFrame(for: .compact)
         islandPanel.orderFrontRegardless()
         verifyVisibleVirtualPanel(phase: "compact", on: virtualScreenOrExit(id: id))
+
+        // 「点恢复 → 先出确认条」自测：造出暂停态，再走面板那颗按钮的同一条入口 toggleAgyWakePaused。
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_SELFTEST_TAP_RESUME"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self else { return }
+                let pauseURL = self.monitor.stateDirForSelfTest().appendingPathComponent("agy-turn.paused")
+                try? FileManager.default.createDirectory(at: pauseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? "paused_by_selftest\n".data(using: .utf8)?.write(to: pauseURL, options: .atomic)
+                self.monitor.reloadWakeStateForSelfTest()
+                self.monitor.toggleAgyWakePaused()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    self.dumpResumeConfirmFacts()
+                }
+            }
+        }
+
+        // 机械自测：导出「确认条文案 + 两个按钮的实际效果」，并用桩脚本证明重放参数就是 --max-backlog 1。
+        if ProcessInfo.processInfo.environment["AGENT_ISLAND_SELFTEST_RESUME"] == "1",
+           let outPath = ProcessInfo.processInfo.environment["AGENT_ISLAND_SELFTEST_OUT"], !outPath.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self = self else { return }
+                let backlog = AgentMonitor.backlogCount()
+                let text = AgentMonitor.resumeConfirmationText(backlogCount: backlog)
+                var facts: [String: Any] = [
+                    "backlog_count": backlog,
+                    "confirm_text": text,
+                    "cancel_keeps_paused": AgentMonitor.resumeBacklogDefault,
+                    "replay_limit": AgentMonitor.resumeBacklogDefault,
+                    "env_pause_marker_before": self.monitor.resumeConfirmPending,
+                ]
+                // 走一遍「取消」：确认条消失、暂停标记仍在（不会偷偷重放）
+                self.monitor.toggleAgyWakePaused()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    facts["pending_after_toggle"] = self.monitor.resumeConfirmPending
+                    facts["pause_marker_after_toggle"] = FileManager.default.fileExists(
+                        atPath: self.monitor.stateDirForSelfTest().appendingPathComponent("agy-turn.paused").path)
+                    self.monitor.cancelResumeConfirmation()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        facts["pending_after_cancel"] = self.monitor.resumeConfirmPending
+                        self.monitor.confirmResume()   // 唯一会真重放的那一下
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                            let logURL = self.monitor.stateDirForSelfTest().appendingPathComponent("island-resume.log")
+                            facts["resume_log"] = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+                            facts["pending_after_confirm"] = self.monitor.resumeConfirmPending
+                            if let d = try? JSONSerialization.data(withJSONObject: facts, options: [.prettyPrinted, .sortedKeys]) {
+                                try? d.write(to: URL(fileURLWithPath: outPath))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
 
         monitor.onModeChange = { [weak self] mode in
             guard let self else { return }
