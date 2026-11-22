@@ -2208,8 +2208,11 @@ for box in boxes:
             status_text = '需高危拍板'
             total_accepted += 1
             eta = '高危待拍板'
-        elif cur_status in ('待确认', '交付待确认') or ('【Step 3' in full_txt) or any(handoff.REPLY_RE.search(p.name) for p, _, _ in files):
-            # 关键分流：待确认属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
+        elif cur_status in ('待确认', '交付待确认') or ('【Step 3' in full_txt) or any((handoff.REPLY_RE.search(p.name) or '-reply' in p.name.lower()) for p, _, _ in files):
+            # 关键分流：待确认与 *-reply*.md 回信属于发起方闭环待验收（Phase 3），严禁混入各 agent 的真待办抽屉！
+            continue
+        elif all('-accept' in p.name.lower() for p, _, _ in files):
+            # 纯接单回执（*-accept*.md）属于告知类，不计入收件方真待办
             continue
         elif cur_status == '需前台接力' or '【Step 2.5 需前台接力】' in full_txt:
             stage = 'relay'
