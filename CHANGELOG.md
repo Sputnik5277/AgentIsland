@@ -5,6 +5,30 @@ All notable changes to **AgentIsland** will be documented in this file.
 
 ---
 
+## [v2.0.0] - 2026-11-23
+
+### Ping-Loop Native Fusion, Tabbed Control Center & Orthogonal Real Topology / Ping-Loop 深度联动、紧凑四分卡与正交直线真实拓扑（重大升级）
+
+- **Compact 4-Tab Control Center（紧凑四分卡，保留原生液态玻璃视觉特效，零多余 emoji）**
+  - Refactored the tall vertical stack into 4 crisp, fixed-height tabs: **团队（Team） / 战报（Feed） / 自优化（Self-Harness） / 链路（Topology）**, keeping native macOS liquid glass and typography floor (`>= 11pt`) untouched.
+  - **Team**: 4-column ambient presence tiles (`Ping` / `AGY` / `Alma` / `模拟机 9011/9012`) with breathing activity rings, 1-click inbox drawer drilldown, and a single-row smoke gate + latest closeout summary bar.
+  - **Feed**: live 5-item human-readable auto-closeout stream parsed directly from `events.log` (hash-free highlights, submit→confirm latency such as `1s` / `<1s`, inline 2-line result expansion, 1-click source open).
+  - **Self-Harness (Zero-Click Change Log)**: displays `已升格 / 已降格 / 观察中` with before/after human-readable diffs driven by `pingloop-harness-latest.json` (`auto_changes`), removing manual approval buttons under bounded auto-loop rules.
+- **Orthogonal Straight-Line Physical Topology（纯正交直线真实绕行拓扑）**
+  - Replaced the single-row line with a true 2D orthogonal topology: upper solid/dashed orthogonal paths connect `Ping (VM) → Funnel 443 → Mac Mini (AGY — 0ms bus — Alma) → LAN → Simulation PC`, while a dedicated straight horizontal bottom line connects `Ping (VM) ━━━━ Simulation PC (9011/9012)` (`Tailscale SSH Direct · Bypassing Mac`).
+- **5-State Live Pill & 30s Soft-Green Receipt（5 态实时胶囊与 30 秒自动闭环回执）**
+  - Strictly narrowed human-interruption alerts (`lulu_actions`) to **M1 3-round fuse** and **high-risk gate blocks** only; ordinary user dispatches auto-close via non-worker proxy verification (`handoff.py` + `agy-turn` + `alma-turn`).
+  - Added 30s soft-green completion receipt (`自动闭环完成 · <title>`) and real daily auto-closeout counter (`全员就绪 · 今日自闭环 N 单`).
+- **Event-Driven Sub-Second Refresh & Unified Authority（<0.5s 事件驱动实时刷新与权威口径 1:1 对齐）**
+  - Mounted 7 `O_EVTONLY` `DispatchSource` watchers across `funnel-sync/`, `events.log`, and `handoffs/{agy,alma,ping,.ack}` with 300ms debounce and 10s fallback polling, filtering synthetic test artifacts (`cc-test` / `selftest`).
+  - Unified Phase 3 confirmation role resolution directly onto `handoff._resolve_confirm_roles()` and `handoff_consts.is_terminal()`, fixing `-reply` substring role inversion and `cc-*/通知` trace pollution.
+- **Equal 3-Agent Quick Dispatch（底部平等三选一快发）**
+  - Bottom quick-send bar supports equal 1-click target selection (`Ping` / `AGY` / `Alma`); any agent can execute and auto-close via heterogeneous verification.
+- **Verification Gates**
+  - `gate_app_hygiene.py`: **10/10 PASS** (`findings=0`); `deploy-app-binary.py`: **PASS** (`size_ratio=1.021`, `v2.0.0`); `handoff_matrix.py`: **40/40 PASS**; `pingloop_smoke_gate.py`: **100/100 (6/6)**.
+
+---
+
 ## [v1.8.2] - 2026-11-22
 
 ### 🩺 C 节裁决三项（B / F / B-11） / Budget-zero, submit-failed, and resume gate

@@ -68,6 +68,13 @@ It solves the visibility and control bottleneck when orchestrating multiple codi
 - **2-second polling has a blind spot.** The event feed is sampled every 2s and aggregated over a 15s window. An event that arrives and ages out between two samples, or lands in a missed log line, can be absent from the topology — the view only claims what was actually sampled. The handoff files themselves remain the source of truth.
 - **Pulse shape**: one dot per active edge, shared 2.4s period, radius 3, a single 4px glow; two concurrent edges show as two dots, never a chain.
 
+### v2.0.0 Major Upgrade — Ping-Loop Live Fusion & Tabbed Control Center (2026-11-23)
+
+- **Compact 4-Tab Control Center (Zero-Emoji, Native Liquid Glass Preserved)**: replaces long vertical stacking with 4 fixed-height tabs — **Team** (4-column ambient presence for `Ping / AGY / Alma / Simulation PC`), **Feed** (today's auto-closeout human-readable timeline from `events.log`), **Self-Harness** (zero-click autonomous upgrade/prune change log), and **Topology**.
+- **Orthogonal Straight-Line Physical Topology**: renders real physical routing with orthogonal lines — `Ping → Funnel 443 → Mac Mini (AGY — 0ms bus — Alma) → LAN → Simulation PC`, plus a dedicated straight horizontal bottom line for `Ping ━━━━ Simulation PC` (`Tailscale SSH Direct · Bypassing Mac`).
+- **5-State Live Pill & 30s Auto-Closeout Receipt**: interrupts the user only on **M1 3-round fuse** or **high-risk gate blocks**; shows live auto-loop progress, 30s soft-green completion receipts, and daily auto-closed counts (`全员就绪 · 今日自闭环 N 单`).
+- **Sub-Second Event-Driven Refresh**: 7 `O_EVTONLY` `DispatchSource` filesystem watchers (`events.log` + `handoffs/{agy,alma,ping,.ack}`, 300ms debounce) paired with unified `handoff._resolve_confirm_roles()` authority and equal `Ping / AGY / Alma` quick dispatch.
+
 ### High-Transmission Glass & Virtual-Only Test Placement (v1.8.1)
 
 - **System `.clear` glass in the expanded state.** The glass skin switches `NSGlassEffectView.style` from `.regular` to the system `.clear` variant when expanded — still native material and reflection, no hand-written shader or imitation glass. Overlays above the glass are thinned at the same time (dark `panelFill` 0.10→0.00, card tint 0.58→0.30, glass tint 0.30→0.06; light 0.06→0.00 / 0.34→0.10 / 0.22→0.05).
@@ -136,6 +143,13 @@ open /Applications/AgentIsland.app
 - **没有通信，就没有连线、脉冲和点**：`activePulses` 为空时，链路图与迷你条一律不画连接线；脉冲层仅在至少一条边活跃时挂载。节点空闲环仍保持 ≥2.2:1 对比度，弱化但看得见。
 - **2 秒轮询有盲区**：事件日志每 2 秒采样一次，按 15 秒窗口聚合；在两次采样之间到达又过期的单条事件，或未被采到的日志行，可能不在链路图中出现。界面只声明实际采到的通讯，原始 handoff 文件才是事实源。
 - **脉冲形态**：每条活跃边 1 个光点，共享 2.4s 周期，半径 3、单层 4px 辉光；两条边并发时是两个点，不会叠成串。
+
+### v2.0.0 重大升级 —— Ping-Loop 实时深度联动与紧凑四分卡（2026-11-23）
+
+- **紧凑四分卡中控台（保留原生液态玻璃特效 · 零多余 emoji）**：告别超长瀑布流，展开首屏收束为 4 张紧凑切卡——**团队**（`Ping / AGY / Alma / 模拟机` 4 列呼吸光环实时态与 1 行裁判摘要）、**战报**（直读 `events.log` 今日最近 5 拍无哈希纯人话闭环流水，点击展开 2 句结果）、**自优化**（全自动升格/降格，免手动点选，仅呈报谁升格/谁降格及变化）、**链路**。
+- **纯正交直线真实物理拓扑**：用纯直线/正交折线还原真实网络走向——上路 `Ping → Funnel 443 → Mac Mini（AGY — 0ms 总线 — Alma）→ 局域网联调 → 模拟电脑`；下路笔直水平绿实线 **`Ping ━━━━ 模拟电脑 9011/9012`（Tailscale SSH 直连 · 不经 Mac）**。
+- **5 态实时胶囊 + 30 秒自动闭环回执**：仅 M1 3 轮熔断与高危门禁拦截才请求露露拍板；普通任务全自动跨箱验收闭环，胶囊支持 30 秒柔和绿成果回执与真实每日自闭环战绩（`全员就绪 · 今日自闭环 N 单`）。
+- **事件驱动秒级刷新与平等派发**：挂载 7 个 `O_EVTONLY` `DispatchSource` 监听 `events.log` 与 `handoffs/{agy,alma,ping,.ack}`（300ms 防抖秒刷，过滤 `cc-test`/`selftest`）；统一复用 `handoff._resolve_confirm_roles()` 权威口径；底部 `[ Ping | AGY | Alma ]` 平等三选一快发，谁接单都自动闭环。
 
 ### 展开态高透原生玻璃与测试显示隔离（v1.8.1）
 

@@ -109,6 +109,7 @@ struct TaskItem: Identifiable, Hashable {
     var artifacts: String = ""
     var eta: String = ""
     var highlights: String = ""
+    var stepNote: String = ""
 }
 
 enum IslandMode: Equatable {
@@ -335,6 +336,69 @@ struct FusedDecisionCard: Identifiable, Equatable {
     let path: String
 }
 
+struct HarnessProposalItem: Identifiable, Equatable {
+    var id: String { signature }
+    let signature: String
+    let distinctSessions: Int
+    let rawHits: Int
+    let carrier: String
+    let recommendedFix: String
+    let shadowVerified: Bool
+    let patchReportPath: String
+}
+
+enum PanelTab: String, CaseIterable {
+    case team = "团队"
+    case feed = "战报"
+    case opt = "自优化"
+    case topo = "链路"
+}
+
+struct HarnessAutoChangeItem: Identifiable, Equatable {
+    var id: String { "\(signature)-\(kind)" }
+    let signature: String
+    let kind: String // upgraded, downgraded, observing
+    let badge: String
+    let title: String
+    let change: String
+    let sessions: Int
+    let carrier: String
+}
+
+struct LoopFeedItem: Identifiable, Equatable {
+    var id: String { "\(time)-\(path)" }
+    let time: String
+    let title: String
+    let route: String
+    let duration: String
+    let summary: String
+    let path: String
+    let isGreen: Bool
+}
+
+struct SelfHarnessState: Equatable {
+    var loaded: Bool = false
+    var isStale: Bool = true
+    var ageMin: Int = 0
+    var sealOk: Bool = true
+    var loopScore: Int = 100
+    var smokePassed: Int = 6
+    var smokeTotal: Int = 6
+    var totalWallMin: Double = 0
+    var effectiveExecMin: Double = 0
+    var overheadLossMin: Double = 0
+    var effectivePct: Double = 100
+    var ticketsMeasured: Int = 0
+    var proposals: [HarnessProposalItem] = []
+    var autoChanges: [HarnessAutoChangeItem] = []
+
+    var escalationCount: Int { proposals.count }
+    var effectiveRatio: CGFloat {
+        guard totalWallMin > 0 else { return 1.0 }
+        return CGFloat(min(1.0, max(0.04, effectiveExecMin / totalWallMin)))
+    }
+}
+
 struct WakeWorkerState: Equatable {
     var status: String = "idle"
     var dailyRuns: Int = 0
@@ -398,9 +462,13 @@ class AgentMonitor: ObservableObject {
     @Published var pingPending: Int = 0
 
     @Published var pendingConfirms: [TaskItem] = []
+    @Published var luluActions: [TaskItem] = []
+    @Published var agentConfirms: [TaskItem] = []
     @Published var totalDispatched: Int = 0
     @Published var totalAccepted: Int = 0
     @Published var totalSubmitted: Int = 0
+    @Published var totalLuluActions: Int = 0
+    @Published var totalAgentConfirms: Int = 0
     @Published var activeConfirmIndex: Int = 0
     @Published var fusedCount: Int = 0
     @Published var fusedSummary: String = ""
@@ -430,6 +498,20 @@ class AgentMonitor: ObservableObject {
     @Published var resumeConfirmBacklog: Int = 0
     @Published var deltaState: PingloopDeltaState = PingloopDeltaState()
     @Published var fusedCards: [FusedDecisionCard] = []
+    @Published var harnessState: SelfHarnessState = SelfHarnessState()
+    @Published var harnessDrawerExpanded: Bool = false
+    @Published var activeTab: PanelTab = .team {
+        didSet { self.onLayoutChange?() }
+    }
+    @Published var todayClosedCount: Int = 0
+    @Published var recentLoopFeed: [LoopFeedItem] = []
+    @Published var expandedFeedId: String? = nil {
+        didSet { self.onLayoutChange?() }
+    }
+    @Published var recentReceiptTitle: String = ""
+    @Published var recentReceiptAt: Date? = nil
+    @Published var simPcOnline: Bool = true
+    private var prevTodayClosedCount: Int = -1
     @Published var observeResults: [String: String] = [:]
     @Published var drawerSearchText: String = ""
     @Published var drawerTodayOnly: Bool = false
@@ -438,6 +520,10 @@ class AgentMonitor: ObservableObject {
     private var wakeDirFD: CInt = -1
     private var wakeDirSource: DispatchSourceFileSystemObject?
     private var wakeLastStatKey: String = ""
+    private var liveWatchSources: [DispatchSourceFileSystemObject] = []
+    private var liveDebounceWorkItem: DispatchWorkItem?
+    private let liveWatchQueue = DispatchQueue(label: "com.sputnik.agentisland.livewatch", qos: .utility)
+    private var lastKnownLuluActions: Int = -1
 
     @Published var currentMode: IslandMode = .compact
     @Published var selectedDrawerAgent: String? = nil {
@@ -554,25 +640,49 @@ class AgentMonitor: ObservableObject {
         todayCount(for: "agy") + todayCount(for: "alma") + todayCount(for: "ping")
     }
 
+    var isRecentReceiptActive: Bool {
+        guard let t = recentReceiptAt, !recentReceiptTitle.isEmpty else { return false }
+        return Date().timeIntervalSince(t) <= 30.0
+    }
+
     var compactHeadText: String {
         if dataUnknown { return "数据未知" }
         if fusedCount > 0 { return "M1 熔断 \(fusedCount) 项" }
-        if totalSubmitted > 0 { return "\(totalSubmitted) 件待你验收" }
-        if totalTodayUnread > 0 { return "今日新单 \(totalTodayUnread) 件" }
-        return "今日清零"
+        if totalLuluActions > 0 { return "\(totalLuluActions) 件待你拍板" }
+        if wakeState.effectiveStatus == "running" { return "Loop 运转中" }
+        if totalAgentConfirms > 0 && totalUnread > 0 { return "推进 \(totalUnread) · 互验 \(totalAgentConfirms)" }
+        if totalAgentConfirms > 0 { return "Agent 互验中 \(totalAgentConfirms)" }
+        if totalTodayUnread > 0 { return "推进中 \(totalTodayUnread) 件" }
+        if totalUnread > 0 { return "履约中 \(totalUnread) 件" }
+        if isRecentReceiptActive { return "自动闭环完成" }
+        return "全员就绪"
+    }
+
+    private func shortAgentName(_ raw: String) -> String {
+        let k = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let id = AgentRoster.identity(for: k) { return id.short }
+        if k == "lulu" { return "露露" }
+        return raw.isEmpty ? "Agent" : raw
     }
 
     var compactTailText: String {
         if dataUnknown { return "· 收件箱读取失败" }
         if fusedCount > 0 { return "· 待露露终裁" }
-        if totalSubmitted > 0 {
-            if let top = todayUnreadLeaders.first {
-                let extra = todayUnreadLeaders.count > 1 ? " 等" : ""
-                return "· 今日 \(top.0.short) +\(top.1)\(extra)"
-            }
-            let names = Set(pendingConfirms.compactMap { AgentRoster.identity(for: $0.from.lowercased())?.short })
+        if totalLuluActions > 0 {
+            let names = Set(luluActions.compactMap { AgentRoster.identity(for: $0.from.lowercased())?.short })
             let joined = names.isEmpty ? "Agent" : names.sorted().prefix(2).joined(separator: "/")
             return "· 来自 \(joined)"
+        }
+        if wakeState.effectiveStatus == "running" {
+            return "· AGY 自动执行中"
+        }
+        if totalAgentConfirms > 0 {
+            if let first = agentConfirms.first {
+                let f = shortAgentName(first.from)
+                let t = shortAgentName(first.to)
+                return "· \(f)→\(t) 验"
+            }
+            return "· 自动闭环中"
         }
         if totalTodayUnread > 0 {
             if let top = todayUnreadLeaders.first {
@@ -580,7 +690,17 @@ class AgentMonitor: ObservableObject {
                 return "· \(top.0.short) \(top.1)\(extra)"
             }
         }
-        return totalUnread > 0 ? "· 存量 \(totalUnread)" : "· 0 待办"
+        if isRecentReceiptActive {
+            let shortT = String(recentReceiptTitle.prefix(10))
+            return "· \(shortT)"
+        }
+        if totalUnread == 0 && harnessState.loaded && (!harnessState.sealOk || harnessState.loopScore < 100) {
+            return "· 裁判 \(harnessState.loopScore)分"
+        }
+        if todayClosedCount > 0 {
+            return "· 今日自闭环 \(todayClosedCount) 单"
+        }
+        return totalUnread > 0 ? "· 免人工" : "· 0 积压"
     }
 
     var preferredCompactWidth: CGFloat {
@@ -604,32 +724,28 @@ class AgentMonitor: ObservableObject {
             }()
             return CGFloat(((tCount + dCount <= 4) ? 380 : 450) + extra)
         }
-        // 内联链路：总览头部 + 迷你条 + 展开拓扑区（含三层通道原文案）
-        if showTopology { return 424 + extra }
         if showSettings { return 756 + extra }
+        if showTopology { return 372 + extra }
 
-        // 头部 + N 个开启区块共 N 段 16pt 间距；补足各区块真实行高，避免默认总览底边裁切资产条
-        var h: CGFloat = 34
-        if fusedCount > 0 || !fusedCards.isEmpty { h += 108 }
-        if enabledSections[PanelSectionKey.overview.rawValue] ?? (PanelSectionKey.defaults[PanelSectionKey.overview.rawValue] ?? false) { h += 28 }
-        if enabledSections[PanelSectionKey.wake.rawValue] ?? true {
-            // 唤醒条本身 36；就地二次确认条再占一行（≈30 + 4 间距），不补就会把下面区块顶出视口
-            h += resumeConfirmPending ? 70 : 36
+        // v2.0 紧凑 4 分卡定高（不再拉成 700pt 瀑布流），动态适配红线卡/展开摘要
+        var h: CGFloat = 52 // 顶栏 + 内边距
+        if fusedCount > 0 || !fusedCards.isEmpty { h += 106 }
+        if totalLuluActions > 0 { h += 112 }
+        if resumeConfirmPending { h += 36 }
+        switch activeTab {
+        case .team:
+            h += 186
+        case .feed:
+            let rows = max(1, min(5, recentLoopFeed.count))
+            h += CGFloat(rows) * 34 + 62 + (expandedFeedId != nil ? 64 : 0)
+        case .opt:
+            let rows = max(1, min(4, harnessState.autoChanges.count))
+            h += CGFloat(rows) * 48 + 64
+        case .topo:
+            h += 248
         }
-        if enabledSections[PanelSectionKey.confirm.rawValue] ?? true {
-            let rejectExtra: CGFloat = (!pendingConfirms.isEmpty && rejectTargetFile != nil) ? 44 : 0
-            h += (pendingConfirms.isEmpty ? 68 : 142) + rejectExtra
-        }
-        if enabledSections[PanelSectionKey.inboxes.rawValue] ?? true { h += 52 }
-        if enabledSections[PanelSectionKey.channels.rawValue] ?? true { h += 50 }
-        if enabledSections[PanelSectionKey.quickSend.rawValue] ?? true { h += 38 }
-        if enabledSections[PanelSectionKey.assets.rawValue] ?? true { h += 32 }
-        let enabledSectionCount = PanelSectionKey.allCases.reduce(0) { partial, key in
-            partial + ((enabledSections[key.rawValue] ?? (PanelSectionKey.defaults[key.rawValue] ?? true)) ? 1 : 0)
-        }
-        let gaps = CGFloat(enabledSectionCount) * 16
-        let verticalPadding: CGFloat = 12 + 14
-        return max(120, h + gaps + verticalPadding) + extra
+        h += 76 // 底部平等快发栏 + 快捷资产条
+        return max(260, h + extra)
     }
     private var timer: Timer?
     private var breathTimer: Timer?
@@ -637,6 +753,7 @@ class AgentMonitor: ObservableObject {
     private var lastToggleTime: Date = Date.distantPast
     private let refreshLock = NSLock()
     private var isRefreshingInFlight = false
+    private var needsFollowupRefresh = false
     
     func canToggle() -> Bool {
         let now = Date()
@@ -806,6 +923,54 @@ class AgentMonitor: ObservableObject {
         refreshAll()
         startTimers()
         startWakeStateWatcher()
+        startLiveEventWatchers()
+    }
+
+    /// 事件驱动实时刷新：监听 Funnel events.log 与三箱/.ack 目录，任何落盘 300ms 防抖后立即刷新
+    func startLiveEventWatchers() {
+        guard preferences != nil else { return }
+        for s in liveWatchSources { s.cancel() }
+        liveWatchSources.removeAll()
+
+        let evLogURL = URL(fileURLWithPath: Self.eventLog)
+        var paths: [String] = [
+            evLogURL.deletingLastPathComponent().path,
+            evLogURL.path,
+        ]
+        if !rootPath.isEmpty {
+            for sub in ["agy", "alma", "ping", ".ack"] {
+                paths.append("\(rootPath)/\(sub)")
+            }
+        }
+        var seen = Set<String>()
+        for path in paths where !path.isEmpty && seen.insert(path).inserted {
+            let fd = open(path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+            let src = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .extend, .rename, .attrib, .delete],
+                queue: liveWatchQueue
+            )
+            src.setEventHandler { [weak self] in
+                self?.scheduleLiveRefresh()
+            }
+            src.setCancelHandler {
+                close(fd)
+            }
+            liveWatchSources.append(src)
+            src.resume()
+        }
+    }
+
+    private func scheduleLiveRefresh() {
+        liveDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.refreshCommPulses()
+            self.refreshAll()
+        }
+        liveDebounceWorkItem = work
+        liveWatchQueue.asyncAfter(deadline: .now() + 0.30, execute: work)
     }
 
     private var wakeStateDirURL: URL {
@@ -861,8 +1026,10 @@ class AgentMonitor: ObservableObject {
         let convURL = env["AGENT_ISLAND_CONVERGENCE_LOG"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             ?? wakeStateDirURL.appendingPathComponent("pingloop-convergence.jsonl")
         let almaURL = wakeStateDirURL.appendingPathComponent("alma-turn.json")
+        let harnessURL = wakeStateDirURL.appendingPathComponent("pingloop-harness-latest.json")
         let decisionsDirURL = env["AGENT_ISLAND_DECISIONS_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
             ?? wakeStateDirURL.appendingPathComponent("a-verifier-decisions", isDirectory: true)
+        let pingFuseDirURL = URL(fileURLWithPath: "/Users/l/Nutstore Files/Obsidian_/multi-agent/handoffs/ping", isDirectory: true)
 
         let fm = FileManager.default
         func fileStat(_ url: URL) -> String {
@@ -872,11 +1039,13 @@ class AgentMonitor: ObservableObject {
             return "\(mt):\(sz)"
         }
         let pauseExists = fm.fileExists(atPath: pauseURL.path)
-        let decFiles = (try? fm.contentsOfDirectory(at: decisionsDirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]))?
-            .filter { $0.lastPathComponent.hasSuffix("-fused.md") }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent } ?? []
+        let verifierFiles = (try? fm.contentsOfDirectory(at: decisionsDirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]))?
+            .filter { $0.lastPathComponent.hasSuffix("-fused.md") } ?? []
+        let fuseMemorialFiles = (try? fm.contentsOfDirectory(at: pingFuseDirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]))?
+            .filter { $0.lastPathComponent.hasPrefix("escalate-fuse-") && $0.lastPathComponent.hasSuffix(".md") } ?? []
+        let decFiles = (verifierFiles + fuseMemorialFiles).sorted { $0.lastPathComponent < $1.lastPathComponent }
         let decStat = decFiles.map { "\($0.lastPathComponent)=\(fileStat($0))" }.joined(separator: ",")
-        let statKey = "\(fileStat(snapURL))|\(pauseExists)|\(fileStat(healthURL))|\(fileStat(convURL))|\(fileStat(almaURL))|\(decStat)"
+        let statKey = "\(fileStat(snapURL))|\(pauseExists)|\(fileStat(healthURL))|\(fileStat(convURL))|\(fileStat(almaURL))|\(fileStat(harnessURL))|\(decStat)"
         if !force && statKey == wakeLastStatKey { return }
         wakeLastStatKey = statKey
 
@@ -1014,6 +1183,59 @@ class AgentMonitor: ObservableObject {
             nextCards.append(FusedDecisionCard(traceId: tid, title: title, summary: summary, path: url.path))
         }
 
+        var nextHarness = SelfHarnessState()
+        if let hrData = try? Data(contentsOf: harnessURL),
+           let hrRoot = try? JSONSerialization.jsonObject(with: hrData) as? [String: Any] {
+            nextHarness.loaded = true
+            nextHarness.sealOk = (hrRoot["seal_ok"] as? Bool) ?? true
+            let upTs = (hrRoot["updated_ts"] as? Double) ?? ((hrRoot["updated_ts"] as? Int).map(Double.init) ?? 0)
+            if upTs > 0 {
+                let ageM = max(0, Int((nowDate.timeIntervalSince1970 - upTs) / 60.0))
+                nextHarness.ageMin = ageM
+                nextHarness.isStale = ageM > 30
+            } else {
+                nextHarness.isStale = false
+            }
+            if let smk = hrRoot["smoke_gate"] as? [String: Any] {
+                nextHarness.loopScore = (smk["loop_score"] as? Int) ?? 100
+                nextHarness.smokePassed = (smk["passed"] as? Int) ?? 6
+                nextHarness.smokeTotal = (smk["total"] as? Int) ?? 6
+            }
+            if let tm = hrRoot["timing"] as? [String: Any] {
+                nextHarness.totalWallMin = (tm["total_wall_min"] as? Double) ?? 0
+                nextHarness.effectiveExecMin = (tm["effective_exec_min"] as? Double) ?? 0
+                nextHarness.overheadLossMin = (tm["overhead_loss_min"] as? Double) ?? 0
+                nextHarness.effectivePct = (tm["effective_pct"] as? Double) ?? 100
+                nextHarness.ticketsMeasured = (tm["tickets_measured"] as? Int) ?? 0
+            }
+            if let props = hrRoot["proposals"] as? [[String: Any]] {
+                nextHarness.proposals = props.map { p in
+                    HarnessProposalItem(
+                        signature: (p["signature"] as? String) ?? "UNKNOWN",
+                        distinctSessions: (p["distinct_sessions"] as? Int) ?? 1,
+                        rawHits: (p["raw_hits"] as? Int) ?? 1,
+                        carrier: (p["carrier"] as? String) ?? "",
+                        recommendedFix: (p["recommended_fix"] as? String) ?? "",
+                        shadowVerified: (p["shadow_verified"] as? Bool) ?? false,
+                        patchReportPath: (p["patch_report_path"] as? String) ?? ""
+                    )
+                }
+            }
+            if let changes = hrRoot["auto_changes"] as? [[String: Any]] {
+                nextHarness.autoChanges = changes.map { c in
+                    HarnessAutoChangeItem(
+                        signature: (c["signature"] as? String) ?? "",
+                        kind: (c["kind"] as? String) ?? "observing",
+                        badge: (c["badge"] as? String) ?? "观察中",
+                        title: (c["title"] as? String) ?? "",
+                        change: (c["change"] as? String) ?? "",
+                        sessions: (c["sessions"] as? Int) ?? 0,
+                        carrier: (c["carrier"] as? String) ?? ""
+                    )
+                }
+            }
+        }
+
         DispatchQueue.main.async {
             if self.wakeState != next {
                 self.wakeState = next
@@ -1024,6 +1246,13 @@ class AgentMonitor: ObservableObject {
             if self.fusedCards != nextCards {
                 self.fusedCards = nextCards
                 self.onLayoutChange?()
+            }
+            if self.harnessState != nextHarness {
+                let layoutDiff = self.harnessState.loaded != nextHarness.loaded || self.harnessState.proposals.count != nextHarness.proposals.count
+                self.harnessState = nextHarness
+                if layoutDiff {
+                    self.onLayoutChange?()
+                }
             }
         }
     }
@@ -1334,7 +1563,8 @@ class AgentMonitor: ObservableObject {
     
     func startTimers() {
         guard preferences != nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        // 主刷新已由 startLiveEventWatchers() 毫秒级事件驱动；保留 10s 低频兜底防漏
+        timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.checkAppearance()
             self?.refreshAll()
         }
@@ -1344,7 +1574,7 @@ class AgentMonitor: ObservableObject {
             }
         }
         refreshCommPulses()
-        commTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        commTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.refreshCommPulses()
         }
     }
@@ -1366,6 +1596,16 @@ class AgentMonitor: ObservableObject {
     static var multiRootPath: String { multiRoot }
     private static let eventLog = ProcessInfo.processInfo.environment["AGENT_ISLAND_EVENT_LOG"]
         ?? "/Users/l/.local/funnel-sync/events.log"
+
+    private static func isSyntheticTestPath(_ path: String) -> Bool {
+        let low = path.lowercased()
+        let base = (low as NSString).lastPathComponent
+        if base.hasPrefix("cc-test-") || base.hasPrefix("cc-cc-test-") || base.contains("selftest") {
+            return true
+        }
+        let exact: Set<String> = ["self.md", "self-alma.md", "dispatch-replied.md", "split-quoted-step.md"]
+        return exact.contains(base)
+    }
 
     private func parseEventTime(_ raw: String) -> Date? {
         Self.isoFull.date(from: raw) ?? Self.isoPlain.date(from: raw)
@@ -1407,22 +1647,36 @@ class AgentMonitor: ObservableObject {
                 }
             }
 
-            // 主源：Funnel 443 写入事件（只认 PUT，不认 HEARTBEAT）
+            // 主源：Funnel 443 写入事件与 handoff.py 自动 STEP 节点事件（不认 HEARTBEAT）
             if let data = FileManager.default.contents(atPath: Self.eventLog),
                let text = String(data: data, encoding: .utf8) {
                 for line in text.split(separator: "\n").suffix(240) {
                     guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)),
                           let d = obj as? [String: Any],
-                          d["action"] as? String == "PUT",
+                          let act = d["action"] as? String,
+                          (act == "PUT" || act == "STEP"),
                           let path = d["path"] as? String,
                           path.hasPrefix("handoffs/"),
+                          !Self.isSyntheticTestPath(path),
                           let raw = d["time"] as? String,
                           let when = self.parseEventTime(raw) else { continue }
-                    let url = URL(fileURLWithPath: Self.multiRoot).appendingPathComponent(path)
-                    if let (from, to) = self.handoffEndpoints(at: url) {
-                        considerOverall(from, to, when)
+                    if act == "STEP",
+                       let f = (d["actor"] as? String)?.lowercased(),
+                       let t = (d["to"] as? String)?.lowercased(),
+                       AgentRoster.identity(for: f) != nil,
+                       AgentRoster.identity(for: t) != nil,
+                       f != t {
+                        considerOverall(f, t, when)
                         if when >= cutoff {
-                            hits.append((from, to, when))
+                            hits.append((f, t, when))
+                        }
+                    } else {
+                        let url = URL(fileURLWithPath: Self.multiRoot).appendingPathComponent(path)
+                        if let (from, to) = self.handoffEndpoints(at: url) {
+                            considerOverall(from, to, when)
+                            if when >= cutoff {
+                                hits.append((from, to, when))
+                            }
                         }
                     }
                 }
@@ -1501,17 +1755,24 @@ class AgentMonitor: ObservableObject {
         guard preferences != nil else { return }
         refreshLock.lock()
         if isRefreshingInFlight {
+            needsFollowupRefresh = true
             refreshLock.unlock()
             return
         }
         isRefreshingInFlight = true
+        needsFollowupRefresh = false
         refreshLock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             defer {
                 self.refreshLock.lock()
                 self.isRefreshingInFlight = false
+                let runAgain = self.needsFollowupRefresh
+                self.needsFollowupRefresh = false
                 self.refreshLock.unlock()
+                if runAgain {
+                    self.refreshAll()
+                }
             }
             
             let snapshot = self.fetchInboxesJSON()
@@ -1547,11 +1808,15 @@ class AgentMonitor: ObservableObject {
                 let pingArr = data["ping"] ?? []
                 let agyArr = data["agy"] ?? []
                 let almaArr = data["alma"] ?? []
-                let confirms = data["pending_confirms"] ?? []
+                let luluArr = data["lulu_actions"] ?? []
+                let agentConfirmArr = data["agent_confirms"] ?? []
+                let confirms = data["pending_confirms"] ?? (luluArr + agentConfirmArr)
 
                 self.pingTasks = pingArr
                 self.agyTasks = agyArr
                 self.almaTasks = almaArr
+                self.luluActions = luluArr
+                self.agentConfirms = agentConfirmArr
                 self.pendingConfirms = confirms
                 
                 self.pingDoneTasks = data["ping_done"] ?? []
@@ -1563,6 +1828,8 @@ class AgentMonitor: ObservableObject {
                 self.almaPending = almaArr.count
                 
                 let allActive = pingArr + agyArr + almaArr
+                self.totalLuluActions = luluArr.count
+                self.totalAgentConfirms = agentConfirmArr.count
                 self.totalSubmitted = confirms.count
                 self.totalAccepted = allActive.filter { $0.stage == "accepted" }.count
                 self.totalDispatched = allActive.filter { $0.stage == "dispatched" }.count
@@ -1577,6 +1844,32 @@ class AgentMonitor: ObservableObject {
                     self.lastFunnelEvent = pl.title.isEmpty ? "等待广播..." : pl.title
                     self.fusedSummary = pl.from
                 }
+                if let statItem = data["__today_stats__"]?.first {
+                    let newCnt = Int(statItem.file) ?? 0
+                    let latestTitle = statItem.title
+                    if self.prevTodayClosedCount >= 0 && newCnt > self.prevTodayClosedCount && !latestTitle.isEmpty {
+                        self.recentReceiptTitle = latestTitle
+                        self.recentReceiptAt = Date()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 31.0) { [weak self] in
+                            self?.onLayoutChange?()
+                        }
+                    }
+                    self.prevTodayClosedCount = newCnt
+                    self.todayClosedCount = newCnt
+                }
+                if let feedArr = data["__loop_feed__"] {
+                    self.recentLoopFeed = feedArr.map { it in
+                        LoopFeedItem(
+                            time: it.date,
+                            title: it.title,
+                            route: it.from,
+                            duration: it.eta,
+                            summary: it.highlights.isEmpty ? it.statusText : it.highlights,
+                            path: it.file,
+                            isGreen: it.stage == "confirmed"
+                        )
+                    }
+                }
                 
                 let currentTotal = pingArr.count + agyArr.count + almaArr.count
                 let prevTotal = self.lastKnownTotalPending
@@ -1590,14 +1883,15 @@ class AgentMonitor: ObservableObject {
                 }
                 self.lastKnownTotalPending = currentTotal
 
-                let prevSubmitted = self.lastKnownSubmitted
-                if prevSubmitted >= 0 && confirms.count > prevSubmitted {
-                    let from = confirms.first?.from ?? "Agent"
+                let prevLulu = self.lastKnownLuluActions
+                if prevLulu >= 0 && luluArr.count > prevLulu {
+                    let from = luluArr.first?.from ?? "Agent"
                     self.triggerNotification(
-                        title: "🔔 \(confirms.count) 件待你验收",
-                        subtitle: "\(from) 已递交成果 · 点击查看并验收"
+                        title: "🔔 \(luluArr.count) 件待你拍板",
+                        subtitle: "\(from) 等待露露确认 · 点击查看"
                     )
                 }
+                self.lastKnownLuluActions = luluArr.count
                 self.lastKnownSubmitted = confirms.count
 
                 // 收起态单行摘要随数据变化，窗口宽度需同步，避免文字溢出
@@ -2034,14 +2328,24 @@ except Exception:
 import sys, json, os, re, time
 from pathlib import Path
 sys.path.insert(0, '/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/multi-agent-handoff/scripts')
-import handoff
+import handoff, handoff_consts
 
 boxes = ['ping', 'agy', 'alma']
 ROOT = handoff.HANDOFFS_ROOT
 
 
 
-TERMINAL_STATUSES = ('已完成', '作废', '已关闭', '已核销', '参考', '已结案', '已确认', '已办', '已回复', '已交付', '已结算', '通知')
+TERMINAL_STATUSES = ('已完成', '作废', '已关闭', '已核销', '参考', '已结案', '已确认', '已办', '已回复', '已交付', '已结算', '通知', '已撤回', '已阅知')
+
+def is_term_status(st):
+    s = str(st or '').strip()
+    return handoff_consts.is_terminal(s) or any(c in s for c in TERMINAL_STATUSES)
+
+def is_synthetic_test_name(name):
+    low = str(name or '').rsplit('/', 1)[-1].lower()
+    if low.startswith('cc-test-') or low.startswith('cc-cc-test-') or 'selftest' in low:
+        return True
+    return low in ('self.md', 'self-alma.md', 'dispatch-replied.md', 'split-quoted-step.md')
 
 def clean_title(t):
     t = re.sub(r'(\\*\\*|__|`)', '', str(t or ''))
@@ -2079,10 +2383,12 @@ for b in boxes:
             or '核验+确认' in txt
             or '已确认结案' in txt
         )
+        is_cc_or_notice = (st in ('通知', '参考', '已阅知') or p.name.startswith(('cc-', 'receipt-')))
         is_doc_closed = (
             (st != '待整改')
+            and (not is_cc_or_notice)
             and (
-                any(c in st for c in TERMINAL_STATUSES)
+                is_term_status(st)
                 or '-confirm' in p.name
                 or p.name in acked_b
                 or is_step4_terminal
@@ -2258,76 +2564,109 @@ for box in boxes:
     items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box] = items
 
-# Phase 3: Pending Confirmations (发起方闭环核验中，兼容 --split -reply 与 --inline 待确认原单)
-raw_confirms = []
+# Phase 3: Pending Confirmations (与 handoff_backlog_audit.py / handoff._resolve_confirm_roles 100% 同源)
+# 严格拆分：lulu_actions（真正需露露本人验收/高危拍板） vs agent_confirms（Agent 之间自动互验闭环）
+lulu_raw = []
+agent_raw = []
 for b in boxes:
     b_dir = ROOT / b
     if not b_dir.is_dir(): continue
-    all_b_files = list(b_dir.iterdir())
+    acked_box = handoff.load_ack(b)
+    all_b_files = [p for p in b_dir.iterdir() if p.is_file() and not handoff.is_ignored_file(p)]
     for p in all_b_files:
-        if not p.is_file() or handoff.is_ignored_file(p): continue
-        if re.search(r'-(?:accept|confirm|reject)\\d*\\.md$', p.name, re.I) or p.name.startswith('receipt-'):
+        if re.search(r'-(?:accept|confirm|reject)\\d*\\.md$', p.name, re.I) or p.name.startswith(('receipt-', 'cancel-', 'pingloop-route-', 'cc-')):
             continue
-        is_reply_file = bool(handoff.REPLY_RE.search(p.name) or '-reply' in p.name.lower())
+        if handoff.REPLY_RE.search(p.name):
+            # 对齐 handoff_backlog_audit.py L58：-reply.md 结尾为派生回执，不单独计入 B 账
+            continue
+        if is_synthetic_test_name(p.name):
+            continue
+        is_reply_file = False
         try:
             txt = p.read_text(encoding='utf-8', errors='replace')
             meta, body = handoff.parse_frontmatter(txt)
+            if not meta:
+                continue
             status = str(meta.get('status', '')).strip()
-            if status not in ('待确认', '交付待确认'): continue
-            if is_reply_file:
-                verifier = str(meta.get('to', '')).strip().lower()
-                submitter = str(meta.get('from', '未知'))
-            else:
-                verifier = str(meta.get('from', '')).strip().lower()
-                submitter = str(meta.get('to', '未知'))
+            if is_term_status(status):
+                continue
+            is_highrisk = (status == '需高危拍板') or p.name.startswith('escalate-highrisk-')
+            if status not in ('待确认', '交付待确认') and not is_highrisk:
+                continue
+
+            # 权威角色解析：直接复用 handoff._resolve_confirm_roles，彻底消除 -reply 字符子串反转 Bug
+            exp_verifier, exp_submitter = handoff._resolve_confirm_roles(p, meta, txt)
+            verifier = (exp_verifier or str(meta.get('from', '')).strip().lower() or 'unknown')
+            submitter = (exp_submitter or str(meta.get('to', '')).strip().lower() or '未知')
             b_stem = re.sub(r'-(?:reply\\d*|audit\\d*|submit\\d*)$', '', p.stem, flags=re.I)
-            if b_stem in all_acked_bases: continue
-            acked = handoff.load_ack(verifier) if verifier else {}
-            if p.name in acked or b_stem in acked: continue
+
+            # 本箱已核销、同 trace/reply_to 已闭环、或存在同目录 -confirm/-reply 已终态则跳过（与 handoff_backlog_audit.py 同源）
+            if p.name in acked_box:
+                continue
+            acked_v = handoff.load_ack(verifier) if verifier and verifier != 'unknown' else {}
+            if p.name in acked_v:
+                continue
             tid = str(meta.get('trace_id', '')).strip()
             rt = str(meta.get('reply_to', '')).strip()
             if tid and tid in closed_traces:
                 continue
-            if rt and (Path(rt).name in closed_files or Path(rt).stem in closed_files):
+            if rt and rt != 'none' and (Path(rt).name in closed_files or Path(rt).stem in closed_files):
                 continue
-            if p.name in closed_files or b_stem in closed_files:
+            if p.name in closed_files or (is_reply_file and (b_stem in all_acked_bases or b_stem in closed_files)):
                 continue
-
-            # 凡同目录存在对应 -confirm 结案回执，或原单已结案，严禁混入待验收！
             has_confirm_file = any((b_stem in f.name and '-confirm' in f.name) for f in all_b_files)
             if has_confirm_file:
+                continue
+            if not is_reply_file and any((f.name.startswith(f'{p.stem}-reply') and f != p) for f in all_b_files):
                 continue
             if is_reply_file:
                 orig_p = b_dir / f'{b_stem}.md'
                 if orig_p.is_file():
                     o_txt = orig_p.read_text(encoding='utf-8', errors='replace')
                     o_meta, _ = handoff.parse_frontmatter(o_txt)
-                    if any(c in str(o_meta.get('status', '')) for c in TERMINAL_STATUSES):
+                    if is_term_status(o_meta.get('status', '')):
                         continue
 
-            raw_confirms.append({
+            # 露露终裁：普通 from=lulu 派单由非履约方总控/异构 Agent 自动代理验收，
+            # 仅「需高危拍板 / escalate-highrisk」与 M1 熔断才进入 lulu_actions 提醒露露拍板！
+            is_lulu = is_highrisk
+            eff_verifier = verifier
+            if verifier == 'lulu' and not is_highrisk:
+                eff_verifier = 'ping' if submitter.lower() != 'ping' else 'agy'
+            item_obj = {
                 'file': f'{b}/{p.name}',
                 'base': b_stem,
                 'from': submitter,
-                'to': verifier,
+                'to': eff_verifier,
                 'date': str(meta.get('date', '-')),
                 'title': clean_title(handoff.first_heading(body) or p.stem),
                 'mtime': p.stat().st_mtime,
-                'stage': 'submitted',
-                'statusText': '发起方核验中',
+                'stage': 'high-risk-blocked' if is_highrisk else 'submitted',
+                'statusText': '待露露拍板' if is_lulu else f'待 {eff_verifier} 自动验收',
                 'artifacts': str(meta.get('artifacts', '')),
-                'eta': '发起方验收中',
+                'eta': '待露露确认' if is_lulu else 'Agent 互验中',
                 'highlights': handoff.extract_highlights(txt)
-            })
-        except Exception: pass
+            }
+            if is_lulu:
+                lulu_raw.append(item_obj)
+            else:
+                agent_raw.append(item_obj)
+        except Exception:
+            pass
 
-latest_by_base = {}
-for item in raw_confirms:
-    b_key = item['base']
-    if b_key not in latest_by_base or item['mtime'] > latest_by_base[b_key]['mtime']:
-        latest_by_base[b_key] = item
+def dedup_latest(arr):
+    by_base = {}
+    for it in arr:
+        k = it['file'] if not it['base'] else f"{it['base']}::{it['to']}"
+        if k not in by_base or it['mtime'] > by_base[k]['mtime']:
+            by_base[k] = it
+    return sorted(by_base.values(), key=lambda x: x['mtime'], reverse=True)
 
-res['pending_confirms'] = sorted(latest_by_base.values(), key=lambda x: x['mtime'], reverse=True)
+lulu_list = dedup_latest(lulu_raw)
+agent_list = dedup_latest(agent_raw)
+res['lulu_actions'] = lulu_list
+res['agent_confirms'] = agent_list
+res['pending_confirms'] = lulu_list + agent_list
 
 # Phase 4: Extract recent completed replies (Done Feed, only confirmed)
 for box in boxes:
@@ -2361,6 +2700,123 @@ for box in boxes:
                 pass
     done_items.sort(key=lambda x: x['mtime'], reverse=True)
     res[box + '_done'] = done_items[:3]
+
+# Attach latest STEP node heartbeat + today auto-closed feed from events.log
+latest_real_ev = ''
+today_prefix = time.strftime('%Y-%m-%d', time.localtime())
+today_closed_set = set()
+submit_ts_map = {}
+feed_rows = []
+try:
+    ev_path = Path(os.environ.get('AGENT_ISLAND_EVENT_LOG', '/Users/l/.local/funnel-sync/events.log'))
+    if ev_path.exists():
+        step_map = {}
+        short_ag = {'ping': 'Ping', 'agy': 'AGY', 'alma': 'Alma', 'lulu': '露露'}
+        for ln in ev_path.read_text(encoding='utf-8', errors='ignore').splitlines()[-450:]:
+            try:
+                ev = json.loads(ln)
+            except Exception:
+                continue
+            p_str = str(ev.get('path', ''))
+            if not p_str or is_synthetic_test_name(p_str):
+                continue
+            fname = p_str.rsplit('/', 1)[-1]
+            t_raw = str(ev.get('time', ''))
+            hhmmss = t_raw[11:19] if len(t_raw) >= 19 else ''
+            hhmm = t_raw[11:16] if len(t_raw) >= 16 else ''
+            act = str(ev.get('action', ''))
+            ev_verb = str(ev.get('event') or act).lower()
+            actor = str(ev.get('actor') or '').lower()
+            to_ag = str(ev.get('to') or '').lower()
+            if act in ('STEP', 'PUT'):
+                label = f"{hhmmss} {actor} {ev_verb} {fname}".strip() if actor else f"{hhmmss} {act} {fname}".strip()
+                latest_real_ev = label
+            if act == 'STEP' and ev_verb == 'submit' and len(t_raw) >= 19:
+                try:
+                    submit_ts_map[fname] = time.mktime(time.strptime(t_raw[:19], '%Y-%m-%dT%H:%M:%S'))
+                except Exception:
+                    pass
+            if act == 'STEP' and ev_verb == 'confirm' and not fname.startswith(('cc-', 'receipt-')):
+                if t_raw.startswith(today_prefix):
+                    today_closed_set.add(fname)
+                dur_txt = '自动'
+                if fname in submit_ts_map and len(t_raw) >= 19:
+                    try:
+                        c_ts = time.mktime(time.strptime(t_raw[:19], '%Y-%m-%dT%H:%M:%S'))
+                        diff_s = max(0, int(c_ts - submit_ts_map[fname]))
+                        if diff_s <= 1:
+                            dur_txt = '1s' if diff_s == 1 else '<1s'
+                        elif diff_s < 60:
+                            dur_txt = f'{diff_s}s'
+                        elif diff_s < 3600:
+                            dur_txt = f'{diff_s // 60}m'
+                    except Exception:
+                        pass
+                rel_p = p_str[len('handoffs/'):] if p_str.startswith('handoffs/') else p_str
+                feed_rows.append({
+                    'fname': fname,
+                    'rel': rel_p,
+                    'hhmm': hhmm or '--:--',
+                    'route': f"{short_ag.get(to_ag, to_ag or 'Agent')} → {short_ag.get(actor, actor or 'Agent')} 验",
+                    'dur': dur_txt,
+                    'date_ok': t_raw.startswith(today_prefix),
+                })
+            if act != 'STEP':
+                continue
+            s_txt = str(ev.get('step', '')).strip()
+            if not s_txt:
+                continue
+            step_map[fname] = f"{s_txt} · {hhmm}" if hhmm else s_txt
+        if step_map:
+            for arr in res.values():
+                for it in arr:
+                    f_leaf = str(it.get('file', '')).rsplit('/', 1)[-1]
+                    sn = step_map.get(f_leaf)
+                    if sn:
+                        it['stepNote'] = sn
+except Exception:
+    pass
+
+# 构建最近 5 拍去重人话闭环战报
+seen_feed = set()
+loop_feed_out = []
+for row in reversed(feed_rows):
+    if row['fname'] in seen_feed:
+        continue
+    seen_feed.add(row['fname'])
+    fp = ROOT / row['rel']
+    f_title = row['fname'].replace('.md', '')
+    f_hl = '后台自动完成交付与核验结案，全程零人工介入。'
+    if fp.is_file():
+        try:
+            ftxt = fp.read_text(encoding='utf-8', errors='replace')
+            _, fbody = handoff.parse_frontmatter(ftxt)
+            f_title = clean_title(handoff.first_heading(fbody) or f_title)
+            hls = handoff.extract_highlights(ftxt)
+            if isinstance(hls, str) and hls.strip():
+                f_hl = hls.strip()[:160]
+            elif isinstance(hls, list) and hls:
+                f_hl = ' '.join(str(x) for x in hls[:2])[:160]
+        except Exception:
+            pass
+    loop_feed_out.append({
+        'file': row['rel'],
+        'title': f_title[:42],
+        'from': row['route'],
+        'to': 'lulu',
+        'date': row['hhmm'],
+        'mtime': 0,
+        'stage': 'confirmed',
+        'statusText': '已结案 · 0 人工',
+        'eta': row['dur'],
+        'highlights': f_hl,
+    })
+    if len(loop_feed_out) >= 5:
+        break
+
+latest_closed_title = loop_feed_out[0]['title'] if loop_feed_out else ''
+res['__today_stats__'] = [{'file': str(len(today_closed_set)), 'title': latest_closed_title, 'from': '', 'to': 'self', 'date': '-', 'mtime': 0}]
+res['__loop_feed__'] = loop_feed_out
 
 # Deep Telemetry from token_usage_archive_v2 (Context & Quota Ledger)
 telem_total = '--'
@@ -2397,7 +2853,8 @@ try:
     import ping_loop_fuse
     f_res = ping_loop_fuse.scan_fuse()
     pl_fused = int(f_res.get('fused_count', 0))
-    pl_event = str(f_res.get('last_event', 'events.log 实时待命'))
+    raw_pl_ev = str(f_res.get('last_event', 'events.log 实时待命'))
+    pl_event = latest_real_ev if (latest_real_ev and (is_synthetic_test_name(raw_pl_ev.split()[-1] if raw_pl_ev.split() else '') or not raw_pl_ev)) else raw_pl_ev
     if f_res.get('fused_tasks'):
         top_f = f_res['fused_tasks'][0]
         pl_summary = f"{top_f['base']} ({top_f['rounds']}轮)"
@@ -2429,7 +2886,8 @@ print(json.dumps(res, ensure_ascii=False))
                         let artifacts = (d["artifacts"] as? String) ?? ""
                         let eta = (d["eta"] as? String) ?? ""
                         let highlights = (d["highlights"] as? String) ?? ""
-                        return TaskItem(file: file, from: from, to: to, date: date, title: title, stage: stage, statusText: statusText, artifacts: artifacts, eta: eta, highlights: highlights)
+                        let stepNote = (d["stepNote"] as? String) ?? ""
+                        return TaskItem(file: file, from: from, to: to, date: date, title: title, stage: stage, statusText: statusText, artifacts: artifacts, eta: eta, highlights: highlights, stepNote: stepNote)
                     }
                 }
                 return output
@@ -2661,23 +3119,20 @@ struct DynamicIslandView: View {
     var compactAccent: Color {
         if monitor.dataUnknown { return Color(hex: "F59E0B") }
         if monitor.fusedCount > 0 { return Color(hex: "EF4444") }
-        if monitor.totalSubmitted > 0, let from = monitor.pendingConfirms.first?.from,
-           let agent = AgentRoster.identity(for: from.lowercased()) {
-            return agent.color
-        }
-        if let lead = monitor.todayUnreadLeaders.first { return lead.0.color }
+        if monitor.totalLuluActions > 0 { return Color(hex: "8B5CF6") }
+        if monitor.totalAgentConfirms > 0 || monitor.totalUnread > 0 { return Color(hex: "3B82F6") }
         return Color(hex: "10B981")
     }
 
     var compactIsAlert: Bool {
-        monitor.dataUnknown || monitor.fusedCount > 0 || monitor.totalSubmitted > 0 || monitor.totalTodayUnread > 0
+        monitor.dataUnknown || monitor.fusedCount > 0 || monitor.totalLuluActions > 0
     }
 
     var compactGlyphName: String {
         if monitor.dataUnknown { return "questionmark" }
         if monitor.fusedCount > 0 { return "exclamationmark" }
-        if monitor.totalSubmitted > 0 { return "bell.fill" }
-        if monitor.totalTodayUnread > 0 { return "tray.fill" }
+        if monitor.totalLuluActions > 0 { return "bell.fill" }
+        if monitor.totalAgentConfirms > 0 || monitor.totalUnread > 0 { return "bolt.fill" }
         return "checkmark"
     }
 
@@ -2714,70 +3169,78 @@ struct DynamicIslandView: View {
         }
     }
     
-    // MARK: - AgentIsland & Multi-Agent 架构控制中心 (苹果原厂大字阶与四层空间调度)
+    // MARK: - AgentIsland v2.0 & Multi-Agent 紧凑四分卡控制中心（保持原生液态玻璃，零多余 emoji）
     var controlCenterExpandedView: some View {
-        VStack(spacing: 16) {
-            // Layer 1: Header Row (14pt 大标题 + 链路图切换 + 关闭/Esc)
+        VStack(spacing: 11) {
+            // Layer 1: 精致顶栏（品牌状态 + 4 分卡切换 + 设置/关闭）
             HStack(spacing: 8) {
                 ZStack {
-                    Circle()
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(accentColor)
                         .frame(width: 22, height: 22)
-                    Image(systemName: "slider.horizontal.3")
+                    Image(systemName: "infinity")
                         .foregroundColor(.white)
-                        .font(.system(size: fs(13), weight: .bold))
+                        .font(.system(size: fs(12), weight: .bold))
                 }
-                Text("总览")
-                    .font(.system(size: fs(15), weight: .bold))
+                Text("Ping-Loop")
+                    .font(.system(size: fs(14), weight: .bold))
                     .foregroundColor(primaryTextColor)
 
                 if monitor.dataUnknown {
                     Text("数据未知")
-                        .font(.system(size: fs(12), weight: .bold))
+                        .font(.system(size: fs(11), weight: .bold))
                         .foregroundColor(textAmber)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(Capsule().fill(Color(hex: "F59E0B").opacity(0.16)))
+                } else if let fb = monitor.reconcileFeedback {
+                    Text(fb)
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(textGreen)
+                        .lineLimit(1)
+                } else {
+                    let isBusy = monitor.wakeState.effectiveStatus == "running" || monitor.totalAgentConfirms > 0 || monitor.totalUnread > 0
+                    Text(isBusy ? "自动闭环中" : "自动闭环正常")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(isBusy ? textBlue : textGreen)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill((isBusy ? Color(hex: "3B82F6") : Color(hex: "10B981")).opacity(0.14)))
                 }
 
-                // 顶部只剩「总览 / 待办总览」两个入口；链路架构改为总览内联区块
+                Spacer(minLength: 4)
+
+                // 4 张紧凑分卡切换（团队 / 战报 / 自优化 / 链路）
                 HStack(spacing: 2) {
-                    Button(action: {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            monitor.showTopology = false
-                        }
-                    }) {
-                        Text("待办总览")
-                            .font(.system(size: fs(13), weight: !monitor.showTopology ? .bold : .semibold))
-                            .foregroundColor(!monitor.showTopology ? accentOnColor : secondaryTextColor)
+                    ForEach(PanelTab.allCases, id: \.self) { tab in
+                        let selected = !monitor.showSettings && !monitor.showTopology && monitor.activeTab == tab
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                monitor.showSettings = false
+                                monitor.showTopology = false
+                                monitor.activeTab = tab
+                            }
+                        }) {
+                            HStack(spacing: 3) {
+                                Text(tab.rawValue)
+                                    .font(.system(size: fs(12), weight: selected ? .bold : .semibold))
+                                if tab == .feed && monitor.todayClosedCount > 0 {
+                                    Text("\(monitor.todayClosedCount)")
+                                        .font(.system(size: fs(11), weight: .bold, design: .monospaced))
+                                        .foregroundColor(selected ? accentOnColor : secondaryTextColor)
+                                }
+                            }
+                            .foregroundColor(selected ? accentOnColor : secondaryTextColor)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
-                            .background(
-                                Capsule().fill(!monitor.showTopology ? accentColor : Color.clear)
-                            )
+                            .background(Capsule().fill(selected ? accentColor : Color.clear))
+                        }
+                        .buttonStyle(PlainButtonStyle())
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    .help("回到总览，收起内联链路")
                 }
                 .padding(2)
                 .background(
                     Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
                 )
-                
-                Spacer()
-                
-                // Status hint / reconcile feedback
-                if let fb = monitor.reconcileFeedback {
-                    Text(fb)
-                        .font(.system(size: fs(13), weight: .bold))
-                        .foregroundColor(totalPending == 0 ? Color(hex: "059669") : Color(hex: "D97706"))
-                        .transition(.scale)
-                } else {
-                    Text("Esc 收起")
-                        .font(.system(size: fs(13), weight: .semibold))
-                        .foregroundColor(secondaryTextColor)
-                }
-                
+
                 Button(action: {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         monitor.showSettings.toggle()
@@ -2802,32 +3265,362 @@ struct DynamicIslandView: View {
             .padding(.top, 10)
             .padding(.horizontal, 16)
 
-            // Layer 2: 黄金展示区 (工单流 vs 架构链路图)
+            // 红线拍板区（仅 M1 熔断或高危拦截时出现，平时 0 高度隐藏）
             if monitor.fusedCount > 0 || !monitor.fusedCards.isEmpty {
                 fusedDecisionBannerView
                     .padding(.horizontal, 14)
             }
-            
-            if monitor.showTopology {
-                // 链路架构内联在总览里：迷你条常驻，点一下就地展开，不占独立 tab
-                VStack(spacing: 10) {
-                    miniLinkStrip
-                    architectureTopologyView
-                }
-                .padding(.horizontal, 14)
-            } else if monitor.showSettings {
+            if monitor.totalLuluActions > 0 && !monitor.showSettings {
+                liveDispatchHeroCardView
+                    .padding(.horizontal, 14)
+            }
+
+            // 主内容区（设置页 vs 4 张紧凑分卡）
+            if monitor.showSettings {
                 settingsView
             } else {
-                // 模块可单独开关、可拖动排序：先后台条，再 M6 飞轮，再三箱，再通道，最后资产
-                ForEach(monitor.sectionOrder, id: \.self) { key in
-                    if monitor.isSectionEnabled(key) {
-                        panelSectionView(key)
+                if monitor.showTopology || monitor.activeTab == .topo {
+                    architectureTopologyView
+                        .padding(.horizontal, 14)
+                } else {
+                    switch monitor.activeTab {
+                    case .team:
+                        v2TeamCardView
+                            .padding(.horizontal, 14)
+                    case .feed:
+                        v2FeedCardView
+                            .padding(.horizontal, 14)
+                    case .opt:
+                        v2OptCardView
+                            .padding(.horizontal, 14)
+                    case .topo:
+                        architectureTopologyView
+                            .padding(.horizontal, 14)
+                    }
+                }
+
+                // 底部平等三选一快发栏 + 快捷资产入口（4 分卡常驻不跳动）
+                VStack(spacing: 6) {
+                    quickSendStrip
+                    assetsRow
+                }
+                .padding(.horizontal, 14)
+            }
+        }
+        .padding(.bottom, 10)
+    }
+
+    // MARK: - v2.0 卡片 1：团队实时态（4 列 Rich Presence + 1 行裁判摘要 + 精简暂停控制）
+    var v2TeamCardView: some View {
+        let agyRunning = monitor.wakeState.effectiveStatus == "running"
+        let agyPaused = monitor.wakeState.effectiveStatus == "paused"
+        let agyBlocked = ["fused-m1", "high-risk-blocked", "需高危拍板", "error", "submit-failed"].contains(monitor.wakeState.effectiveStatus)
+        let lastClosed = monitor.recentLoopFeed.first
+        return VStack(spacing: 9) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("团队实时态 · 点击节点查抽屉")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(secondaryTextColor)
+                    Spacer()
+                    let okText = agyRunning ? "AGY 自动执行中" : (agyBlocked ? "高危挂起 · 待拍板" : (agyPaused ? "后台已暂停" : "4 节点在线 · 0 阻塞"))
+                    let okColor = agyRunning ? textBlue : (agyBlocked ? textRed : (agyPaused ? textAmber : textGreen))
+                    Text(okText)
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(okColor)
+                }
+
+                HStack(spacing: 8) {
+                    v2AgentTile(
+                        badge: "P", name: "Ping", role: "云端 VM",
+                        status: monitor.pingPending > 0 ? "处理 \(monitor.pingPending) 单中" : "待命 · Funnel通",
+                        color: Color(hex: "7C3AED"),
+                        active: monitor.pingPending > 0 || monitor.activePulses.contains { $0.source == "ping" || $0.target == "ping" }
+                    ) { monitor.setDrawerAgent("ping") }
+
+                    v2AgentTile(
+                        badge: "白", name: "AGY", role: "Mac 代码",
+                        status: agyRunning ? "自动执行中" : (agyBlocked ? "高危挂起" : (agyPaused ? "已暂停" : "待命 · 自动验结")),
+                        color: agyBlocked ? Color(hex: "EF4444") : Color(hex: "2563EB"),
+                        active: agyRunning || agyBlocked || monitor.agyPending > 0
+                    ) { monitor.setDrawerAgent("agy") }
+
+                    v2AgentTile(
+                        badge: "A", name: "Alma", role: "Mac 巡检",
+                        status: monitor.almaPending > 0 ? "履约 \(monitor.almaPending) 单" : "待命 · 跨箱验货",
+                        color: Color(hex: "D97706"),
+                        active: monitor.almaPending > 0 || monitor.activePulses.contains { $0.source == "alma" || $0.target == "alma" }
+                    ) { monitor.setDrawerAgent("alma") }
+
+                    v2AgentTile(
+                        badge: "算", name: "模拟机", role: "9011/9012",
+                        status: monitor.tailscaleOnline ? "Tailscale 就绪" : "私网离线",
+                        color: Color(hex: "059669"),
+                        active: false
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.16)) { monitor.activeTab = .topo }
                     }
                 }
             }
+            .padding(11)
+            .background(squircleCardBackground)
 
+            // 1 行健康与最近闭环摘要 + 后台暂停开关
+            HStack(spacing: 8) {
+                let score = monitor.harnessState.loopScore
+                let scoreOk = monitor.harnessState.sealOk && score >= 100
+                Text("裁判 \(score)/100 (\(monitor.harnessState.smokePassed)/\(monitor.harnessState.smokeTotal))")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(scoreOk ? textGreen : textAmber)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill((scoreOk ? Color(hex: "10B981") : Color(hex: "F59E0B")).opacity(0.14)))
+
+                if let lc = lastClosed {
+                    Text("最近：\(lc.time) \(lc.title)")
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                        .lineLimit(1)
+                } else {
+                    Text("全员就绪 · 今日自闭环 \(monitor.todayClosedCount) 单")
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.16)) { monitor.activeTab = .feed }
+                }) {
+                    Text("看战报")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(accentTextColor)
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Button(action: {
+                    monitor.toggleAgyWakePaused()
+                }) {
+                    Text(monitor.wakeState.paused ? "恢复" : "暂停")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(monitor.wakeState.paused ? textGreen : secondaryTextColor)
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.06)))
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(squircleCardBackground)
+
+            if monitor.resumeConfirmPending {
+                resumeConfirmBar
+            }
         }
-        .padding(.bottom, 10)
+    }
+
+    func v2AgentTile(badge: String, name: String, role: String, status: String, color: Color, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    ZStack {
+                        if active {
+                            Circle()
+                                .stroke(color.opacity(monitor.pulse ? 0.65 : 0.20), lineWidth: 2)
+                                .frame(width: 28, height: 28)
+                        }
+                        Circle()
+                            .fill(color)
+                            .frame(width: 22, height: 22)
+                        Text(badge)
+                            .font(.system(size: fs(11), weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(name)
+                            .font(.system(size: fs(12), weight: .bold))
+                            .foregroundColor(primaryTextColor)
+                            .lineLimit(1)
+                        Text(role)
+                            .font(.system(size: fs(11), weight: .semibold))
+                            .foregroundColor(secondaryTextColor)
+                            .lineLimit(1)
+                    }
+                }
+                Text(status)
+                    .font(.system(size: fs(11), weight: active ? .bold : .semibold))
+                    .foregroundColor(active ? color : secondaryTextColor)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8).padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(active ? color.opacity(monitor.panelIsDark ? 0.20 : 0.10) : (monitor.panelIsDark ? Color.white.opacity(0.05) : Color.black.opacity(0.035)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(active ? color.opacity(0.45) : Color.clear, lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    // MARK: - v2.0 卡片 2：今日自动闭环战报（最近 5 拍无哈希纯人话）
+    var v2FeedCardView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("今日自动闭环战报 · 点行展开结果")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(secondaryTextColor)
+                Spacer()
+                Text("今日已自闭环 \(monitor.todayClosedCount) 单")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(textGreen)
+            }
+
+            if monitor.recentLoopFeed.isEmpty {
+                HStack(spacing: 6) {
+                    Circle().fill(Color(hex: "10B981")).frame(width: 7, height: 7)
+                    Text("今日尚无新闭环记录，系统后台静默待命中")
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                }
+                .padding(.vertical, 12)
+            } else {
+                VStack(spacing: 5) {
+                    ForEach(monitor.recentLoopFeed) { row in
+                        let isExp = monitor.expandedFeedId == row.id
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 7) {
+                                Text(row.time)
+                                    .font(.system(size: fs(11), weight: .bold, design: .monospaced))
+                                    .foregroundColor(secondaryTextColor)
+                                Circle()
+                                    .fill(row.isGreen ? Color(hex: "10B981") : Color(hex: "3B82F6"))
+                                    .frame(width: 6, height: 6)
+                                Text(row.title)
+                                    .font(.system(size: fs(12), weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text(row.route)
+                                    .font(.system(size: fs(11), weight: .semibold))
+                                    .foregroundColor(secondaryTextColor)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Capsule().fill(monitor.panelIsDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05)))
+                                Text(row.duration)
+                                    .font(.system(size: fs(11), weight: .bold, design: .monospaced))
+                                    .foregroundColor(textGreen)
+                                    .frame(minWidth: 28, alignment: .trailing)
+                            }
+                            if isExp {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(row.summary)
+                                        .font(.system(size: fs(12), weight: .regular))
+                                        .foregroundColor(secondaryTextColor)
+                                        .lineLimit(3)
+                                    HStack {
+                                        Text(row.path)
+                                            .font(.system(size: fs(11), weight: .regular, design: .monospaced))
+                                            .foregroundColor(secondaryTextColor)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Button(action: {
+                                            let full = "\(monitor.rootPath)/\(row.path)"
+                                            NSWorkspace.shared.open(URL(fileURLWithPath: full))
+                                        }) {
+                                            Text("打开原文")
+                                                .font(.system(size: fs(11), weight: .bold))
+                                                .foregroundColor(accentTextColor)
+                                        }
+                                        .buttonStyle(PlainButtonStyle())
+                                    }
+                                }
+                                .padding(.top, 2)
+                            }
+                        }
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(monitor.panelIsDark ? Color.white.opacity(isExp ? 0.09 : 0.05) : Color.black.opacity(isExp ? 0.06 : 0.035))
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                monitor.expandedFeedId = isExp ? nil : row.id
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(11)
+        .background(squircleCardBackground)
+    }
+
+    // MARK: - v2.0 卡片 3：自优化变化日志（全自动 loop 判断，零手动按钮，只报谁升格/谁降格/变化是什么）
+    var v2OptCardView: some View {
+        let hs = monitor.harnessState
+        let scoreOk = hs.sealOk && hs.loopScore >= 100
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("裁判 \(hs.loopScore)/100 (\(hs.smokePassed)/\(hs.smokeTotal))")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(scoreOk ? textGreen : textRed)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill((scoreOk ? Color(hex: "10B981") : Color(hex: "EF4444")).opacity(0.14)))
+                Text("全自动升格/降格 · 仅呈报变化")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(secondaryTextColor)
+                Spacer()
+                Text(hs.ageMin <= 1 ? "刚刚扫描" : "\(hs.ageMin)m 前扫描")
+                    .font(.system(size: fs(11), weight: .semibold, design: .monospaced))
+                    .foregroundColor(secondaryTextColor)
+            }
+
+            if hs.autoChanges.isEmpty {
+                Text("当前无新升格或降格变化，6/6 不可变冒烟门禁持续守卫中。")
+                    .font(.system(size: fs(12), weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+                    .padding(.vertical, 10)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(Array(hs.autoChanges.prefix(4))) { item in
+                        let badgeColor: Color = item.kind == "upgraded" ? Color(hex: "10B981") : (item.kind == "downgraded" ? Color(hex: "3B82F6") : Color(hex: "6B7280"))
+                        let badgeTextColor: Color = item.kind == "upgraded" ? textGreen : (item.kind == "downgraded" ? textBlue : secondaryTextColor)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(item.badge)
+                                    .font(.system(size: fs(11), weight: .bold))
+                                    .foregroundColor(badgeTextColor)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Capsule().fill(badgeColor.opacity(0.15)))
+                                Text(item.title)
+                                    .font(.system(size: fs(12), weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(item.carrier)
+                                    .font(.system(size: fs(11), weight: .regular, design: .monospaced))
+                                    .foregroundColor(secondaryTextColor)
+                                    .lineLimit(1)
+                            }
+                            Text(item.change)
+                                .font(.system(size: fs(11), weight: .medium))
+                                .foregroundColor(secondaryTextColor)
+                                .lineLimit(2)
+                        }
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(monitor.panelIsDark ? Color.white.opacity(0.05) : Color.black.opacity(0.035))
+                        )
+                    }
+                }
+            }
+        }
+        .padding(11)
+        .background(squircleCardBackground)
     }
 
     // MARK: - Panel Sections (可单独开关 · 可拖动排序)
@@ -2897,15 +3690,31 @@ struct DynamicIslandView: View {
             Spacer(minLength: 4)
 
             HStack(spacing: 4) {
-                Image(systemName: "tray.and.arrow.down.fill")
-                    .font(.system(size: fs(12), weight: .bold))
-                    .foregroundColor(textPurple)
-                Text(monitor.totalSubmitted == 0 ? "无待验收" : "\(monitor.totalSubmitted) 待验收")
-                    .font(.system(size: fs(12), weight: .bold))
-                    .foregroundColor(monitor.totalSubmitted == 0 ? secondaryTextColor : Color(hex: "8B5CF6"))
+                if monitor.totalLuluActions > 0 {
+                    Image(systemName: "bell.badge.fill")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(textPurple)
+                    Text("\(monitor.totalLuluActions) 待你拍板")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(Color(hex: "8B5CF6"))
+                } else if monitor.totalAgentConfirms > 0 {
+                    Image(systemName: "bolt.circle.fill")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(textBlue)
+                    Text("\(monitor.totalAgentConfirms) 互验中")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(textBlue)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(textGreen)
+                    Text("0 积压")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(secondaryTextColor)
+                }
             }
             .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(Capsule().fill(Color(hex: "8B5CF6").opacity(monitor.totalSubmitted == 0 ? 0.05 : 0.13)))
+            .background(Capsule().fill((monitor.totalLuluActions > 0 ? Color(hex: "8B5CF6") : (monitor.totalAgentConfirms > 0 ? Color(hex: "3B82F6") : Color(hex: "10B981"))).opacity(monitor.totalSubmitted == 0 ? 0.06 : 0.13)))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 2)
@@ -3347,7 +4156,7 @@ struct DynamicIslandView: View {
             TextField(
                 "",
                 text: $monitor.quickSendText,
-                prompt: Text("快发一句话给 \(currentLabel)（回车直达）…").foregroundColor(secondaryTextColor.opacity(0.75))
+                prompt: Text("跟 \(currentLabel) 说句话或下任务（完成后自动闭环）").foregroundColor(secondaryTextColor.opacity(0.75))
             )
                 .textFieldStyle(.plain)
                 .font(.system(size: fs(12)))
@@ -3685,6 +4494,156 @@ struct DynamicIslandView: View {
         .buttonStyle(PlainButtonStyle())
     }
     
+    // MARK: - 有界外骨骼自优化与墙钟透视带（0 点击首屏直达 + 聚类升格一键批红抽屉）
+    @ViewBuilder
+    var selfHarnessStripView: some View {
+        let hs = monitor.harnessState
+        let scoreGood = hs.sealOk && hs.loopScore == 100 && !hs.isStale
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Image(systemName: hs.sealOk ? "lock.shield.fill" : "exclamationmark.octagon.fill")
+                        .font(.system(size: fs(12), weight: .bold))
+                        .foregroundColor(scoreGood ? textGreen : textRed)
+                    Text("裁判 \(hs.loopScore)/100")
+                        .font(.system(size: fs(12), weight: .bold).monospacedDigit())
+                        .foregroundColor(scoreGood ? textGreen : textRed)
+                }
+                .layoutPriority(1)
+
+                Text("•")
+                    .font(.system(size: fs(12), weight: .semibold))
+                    .foregroundColor(secondaryTextColor)
+
+                Text("有效 \(String(format: "%.1f", hs.effectivePct))% (\(Int(hs.effectiveExecMin.rounded()))m/\(Int(hs.totalWallMin.rounded()))m)")
+                    .font(.system(size: fs(12), weight: .semibold).monospacedDigit())
+                    .foregroundColor(primaryTextColor)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                if hs.escalationCount > 0 {
+                    Button(action: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            monitor.harnessDrawerExpanded.toggle()
+                        }
+                        monitor.onLayoutChange?()
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: fs(11), weight: .bold))
+                            Text("升格 \(hs.escalationCount)簇")
+                                .font(.system(size: fs(12), weight: .bold).monospacedDigit())
+                            Image(systemName: monitor.harnessDrawerExpanded ? "chevron.up" : "chevron.down")
+                                .font(.system(size: fs(11), weight: .bold))
+                        }
+                        .foregroundColor(textAmber)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color(hex: "FF9F0A").opacity(monitor.panelIsDark ? 0.20 : 0.14)))
+                    }
+                    .buttonStyle(PressableScaleButtonStyle())
+                    .layoutPriority(1)
+                } else {
+                    Text(hs.isStale ? "陈旧 \(hs.ageMin)m" : "0 待升格")
+                        .font(.system(size: fs(12), weight: .semibold))
+                        .foregroundColor(hs.isStale ? textAmber : secondaryTextColor)
+                        .layoutPriority(1)
+                }
+            }
+
+            GeometryReader { geo in
+                let totalW = max(20, geo.size.width)
+                let effW = max(6, min(totalW, totalW * hs.effectiveRatio))
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(secondaryTextColor.opacity(0.20))
+                        .frame(width: totalW, height: 4)
+                    Capsule()
+                        .fill(Color(hex: "0A84FF"))
+                        .frame(width: effW, height: 4)
+                }
+            }
+            .frame(height: 4)
+
+            if monitor.harnessDrawerExpanded && !hs.proposals.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(hs.proposals.prefix(3))) { item in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 4) {
+                                    Text("\(item.signature) · 跨\(item.distinctSessions)单")
+                                        .font(.system(size: fs(12), weight: .bold).monospacedDigit())
+                                        .foregroundColor(primaryTextColor)
+                                        .lineLimit(1)
+                                    if item.shadowVerified {
+                                        Text("✓ 沙箱已验")
+                                            .font(.system(size: fs(11), weight: .bold))
+                                            .foregroundColor(textGreen)
+                                            .layoutPriority(1)
+                                    }
+                                }
+                                Text("\(item.carrier) → \(item.recommendedFix)")
+                                    .font(.system(size: fs(11), weight: .medium))
+                                    .foregroundColor(secondaryTextColor)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                            Button(action: {
+                                if item.shadowVerified && !item.patchReportPath.isEmpty {
+                                    monitor.copyToClipboard("python3 ~/.config/alma/scripts/apply-dreaming-patch.py --apply --report \"\(item.patchReportPath)\"", label: "一键合入已验补丁命令")
+                                } else {
+                                    monitor.copyToClipboard("批准机械升格 [\(item.signature)]：请按载体 \(item.carrier) 实施 \(item.recommendedFix) 并补齐先红后绿门禁", label: "A 批准指令")
+                                }
+                            }) {
+                                Text(item.shadowVerified ? "A 合入" : "A 批升格")
+                                    .font(.system(size: fs(11), weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 4)
+                                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color(hex: item.shadowVerified ? "059669" : "0A84FF")))
+                            }
+                            .buttonStyle(PressableScaleButtonStyle())
+                            .layoutPriority(1)
+
+                            Button(action: {
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    let proc = Process()
+                                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                                    proc.arguments = [
+                                        "/Users/l/Nutstore Files/Obsidian_/multi-agent/skills/ping-loop/scripts/pingloop_harness_propose.py",
+                                        "--cooldown", item.signature,
+                                        "--fast", "--quiet"
+                                    ]
+                                    proc.standardOutput = FileHandle.nullDevice
+                                    proc.standardError = FileHandle.nullDevice
+                                    try? proc.run()
+                                }
+                                monitor.copyToClipboard("已将 [\(item.signature)] 写入 7 天冷却止损", label: "7天冷却已生效")
+                            }) {
+                                Text("C 止损")
+                                    .font(.system(size: fs(11), weight: .bold))
+                                    .foregroundColor(primaryTextColor)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 4)
+                                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(monitor.panelIsDark ? Color.white.opacity(0.14) : Color.black.opacity(0.08)))
+                            }
+                            .buttonStyle(PressableScaleButtonStyle())
+                            .layoutPriority(1)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(monitor.panelIsDark ? Color.white.opacity(0.05) : Color.black.opacity(0.03)))
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(squircleCardBackground)
+    }
+
     // MARK: - M1 熔断露露专属决策卡（批奏折专区：直读 a-verifier-decisions/*-fused.md）
     var fusedDecisionBannerView: some View {
         let topCard = monitor.fusedCards.first
@@ -3771,129 +4730,160 @@ struct DynamicIslandView: View {
         )
     }
     
-    // 横向多 Agent 拓扑：AGY 左 · Alma 中 · Ping 右；Funnel 443 横贯中部。
-    // 脉冲只来自 events.log / handoff mtime 的真实通讯；静默时零活动连线、零脉冲、零高亮。
+    // v2.0 纯正交直线真实网络拓扑：
+    // 上路正交直线：Ping -> Funnel 443 -> Mac Mini (AGY -- 0ms 总线 -- Alma) -> 局域网联调 -> 模拟电脑
+    // 下路笔直水平绿线：Ping ———————— 模拟电脑 9011/9012（Tailscale SSH 直连 · 不经 Mac）
     var architectureTopologyView: some View {
-        VStack(spacing: 10) {
-            HStack(alignment: .top, spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("横向链路 · 事件驱动脉冲")
-                        .font(.system(size: fs(13), weight: .bold))
-                        .foregroundColor(primaryTextColor)
-                    Text("AGY 左 · Alma 中 · Ping 右")
-                        .font(.system(size: fs(12), weight: .semibold))
-                        .foregroundColor(secondaryTextColor)
-                }
-                Spacer()
-                // 坚果云：右上角小节点，只作冷备，不参与通讯判定
-                HStack(spacing: 4) {
-                    Image(systemName: "externaldrive.fill")
-                        .font(.system(size: fs(12), weight: .semibold))
-                    Text("坚果云 · 冷备")
-                        .font(.system(size: fs(12), weight: .bold))
-                    Circle()
-                        .fill(monitor.nutstoreOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
-                        .frame(width: 5, height: 5)
-                }
-                .foregroundColor(textGray)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(Color(hex: "9CA3AF").opacity(0.14)))
-            }
-            .padding(.horizontal, 12)
-
+        VStack(spacing: 8) {
             GeometryReader { geo in
-                let width = geo.size.width
-                let railY: CGFloat = 48
+                let w = geo.size.width
+                let macX = w * 0.31
+                let macW = w * 0.38
+                let macY: CGFloat = 10
+                let macH: CGFloat = 80
+                let topLineY: CGFloat = 52
+                let botLineY: CGFloat = 132
+                let pingX = w * 0.12
+                let simX = w * 0.88
+                let agyX = macX + macW * 0.27
+                let almaX = macX + macW * 0.73
+
                 ZStack {
-                    // 空闲态不画任何线段：没有通讯就没有连线、脉冲和光点。
-                    // 只有 activePulses 非空时才挂载 pulseLayer（实线 + 箭头 + 光点）。
-
-                    HStack(spacing: 4) {
-                        Image(systemName: "bolt.horizontal.fill")
-                            .font(.system(size: fs(11), weight: .bold))
-                        Text("Funnel 443 · 主通道")
-                            .font(.system(size: fs(12), weight: .bold))
-                    }
-                    .foregroundColor(monitor.activePulses.isEmpty ? textGray : textGreen)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(monitor.activePulses.isEmpty
-                        ? Color(hex: "9CA3AF").opacity(0.14)
-                        : Color(hex: "059669").opacity(0.14)))
-                    .position(x: width / 2, y: 11)
-
-                    ForEach(Array(AgentRoster.all.enumerated()), id: \.element.id) { idx, agent in
-                        topologyNode(
-                            agent: agent,
-                            isActive: monitor.activePulses.contains { $0.source == agent.key || $0.target == agent.key }
+                    // Mac Mini 虚线外框（置于上方，绝不遮挡下方 Ping->模拟电脑 直连线）
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(hex: "3B82F6").opacity(monitor.panelIsDark ? 0.08 : 0.05))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(secondaryTextColor.opacity(0.32), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
                         )
-                        .position(x: width * [0.16, 0.5, 0.84][idx], y: railY + 21)
-                    }
+                        .frame(width: macW, height: macH)
+                        .position(x: macX + macW / 2, y: macY + macH / 2)
 
-                    if !monitor.activePulses.isEmpty {
-                        topologyPulseLayer(width: width, railY: railY)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
-            .frame(height: 128)
-
-            // Tailscale：底部基座横条
-            HStack(spacing: 7) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: fs(12), weight: .bold))
-                    .foregroundColor(textBlue)
-                Text("Tailscale 私网 · 基座")
-                    .font(.system(size: fs(12), weight: .bold))
-                    .foregroundColor(primaryTextColor)
-                Text("跨机底座，不承载业务脉冲")
-                    .font(.system(size: fs(12), weight: .semibold))
-                    .foregroundColor(secondaryTextColor)
-                Spacer()
-                Circle()
-                    .fill(monitor.tailscaleOnline ? Color(hex: "10B981") : Color(hex: "EF4444"))
-                    .frame(width: 6, height: 6)
-                Text(monitor.tailscaleOnline ? "在线" : "离线")
-                    .font(.system(size: fs(12), weight: .semibold))
-                    .foregroundColor(monitor.tailscaleOnline ? textGreen : textRed)
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(squircleCardBackground)
-
-            // 诚实状态条：没有通讯就明说静默，绝不画假脉冲
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(monitor.activePulses.isEmpty ? textGray : Color(hex: "10B981"))
-                    .frame(width: 5, height: 5)
-                if monitor.activePulses.isEmpty {
-                    Text("最近 15 秒无通讯 · 脉冲静默")
-                        .font(.system(size: fs(12), weight: .semibold))
+                    Text("Mac Mini 本地执行中台")
+                        .font(.system(size: fs(11), weight: .semibold))
                         .foregroundColor(secondaryTextColor)
-                } else {
-                    Text("最近 15 秒 \(monitor.activePulses.reduce(0) { $0 + $1.count }) 次通讯")
-                        .font(.system(size: fs(12), weight: .bold))
-                        .foregroundColor(textGreen)
-                    ForEach(Array(monitor.activePulses.prefix(3))) { pulse in
-                        Text("\(AgentRoster.identity(for: pulse.source)?.short ?? pulse.source) → \(AgentRoster.identity(for: pulse.target)?.short ?? pulse.target) ×\(pulse.count)")
-                            .font(.system(size: fs(12), weight: .semibold, design: .monospaced))
-                            .foregroundColor(secondaryTextColor)
+                        .position(x: macX + macW / 2, y: macY + 11)
+
+                    // 正交直线 1：Ping 向上折右直入 Mac Mini（Funnel 443）
+                    Path { path in
+                        path.move(to: CGPoint(x: pingX, y: botLineY - 20))
+                        path.addLine(to: CGPoint(x: pingX, y: topLineY))
+                        path.addLine(to: CGPoint(x: macX, y: topLineY))
                     }
+                    .stroke(Color(hex: "2563EB"), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+
+                    Text("Funnel 443")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(textBlue)
+                        .position(x: (pingX + macX) / 2, y: topLineY - 12)
+
+                    // Mac 内部直线：AGY — Alma (0ms 本地总线)
+                    Path { path in
+                        path.move(to: CGPoint(x: agyX + 18, y: topLineY))
+                        path.addLine(to: CGPoint(x: almaX - 18, y: topLineY))
+                    }
+                    .stroke(secondaryTextColor.opacity(0.55), style: StrokeStyle(lineWidth: 1.6, dash: [3, 3]))
+
+                    Text("0ms 总线")
+                        .font(.system(size: fs(11), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
+                        .position(x: macX + macW / 2, y: topLineY - 11)
+
+                    // 正交直线 2：Mac Mini 向右折下连模拟电脑（局域网联调）
+                    Path { path in
+                        path.move(to: CGPoint(x: macX + macW, y: topLineY))
+                        path.addLine(to: CGPoint(x: simX, y: topLineY))
+                        path.addLine(to: CGPoint(x: simX, y: botLineY - 20))
+                    }
+                    .stroke(Color(hex: "059669"), style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round, dash: [4, 3]))
+
+                    Text("局域网联调")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(textGreen)
+                        .position(x: (macX + macW + simX) / 2, y: topLineY - 12)
+
+                    // 笔直水平绿实线（核心）：Ping ———————— 模拟电脑（Tailscale SSH 直连 · 不经 Mac）
+                    Path { path in
+                        path.move(to: CGPoint(x: pingX + 20, y: botLineY))
+                        path.addLine(to: CGPoint(x: simX - 20, y: botLineY))
+                    }
+                    .stroke(Color(hex: "059669"), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+
+                    Text("Tailscale SSH 直连 · 不经 Mac")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(textGreen)
+                        .position(x: w / 2, y: botLineY + 15)
+
+                    // 节点：AGY（Mac 内左）
+                    v2TopoNode(badge: "白", label: "AGY", color: Color(hex: "2563EB"), radius: 16, active: monitor.activePulses.contains { $0.source == "agy" || $0.target == "agy" })
+                        .position(x: agyX, y: topLineY + 7)
+
+                    // 节点：Alma（Mac 内右）
+                    v2TopoNode(badge: "A", label: "Alma", color: Color(hex: "D97706"), radius: 16, active: monitor.activePulses.contains { $0.source == "alma" || $0.target == "alma" })
+                        .position(x: almaX, y: topLineY + 7)
+
+                    // 节点：Ping（左下）
+                    v2TopoNode(badge: "P", label: "Ping (VM)", color: Color(hex: "7C3AED"), radius: 19, active: monitor.activePulses.contains { $0.source == "ping" || $0.target == "ping" })
+                        .position(x: pingX, y: botLineY + 8)
+
+                    // 节点：模拟电脑（右下）
+                    v2TopoNode(badge: "算", label: "模拟电脑 9011", color: Color(hex: "059669"), radius: 19, active: false)
+                        .position(x: simX, y: botLineY + 8)
+                }
+            }
+            .frame(height: 178)
+
+            // 底部 1 行诚实状态条
+            HStack(spacing: 10) {
+                HStack(spacing: 5) {
+                    Circle().fill(monitor.funnelOnline ? Color(hex: "2563EB") : Color(hex: "EF4444")).frame(width: 6, height: 6)
+                    Text("Funnel 443")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(primaryTextColor)
+                }
+                HStack(spacing: 5) {
+                    Circle().fill(monitor.tailscaleOnline ? Color(hex: "059669") : Color(hex: "EF4444")).frame(width: 6, height: 6)
+                    Text("Tailscale 直连")
+                        .font(.system(size: fs(11), weight: .bold))
+                        .foregroundColor(primaryTextColor)
+                }
+                HStack(spacing: 5) {
+                    Circle().fill(monitor.nutstoreOnline ? Color(hex: "10B981") : Color(hex: "EF4444")).frame(width: 6, height: 6)
+                    Text("坚果云冷备")
+                        .font(.system(size: fs(11), weight: .semibold))
+                        .foregroundColor(secondaryTextColor)
                 }
                 Spacer()
+                Text(monitor.activePulses.isEmpty ? "脉冲静默" : "近 15s \(monitor.activePulses.reduce(0) { $0 + $1.count }) 次通讯")
+                    .font(.system(size: fs(11), weight: .bold))
+                    .foregroundColor(monitor.activePulses.isEmpty ? secondaryTextColor : textGreen)
             }
-            .padding(.horizontal, 12)
-
-            // D3：迷你条压缩后，原文案不丢——展开态在这里给出完整三层说明
-            VStack(alignment: .leading, spacing: 2) {
-                channelCopyRow(tier: "底座", name: "Tailscale", detail: "私网底座 · SSH 可达")
-                channelCopyRow(tier: "主通道", name: "Funnel 443", detail: "HTTPS 专用通道 · 主传输路径")
-                channelCopyRow(tier: "冷备", name: "坚果云", detail: "只读冷备 · 灾难恢复底仓")
-            }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 8).padding(.top, 4)
         }
-        .padding(.horizontal, 14)
+        .padding(11)
+        .background(squircleCardBackground)
+    }
+
+    func v2TopoNode(badge: String, label: String, color: Color, radius: CGFloat, active: Bool) -> some View {
+        VStack(spacing: 3) {
+            ZStack {
+                if active {
+                    Circle()
+                        .stroke(color.opacity(monitor.pulse ? 0.70 : 0.25), lineWidth: 2)
+                        .frame(width: radius * 2 + 6, height: radius * 2 + 6)
+                }
+                Circle()
+                    .fill(color)
+                    .frame(width: radius * 2, height: radius * 2)
+                Text(badge)
+                    .font(.system(size: fs(12), weight: .bold))
+                    .foregroundColor(.white)
+            }
+            Text(label)
+                .font(.system(size: fs(11), weight: .bold))
+                .foregroundColor(primaryTextColor)
+                .lineLimit(1)
+        }
     }
 
     func channelCopyRow(tier: String, name: String, detail: String) -> some View {
@@ -4085,19 +5075,20 @@ struct DynamicIslandView: View {
             let item = monitor.pendingConfirms[safeIdx]
             
             VStack(spacing: 12) {
-                // Header: 调度状态 + 轮播器
+                // Header: 区分「需露露拍板（高危/熔断）」与「Agent 内部自动互验」
+                let isLuluCard = (item.stage == "high-risk-blocked" || item.file.contains("escalate-highrisk-"))
                 HStack(spacing: 6) {
                     ZStack {
                         Circle()
-                            .fill(Color(hex: "8B5CF6"))
+                            .fill(isLuluCard ? Color(hex: "8B5CF6") : Color(hex: "3B82F6"))
                             .frame(width: 18, height: 18)
-                        Image(systemName: "bell.badge.fill")
+                        Image(systemName: isLuluCard ? "bell.badge.fill" : "bolt.fill")
                             .font(.system(size: fs(12), weight: .bold))
                             .foregroundColor(.white)
                     }
-                    Text("架构调度 · 发起方亲自视觉验收闭环")
+                    Text(isLuluCard ? "高危拦截 · 待你拍板（\(monitor.totalLuluActions)）" : "Agent 内部互验中（\(monitor.totalAgentConfirms) · 免人工）")
                         .font(.system(size: fs(13), weight: .bold))
-                        .foregroundColor(textPurple)
+                        .foregroundColor(isLuluCard ? textPurple : textBlue)
                     
                     Spacer()
                     
@@ -4147,6 +5138,15 @@ struct DynamicIslandView: View {
                             .lineLimit(1)
                         Spacer()
                         lifecycleStepperView(stage: item.stage)
+                    }
+                    if !item.stepNote.isEmpty {
+                        HStack(spacing: 4) {
+                            Circle().fill(accentColor).frame(width: 5, height: 5)
+                            Text(item.stepNote)
+                                .font(.system(size: fs(11), weight: .semibold))
+                                .foregroundColor(accentColor)
+                                .lineLimit(1)
+                        }
                     }
                     
                     // Route & Artifact Link
@@ -4684,6 +5684,15 @@ struct DynamicIslandView: View {
                                                     Text("• \(task.eta)")
                                                         .font(.system(size: fs(11), weight: .bold))
                                                         .foregroundColor(isOverdue ? textRed : (isRelay ? textAmber : textBlue))
+                                                        .lineLimit(1)
+                                                }
+                                            }
+                                            if !task.stepNote.isEmpty {
+                                                HStack(spacing: 4) {
+                                                    Circle().fill(accentColor).frame(width: 4.5, height: 4.5)
+                                                    Text(task.stepNote)
+                                                        .font(.system(size: fs(11), weight: .semibold))
+                                                        .foregroundColor(accentColor)
                                                         .lineLimit(1)
                                                 }
                                             }
@@ -5273,8 +6282,11 @@ struct DynamicIslandView: View {
         if monitor.totalAccepted > 0 {
             parts.append("\(monitor.totalAccepted)履约中")
         }
-        if monitor.totalSubmitted > 0 {
-            parts.append("\(monitor.totalSubmitted)待验")
+        if monitor.totalLuluActions > 0 {
+            parts.append("\(monitor.totalLuluActions)待你拍板")
+        }
+        if monitor.totalAgentConfirms > 0 {
+            parts.append("\(monitor.totalAgentConfirms)互验")
         }
         if !parts.isEmpty {
             return parts.joined(separator: " · ")
